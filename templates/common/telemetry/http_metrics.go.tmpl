@@ -1,0 +1,115 @@
+package telemetry
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// HTTPMetrics holds HTTP RED metrics instruments
+// RED = Rate (requests/sec), Errors (error rate), Duration (latency)
+type HTTPMetrics struct {
+	requestsTotal   metric.Int64Counter
+	requestDuration metric.Float64Histogram
+	requestsActive  metric.Int64UpDownCounter
+}
+
+// NewHTTPMetrics creates HTTP metrics instruments
+func NewHTTPMetrics(serviceName string) (*HTTPMetrics, error) {
+	meter := otel.Meter(serviceName)
+
+	requestsTotal, err := meter.Int64Counter(
+		"http_requests_total",
+		metric.WithDescription("Total number of HTTP requests"),
+		metric.WithUnit("{request}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	requestDuration, err := meter.Float64Histogram(
+		"http_request_duration_seconds",
+		metric.WithDescription("HTTP request duration in seconds"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	requestsActive, err := meter.Int64UpDownCounter(
+		"http_requests_active",
+		metric.WithDescription("Number of HTTP requests currently being processed"),
+		metric.WithUnit("{request}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &HTTPMetrics{
+		requestsTotal:   requestsTotal,
+		requestDuration: requestDuration,
+		requestsActive:  requestsActive,
+	}, nil
+}
+
+// metricsResponseWriter captures status code for metrics
+type metricsResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *metricsResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Middleware returns HTTP middleware that records RED metrics
+func (m *HTTPMetrics) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Track active requests (gauge behavior)
+		m.requestsActive.Add(r.Context(), 1)
+		defer m.requestsActive.Add(r.Context(), -1)
+
+		// Wrap response writer to capture status
+		wrapped := &metricsResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Process request
+		next.ServeHTTP(wrapped, r)
+
+		// Record metrics after request completes
+		duration := time.Since(start).Seconds()
+
+		attrs := []attribute.KeyValue{
+			attribute.String("method", r.Method),
+			attribute.String("path", r.URL.Path),
+			attribute.String("status", strconv.Itoa(wrapped.statusCode)),
+			attribute.String("status_class", statusClass(wrapped.statusCode)),
+		}
+
+		m.requestsTotal.Add(r.Context(), 1, metric.WithAttributes(attrs...))
+		m.requestDuration.Record(r.Context(), duration, metric.WithAttributes(attrs...))
+	})
+}
+
+// statusClass returns the status class (2xx, 4xx, 5xx)
+func statusClass(code int) string {
+	switch {
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}

@@ -1,0 +1,156 @@
+package telemetry
+
+import (
+	"context"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// DBObservability provides database observability (traces and metrics)
+type DBObservability struct {
+	tracer trace.Tracer
+
+	// Metrics
+	queryDuration metric.Float64Histogram
+	queryTotal    metric.Int64Counter
+	queryErrors   metric.Int64Counter
+	connections   metric.Int64UpDownCounter
+}
+
+// NewDBObservability creates a new database observability instance
+func NewDBObservability(serviceName, dbSystem string) (*DBObservability, error) {
+	tracer := otel.Tracer(serviceName + "/db")
+	meter := otel.Meter(serviceName + "/db")
+
+	queryDuration, err := meter.Float64Histogram(
+		"db_query_duration_seconds",
+		metric.WithDescription("Duration of database queries in seconds"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	queryTotal, err := meter.Int64Counter(
+		"db_queries_total",
+		metric.WithDescription("Total number of database queries"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	queryErrors, err := meter.Int64Counter(
+		"db_query_errors_total",
+		metric.WithDescription("Total number of failed database queries"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	connections, err := meter.Int64UpDownCounter(
+		"db_connections_active",
+		metric.WithDescription("Number of active database connections"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DBObservability{
+		tracer:        tracer,
+		queryDuration: queryDuration,
+		queryTotal:    queryTotal,
+		queryErrors:   queryErrors,
+		connections:   connections,
+	}, nil
+}
+
+// QueryOptions holds options for tracing a database query
+type QueryOptions struct {
+	Operation string // e.g., "SELECT", "INSERT", "UPDATE", "DELETE"
+	Table     string // e.g., "users", "sessions"
+	Query     string // SQL query (sanitized, no parameters)
+}
+
+// TraceQuery starts a span and records metrics for a database query
+// It returns a function that should be called when the query completes
+func (o *DBObservability) TraceQuery(ctx context.Context, opts QueryOptions) (context.Context, func(error)) {
+	if o == nil {
+		return ctx, func(error) {}
+	}
+
+	start := time.Now()
+
+	// Create span with semantic conventions
+	spanName := opts.Operation
+	if opts.Table != "" {
+		spanName = opts.Operation + " " + opts.Table
+	}
+
+	ctx, span := o.tracer.Start(ctx, spanName,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("db.system", "sql"),
+			attribute.String("db.operation", opts.Operation),
+		),
+	)
+
+	if opts.Table != "" {
+		span.SetAttributes(attribute.String("db.sql.table", opts.Table))
+	}
+	if opts.Query != "" {
+		span.SetAttributes(attribute.String("db.statement", opts.Query))
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", opts.Operation),
+		attribute.String("table", opts.Table),
+	}
+
+	// Increment query counter
+	o.queryTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+
+	return ctx, func(err error) {
+		duration := time.Since(start).Seconds()
+
+		// Record duration
+		o.queryDuration.Record(ctx, duration, metric.WithAttributes(attrs...))
+
+		if err != nil {
+			// Record error
+			o.queryErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+
+		span.End()
+	}
+}
+
+// ConnectionOpened records a new database connection
+func (o *DBObservability) ConnectionOpened(ctx context.Context) {
+	if o == nil {
+		return
+	}
+	o.connections.Add(ctx, 1)
+}
+
+// ConnectionClosed records a closed database connection
+func (o *DBObservability) ConnectionClosed(ctx context.Context) {
+	if o == nil {
+		return
+	}
+	o.connections.Add(ctx, -1)
+}
+
+// NoOpDBObservability returns a no-op observability instance for when observability is disabled
+func NoOpDBObservability() *DBObservability {
+	return nil
+}

@@ -1,0 +1,118 @@
+package telemetry
+
+import (
+	"context"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+)
+
+// Config holds telemetry configuration
+type Config struct {
+	ServiceName    string
+	ServiceVersion string
+	Environment    string
+	OTLPEndpoint   string
+	Enabled        bool
+}
+
+// Provider wraps OpenTelemetry providers for traces and metrics
+type Provider struct {
+	tracerProvider *sdktrace.TracerProvider
+	meterProvider  *sdkmetric.MeterProvider
+}
+
+// InitTelemetry initializes OpenTelemetry with traces and metrics
+func InitTelemetry(ctx context.Context, cfg Config) (*Provider, error) {
+	if !cfg.Enabled {
+		return &Provider{}, nil
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(cfg.ServiceName),
+			semconv.ServiceVersion(cfg.ServiceVersion),
+			semconv.DeploymentEnvironment(cfg.Environment),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize trace exporter
+	traceExporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(res),
+		sdktrace.WithBatcher(traceExporter),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))), // Sample 10% in production
+	)
+
+	// Initialize metrics exporter
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint),
+		otlpmetricgrpc.WithInsecure(),
+	)
+	if err != nil {
+		tracerProvider.Shutdown(ctx)
+		return nil, err
+	}
+
+	meterProvider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(15*time.Second))),
+	)
+
+	// Set global providers
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetMeterProvider(meterProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return &Provider{
+		tracerProvider: tracerProvider,
+		meterProvider:  meterProvider,
+	}, nil
+}
+
+// Shutdown gracefully shuts down telemetry providers
+func (p *Provider) Shutdown(ctx context.Context) error {
+	if p.tracerProvider == nil && p.meterProvider == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Shutdown metrics first to flush pending data
+	if p.meterProvider != nil {
+		if err := p.meterProvider.Shutdown(ctx); err != nil {
+			return err
+		}
+	}
+
+	if p.tracerProvider != nil {
+		if err := p.tracerProvider.Shutdown(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

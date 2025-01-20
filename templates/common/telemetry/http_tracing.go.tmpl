@@ -1,0 +1,105 @@
+package telemetry
+
+import (
+	"net"
+	"net/http"
+	"strings"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// HTTPTracing provides distributed tracing for HTTP requests
+type HTTPTracing struct {
+	tracer trace.Tracer
+}
+
+// NewHTTPTracing creates a new HTTP tracing middleware
+func NewHTTPTracing(serviceName string) *HTTPTracing {
+	return &HTTPTracing{
+		tracer: otel.Tracer(serviceName),
+	}
+}
+
+// tracingResponseWriter captures status code for span attributes
+type tracingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *tracingResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Middleware returns HTTP middleware that creates spans for each request
+func (t *HTTPTracing) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Extract trace context from incoming request headers
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
+		// Start span
+		ctx, span := t.tracer.Start(ctx, r.Method+" "+r.URL.Path,
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(
+				semconv.HTTPMethod(r.Method),
+				semconv.HTTPTarget(r.URL.Path),
+				semconv.HTTPScheme(scheme(r)),
+				semconv.NetHostName(r.Host),
+				semconv.UserAgentOriginal(r.UserAgent()),
+				attribute.String("http.client_ip", clientIP(r)),
+			),
+		)
+		defer span.End()
+
+		// Wrap response writer
+		wrapped := &tracingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Process request with traced context
+		next.ServeHTTP(wrapped, r.WithContext(ctx))
+
+		// Record response attributes
+		span.SetAttributes(semconv.HTTPStatusCode(wrapped.statusCode))
+
+		// Mark span as error for 5xx responses
+		if wrapped.statusCode >= 500 {
+			span.SetAttributes(attribute.Bool("error", true))
+		}
+	})
+}
+
+// scheme returns the request scheme
+func scheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if s := r.Header.Get("X-Forwarded-Proto"); s != "" {
+		return s
+	}
+	return "http"
+}
+
+// clientIP extracts client IP from request headers
+// X-Forwarded-For can be spoofed - only trust if behind a known proxy
+func clientIP(r *http.Request) string {
+	// X-Forwarded-For contains comma-separated list: client, proxy1, proxy2
+	// Take only the first (leftmost) IP which is the original client
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// RemoteAddr includes port, extract just the IP
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}

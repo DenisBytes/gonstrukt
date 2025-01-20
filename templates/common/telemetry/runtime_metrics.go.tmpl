@@ -1,0 +1,102 @@
+package telemetry
+
+import (
+	"context"
+	"runtime"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// RuntimeMetrics collects Go runtime metrics
+type RuntimeMetrics struct {
+	meter  metric.Meter
+	stopCh chan struct{}
+}
+
+// NewRuntimeMetrics creates a new runtime metrics collector
+func NewRuntimeMetrics(serviceName string) (*RuntimeMetrics, error) {
+	meter := otel.Meter(serviceName)
+
+	// Register observable gauges using the callback pattern
+	_, err := meter.Int64ObservableGauge("runtime.goroutines",
+		metric.WithDescription("Number of goroutines"),
+		metric.WithUnit("{goroutine}"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(int64(runtime.NumGoroutine()))
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = meter.Int64ObservableGauge("runtime.memory.heap_alloc",
+		metric.WithDescription("Bytes of allocated heap objects"),
+		metric.WithUnit("By"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			o.Observe(int64(m.HeapAlloc))
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = meter.Int64ObservableGauge("runtime.memory.heap_sys",
+		metric.WithDescription("Bytes of heap memory obtained from the OS"),
+		metric.WithUnit("By"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			o.Observe(int64(m.HeapSys))
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = meter.Int64ObservableGauge("runtime.gc.count",
+		metric.WithDescription("Number of completed GC cycles"),
+		metric.WithUnit("{cycle}"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			o.Observe(int64(m.NumGC))
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RuntimeMetrics{
+		meter:  meter,
+		stopCh: make(chan struct{}),
+	}, nil
+}
+
+// Start begins collecting runtime metrics (kept for API compatibility)
+func (r *RuntimeMetrics) Start(ctx context.Context, interval time.Duration) {
+	// Observable gauges auto-collect on scrape, but we can add custom attributes here if needed
+}
+
+// Stop stops the metrics collection
+func (r *RuntimeMetrics) Stop() {
+	close(r.stopCh)
+}
+
+// RecordCustomMetric records a custom metric value
+func (r *RuntimeMetrics) RecordCustomMetric(ctx context.Context, name string, value int64, attrs ...attribute.KeyValue) error {
+	counter, err := r.meter.Int64Counter(name)
+	if err != nil {
+		return err
+	}
+	counter.Add(ctx, value, metric.WithAttributes(attrs...))
+	return nil
+}

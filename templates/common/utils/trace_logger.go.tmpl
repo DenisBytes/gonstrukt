@@ -1,0 +1,51 @@
+package utils
+
+import (
+	"context"
+
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+)
+
+// TraceLogger wraps a zap logger with trace context
+type TraceLogger struct {
+	logger *zap.Logger
+}
+
+// NewTraceLogger creates a new trace-aware logger
+func NewTraceLogger(logger *zap.Logger) *TraceLogger {
+	return &TraceLogger{logger: logger}
+}
+
+// WithContext adds trace context to log fields
+func (t *TraceLogger) WithContext(ctx context.Context) *zap.Logger {
+	span := trace.SpanFromContext(ctx)
+	if !span.SpanContext().IsValid() {
+		return t.logger
+	}
+
+	return t.logger.With(
+		zap.String("trace_id", span.SpanContext().TraceID().String()),
+		zap.String("span_id", span.SpanContext().SpanID().String()),
+	)
+}
+
+// Info logs an info message with trace context
+func (t *TraceLogger) Info(ctx context.Context, msg string, fields ...zap.Field) {
+	t.WithContext(ctx).Info(msg, fields...)
+}
+
+// Debug logs a debug message with trace context
+func (t *TraceLogger) Debug(ctx context.Context, msg string, fields ...zap.Field) {
+	t.WithContext(ctx).Debug(msg, fields...)
+}
+
+// Warn logs a warning message with trace context
+func (t *TraceLogger) Warn(ctx context.Context, msg string, fields ...zap.Field) {
+	t.WithContext(ctx).Warn(msg, fields...)
+}
+
+// Error logs an error message with trace context
+func (t *TraceLogger) Error(ctx context.Context, msg string, fields ...zap.Field) {
+	t.WithContext(ctx).Error(msg, fields...)
+}

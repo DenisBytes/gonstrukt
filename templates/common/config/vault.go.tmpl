@@ -1,0 +1,221 @@
+package config
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"reflect"
+	"time"
+
+	vault "github.com/hashicorp/vault/api"
+)
+
+// VaultConfig holds Vault connection configuration
+type VaultConfig struct {
+	Address   string
+	Token     string
+	Path      string
+	Namespace string
+}
+
+// VaultClient wraps the Vault API client
+type VaultClient struct {
+	client *vault.Client
+	config VaultConfig
+}
+
+// NewVaultClient creates a new Vault client
+func NewVaultClient(cfg VaultConfig) (*VaultClient, error) {
+	config := vault.DefaultConfig()
+	config.Address = cfg.Address
+	config.Timeout = 30 * time.Second
+
+	client, err := vault.NewClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create vault client: %w", err)
+	}
+
+	// Set token from config or environment
+	token := cfg.Token
+	if token == "" {
+		token = os.Getenv("VAULT_TOKEN")
+	}
+	client.SetToken(token)
+
+	// Set namespace if provided
+	if cfg.Namespace != "" {
+		client.SetNamespace(cfg.Namespace)
+	}
+
+	return &VaultClient{
+		client: client,
+		config: cfg,
+	}, nil
+}
+
+// LoadVault loads configuration from Vault
+func LoadVault[T any](ctx context.Context, vc *VaultClient, path string) (*T, error) {
+	if path == "" {
+		path = vc.config.Path
+	}
+
+	secret, err := vc.client.KVv2("secret").Get(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read secret from vault: %w", err)
+	}
+
+	if secret == nil || secret.Data == nil {
+		return nil, fmt.Errorf("no data found at path: %s", path)
+	}
+
+	var cfg T
+	v := reflect.ValueOf(&cfg).Elem()
+	t := v.Type()
+
+	if err := loadVaultStruct(v, t, secret.Data, ""); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func loadVaultStruct(v reflect.Value, t reflect.Type, data map[string]interface{}, prefix string) error {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		fieldValue := v.Field(i)
+
+		if !fieldValue.CanSet() {
+			continue
+		}
+
+		// Handle embedded structs
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if err := loadVaultStruct(fieldValue, field.Type, data, prefix); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Handle nested structs
+		if field.Type.Kind() == reflect.Struct {
+			nestedPrefix := prefix
+			if vaultPrefix := field.Tag.Get("vaultPrefix"); vaultPrefix != "" {
+				if prefix != "" {
+					nestedPrefix = prefix + "_" + vaultPrefix
+				} else {
+					nestedPrefix = vaultPrefix
+				}
+			}
+			if err := loadVaultStruct(fieldValue, field.Type, data, nestedPrefix); err != nil {
+				return err
+			}
+			continue
+		}
+
+		vaultKey := field.Tag.Get("vault")
+		if vaultKey == "" {
+			vaultKey = field.Tag.Get("json")
+		}
+		if vaultKey == "" {
+			continue
+		}
+
+		if prefix != "" {
+			vaultKey = prefix + "_" + vaultKey
+		}
+
+		value, ok := data[vaultKey]
+		if !ok {
+			defaultVal := field.Tag.Get("vaultDefault")
+			if defaultVal != "" {
+				value = defaultVal
+			} else if required := field.Tag.Get("vaultRequired"); required == "true" {
+				return fmt.Errorf("required vault key %s is not set", vaultKey)
+			} else {
+				continue
+			}
+		}
+
+		if err := setVaultFieldValue(fieldValue, value); err != nil {
+			return fmt.Errorf("failed to set %s: %w", vaultKey, err)
+		}
+	}
+
+	return nil
+}
+
+func setVaultFieldValue(v reflect.Value, value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	switch v.Kind() {
+	case reflect.String:
+		if s, ok := value.(string); ok {
+			v.SetString(s)
+		}
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch val := value.(type) {
+		case float64:
+			v.SetInt(int64(val))
+		case int:
+			v.SetInt(int64(val))
+		case int64:
+			v.SetInt(val)
+		case string:
+			if v.Type() == reflect.TypeOf(time.Duration(0)) {
+				d, err := time.ParseDuration(val)
+				if err != nil {
+					return err
+				}
+				v.SetInt(int64(d))
+			}
+		}
+
+	case reflect.Bool:
+		if b, ok := value.(bool); ok {
+			v.SetBool(b)
+		}
+
+	case reflect.Float32, reflect.Float64:
+		if f, ok := value.(float64); ok {
+			v.SetFloat(f)
+		}
+
+	case reflect.Slice:
+		if arr, ok := value.([]interface{}); ok {
+			slice := reflect.MakeSlice(v.Type(), len(arr), len(arr))
+			for i, item := range arr {
+				if err := setVaultFieldValue(slice.Index(i), item); err != nil {
+					return err
+				}
+			}
+			v.Set(slice)
+		}
+	}
+
+	return nil
+}
+
+// Watch starts watching for configuration changes
+func (vc *VaultClient) Watch(ctx context.Context, path string, callback func(map[string]interface{})) {
+	// Implementation depends on Vault setup (agent, caching, etc.)
+	// This is a simplified polling approach
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				secret, err := vc.client.KVv2("secret").Get(ctx, path)
+				if err == nil && secret != nil && secret.Data != nil {
+					callback(secret.Data)
+				}
+			}
+		}
+	}()
+}

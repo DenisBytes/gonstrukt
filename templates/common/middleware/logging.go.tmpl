@@ -1,0 +1,80 @@
+package middleware
+
+import (
+	"net/http"
+	"time"
+
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+)
+
+// loggingResponseWriter wraps http.ResponseWriter to capture status code and size
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	size       int
+}
+
+func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	return &loggingResponseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+	}
+}
+
+func (rw *loggingResponseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *loggingResponseWriter) Write(b []byte) (int, error) {
+	size, err := rw.ResponseWriter.Write(b)
+	rw.size += size
+	return size, err
+}
+
+// Logging middleware logs HTTP requests with trace correlation
+func Logging(logger *zap.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rw := newLoggingResponseWriter(w)
+
+			defer func() {
+				duration := time.Since(start)
+
+				// Extract trace context for log correlation
+				// This connects logs to distributed traces
+				fields := []zap.Field{
+					zap.String("method", r.Method),
+					zap.String("path", r.URL.Path),
+					zap.Int("status", rw.statusCode),
+					zap.Int("size", rw.size),
+					zap.Duration("duration", duration),
+					zap.String("remote_addr", r.RemoteAddr),
+				}
+
+				// Add trace correlation if span exists
+				// When debugging: filter logs by trace_id to see full request flow
+				if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
+					fields = append(fields,
+						zap.String("trace_id", span.SpanContext().TraceID().String()),
+						zap.String("span_id", span.SpanContext().SpanID().String()),
+					)
+				}
+
+				// Log level based on status code
+				switch {
+				case rw.statusCode >= 500:
+					logger.Error("http request", fields...)
+				case rw.statusCode >= 400:
+					logger.Warn("http request", fields...)
+				default:
+					logger.Info("http request", fields...)
+				}
+			}()
+
+			next.ServeHTTP(rw, r)
+		})
+	}
+}
