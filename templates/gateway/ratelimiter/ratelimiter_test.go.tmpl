@@ -1,0 +1,346 @@
+package ratelimiter
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestRateLimiter_Allow(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(10, 10) // 10 tokens, 10 per second refill
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(10, time.Second) // 10 requests per second
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(10, 10) // 10 capacity, 10 per second
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(10, time.Second) // 10 requests per second
+{{- else}}
+	rl := NewTokenBucket(10, 10)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-client"
+
+	tests := []struct {
+		name      string
+		requests  int
+		wantAllow int
+		wantDeny  int
+	}{
+		{
+			name:      "within limit",
+			requests:  5,
+			wantAllow: 5,
+			wantDeny:  0,
+		},
+		{
+			name:      "at limit",
+			requests:  10,
+			wantAllow: 10,
+			wantDeny:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset for each test
+			_ = rl.Reset(ctx, key)
+
+			allowed := 0
+			denied := 0
+
+			for i := 0; i < tt.requests; i++ {
+				ok, err := rl.Allow(ctx, key)
+				if err != nil {
+					t.Fatalf("Allow() error = %v", err)
+				}
+				if ok {
+					allowed++
+				} else {
+					denied++
+				}
+			}
+
+			if allowed != tt.wantAllow {
+				t.Errorf("Allow() allowed = %d, want %d", allowed, tt.wantAllow)
+			}
+			if denied != tt.wantDeny {
+				t.Errorf("Allow() denied = %d, want %d", denied, tt.wantDeny)
+			}
+		})
+	}
+}
+
+func TestRateLimiter_ExceedLimit(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(1, 5) // 1 token/sec refill, 5 max (burst)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(5, time.Second) // 5 requests per second
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(1, 5) // 1 per second, 5 capacity
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(5, time.Second) // 5 requests per second
+{{- else}}
+	rl := NewTokenBucket(1, 5)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-exceed"
+
+	// Reset
+	_ = rl.Reset(ctx, key)
+
+	// Use all tokens
+	for i := 0; i < 5; i++ {
+		ok, err := rl.Allow(ctx, key)
+		if err != nil {
+			t.Fatalf("Allow() error = %v", err)
+		}
+		if !ok {
+			t.Errorf("Allow() denied request %d, expected allow", i+1)
+		}
+	}
+
+	// Next request should be denied
+	ok, err := rl.Allow(ctx, key)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if ok {
+		t.Error("Allow() should deny request exceeding limit")
+	}
+}
+
+func TestRateLimiter_DifferentKeys(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(5, 5)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(5, time.Second)
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(5, 5)
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(5, time.Second)
+{{- else}}
+	rl := NewTokenBucket(5, 5)
+{{- end}}
+
+	ctx := context.Background()
+	key1 := "client-1"
+	key2 := "client-2"
+
+	// Reset both
+	_ = rl.Reset(ctx, key1)
+	_ = rl.Reset(ctx, key2)
+
+	// Exhaust key1
+	for i := 0; i < 5; i++ {
+		ok, err := rl.Allow(ctx, key1)
+		if err != nil {
+			t.Fatalf("Allow() error = %v", err)
+		}
+		if !ok {
+			t.Errorf("Allow() key1 denied request %d", i+1)
+		}
+	}
+
+	// key1 should be denied
+	ok, err := rl.Allow(ctx, key1)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if ok {
+		t.Error("Allow() key1 should be denied after limit")
+	}
+
+	// key2 should still be allowed
+	ok, err = rl.Allow(ctx, key2)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if !ok {
+		t.Error("Allow() key2 should be allowed (independent limit)")
+	}
+}
+
+func TestRateLimiter_Refill(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(10, 5) // 10 tokens/sec refill, 5 max (burst)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(5, 500*time.Millisecond) // 5 requests per 500ms
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(10, 5) // 10 per second, 5 capacity
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(5, 500*time.Millisecond) // 5 requests per 500ms
+{{- else}}
+	rl := NewTokenBucket(10, 5)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-refill"
+
+	// Reset
+	_ = rl.Reset(ctx, key)
+
+	// Exhaust limit
+	for i := 0; i < 5; i++ {
+		_, _ = rl.Allow(ctx, key)
+	}
+
+	// Should be denied
+	ok, _ := rl.Allow(ctx, key)
+	if ok {
+		t.Error("Allow() should deny after exhaustion")
+	}
+
+	// Wait for refill
+	time.Sleep(600 * time.Millisecond)
+
+	// Should be allowed again
+	ok, _ = rl.Allow(ctx, key)
+	if !ok {
+		t.Error("Allow() should allow after refill")
+	}
+}
+
+func TestRateLimiter_Reset(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(0.01, 5) // Very slow refill, 5 max (burst)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(5, time.Minute) // Long window to prevent auto-refill
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(0.01, 5) // Very slow, 5 capacity
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(5, time.Minute)
+{{- else}}
+	rl := NewTokenBucket(0.01, 5)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-reset"
+
+	// Exhaust limit
+	for i := 0; i < 5; i++ {
+		_, _ = rl.Allow(ctx, key)
+	}
+
+	// Should be denied
+	ok, _ := rl.Allow(ctx, key)
+	if ok {
+		t.Error("Allow() should deny after exhaustion")
+	}
+
+	// Reset
+	if err := rl.Reset(ctx, key); err != nil {
+		t.Fatalf("Reset() error = %v", err)
+	}
+
+	// Should be allowed again
+	ok, _ = rl.Allow(ctx, key)
+	if !ok {
+		t.Error("Allow() should allow after reset")
+	}
+}
+
+func TestRateLimiter_GetStats(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(10, 10)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(10, time.Minute)
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(10, 10)
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(10, time.Minute)
+{{- else}}
+	rl := NewTokenBucket(10, 10)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-stats"
+
+	// Reset
+	_ = rl.Reset(ctx, key)
+
+	stats, err := rl.GetStats(ctx, key)
+	if err != nil {
+		t.Fatalf("GetStats() error = %v", err)
+	}
+
+	if stats.Total != 10 {
+		t.Errorf("GetStats() Total = %d, want 10", stats.Total)
+	}
+
+	// Use some tokens
+	for i := 0; i < 3; i++ {
+		_, _ = rl.Allow(ctx, key)
+	}
+
+	stats, err = rl.GetStats(ctx, key)
+	if err != nil {
+		t.Fatalf("GetStats() error = %v", err)
+	}
+
+	if stats.Remaining != 7 {
+		t.Errorf("GetStats() Remaining after 3 requests = %d, want 7", stats.Remaining)
+	}
+}
+
+func TestRateLimiter_Concurrent(t *testing.T) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	rl := NewTokenBucket(100, 100)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rl := NewSlidingWindow(100, time.Second)
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rl := NewLeakyBucket(100, 100)
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rl := NewFixedWindow(100, time.Second)
+{{- else}}
+	rl := NewTokenBucket(100, 100)
+{{- end}}
+
+	ctx := context.Background()
+	key := "test-concurrent"
+
+	// Reset
+	_ = rl.Reset(ctx, key)
+
+	const numGoroutines = 10
+	const requestsPerGoroutine = 10
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	allowed := 0
+	denied := 0
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < requestsPerGoroutine; j++ {
+				ok, _ := rl.Allow(ctx, key)
+				if ok {
+					mu.Lock()
+					allowed++
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					denied++
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	total := allowed + denied
+	if total != numGoroutines*requestsPerGoroutine {
+		t.Errorf("total requests = %d, want %d", total, numGoroutines*requestsPerGoroutine)
+	}
+
+	// With 100 token limit and 100 requests, all should be allowed
+	if allowed != 100 {
+		t.Errorf("allowed = %d, want 100", allowed)
+	}
+}

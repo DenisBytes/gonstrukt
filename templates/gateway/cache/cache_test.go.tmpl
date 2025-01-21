@@ -1,0 +1,317 @@
+package cache
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+)
+
+// testCache is the shared cache client for integration tests.
+var testCache Cache
+
+// TestMain sets up and tears down test infrastructure.
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	if testing.Short() {
+		fmt.Println("Skipping integration tests in short mode")
+		os.Exit(0)
+	}
+
+	var err error
+	testCache, err = setupTestCache()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup test cache: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Make sure the cache server is running\n")
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	if testCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		testCache.Close(ctx)
+	}
+
+	os.Exit(code)
+}
+
+func setupTestCache() (Cache, error) {
+{{- if eq .CacheType "redis"}}
+	addr := getEnvOrDefault("TEST_REDIS_ADDR", "localhost:6379")
+	return NewRedisCache(addr, "", 0)
+{{- else if eq .CacheType "valkey"}}
+	addr := getEnvOrDefault("TEST_VALKEY_ADDR", "localhost:6379")
+	return NewValkeyCache(addr, "", 0)
+{{- else}}
+	return NewMemoryCache(1000, 5*time.Minute), nil
+{{- end}}
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func mustGetTestCache(t *testing.T) Cache {
+	t.Helper()
+	if testCache == nil {
+		t.Fatal("test cache not initialized")
+	}
+	return testCache
+}
+
+func TestCache_SetAndGet(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+		ttl   time.Duration
+	}{
+		{
+			name:  "set and get simple value",
+			key:   "test-key-1",
+			value: "test-value-1",
+			ttl:   time.Minute,
+		},
+		{
+			name:  "set and get with special characters",
+			key:   "test:key:2",
+			value: `{"json": "value"}`,
+			ttl:   time.Minute,
+		},
+		{
+			name:  "set and get empty value",
+			key:   "test-key-3",
+			value: "",
+			ttl:   time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Cleanup
+			t.Cleanup(func() {
+				c.Delete(ctx, tt.key)
+			})
+
+			// Set
+			if err := c.Set(ctx, tt.key, []byte(tt.value), tt.ttl); err != nil {
+				t.Fatalf("Set() error = %v", err)
+			}
+
+			// Get
+			got, err := c.Get(ctx, tt.key)
+			if err != nil {
+				t.Fatalf("Get() error = %v", err)
+			}
+
+			if string(got) != tt.value {
+				t.Errorf("Get() = %v, want %v", string(got), tt.value)
+			}
+		})
+	}
+}
+
+func TestCache_Get_NotFound(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	_, err := c.Get(ctx, "non-existent-key")
+	if !IsCacheMiss(err) {
+		t.Errorf("Get() non-existent key error = %v, want cache miss", err)
+	}
+}
+
+func TestCache_Delete(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	key := "test-delete-key"
+	value := "test-value"
+
+	// Set a value
+	if err := c.Set(ctx, key, []byte(value), time.Minute); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// Verify it exists
+	_, err := c.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get() before delete error = %v", err)
+	}
+
+	// Delete
+	if err := c.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	// Verify it's gone
+	_, err = c.Get(ctx, key)
+	if !IsCacheMiss(err) {
+		t.Errorf("Get() after delete error = %v, want cache miss", err)
+	}
+}
+
+func TestCache_Delete_NotFound(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	// Deleting non-existent key should not error
+	err := c.Delete(ctx, "non-existent-delete-key")
+	if err != nil {
+		t.Errorf("Delete() non-existent key error = %v, want nil", err)
+	}
+}
+
+func TestCache_Expiration(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	key := "test-expiry-key"
+	value := "test-value"
+	ttl := 100 * time.Millisecond
+
+	// Set with short TTL
+	if err := c.Set(ctx, key, []byte(value), ttl); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// Verify it exists
+	_, err := c.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get() immediately after set error = %v", err)
+	}
+
+	// Wait for expiration
+	time.Sleep(ttl + 50*time.Millisecond)
+
+	// Verify it's expired
+	_, err = c.Get(ctx, key)
+	if !IsCacheMiss(err) {
+		t.Errorf("Get() after expiry error = %v, want cache miss", err)
+	}
+}
+
+func TestCache_Exists(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	key := "test-exists-key"
+	value := "test-value"
+
+	t.Cleanup(func() {
+		c.Delete(ctx, key)
+	})
+
+	// Check non-existent
+	exists, err := c.Exists(ctx, key)
+	if err != nil {
+		t.Fatalf("Exists() error = %v", err)
+	}
+	if exists {
+		t.Error("Exists() = true for non-existent key")
+	}
+
+	// Set value
+	if err := c.Set(ctx, key, []byte(value), time.Minute); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// Check exists
+	exists, err = c.Exists(ctx, key)
+	if err != nil {
+		t.Fatalf("Exists() error = %v", err)
+	}
+	if !exists {
+		t.Error("Exists() = false for existing key")
+	}
+}
+
+func TestCache_SetOverwrite(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	key := "test-overwrite-key"
+	value1 := "value1"
+	value2 := "value2"
+
+	t.Cleanup(func() {
+		c.Delete(ctx, key)
+	})
+
+	// Set first value
+	if err := c.Set(ctx, key, []byte(value1), time.Minute); err != nil {
+		t.Fatalf("Set() first value error = %v", err)
+	}
+
+	// Verify first value
+	got, err := c.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get() first value error = %v", err)
+	}
+	if string(got) != value1 {
+		t.Errorf("Get() = %v, want %v", string(got), value1)
+	}
+
+	// Overwrite with second value
+	if err := c.Set(ctx, key, []byte(value2), time.Minute); err != nil {
+		t.Fatalf("Set() second value error = %v", err)
+	}
+
+	// Verify second value
+	got, err = c.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get() second value error = %v", err)
+	}
+	if string(got) != value2 {
+		t.Errorf("Get() = %v, want %v", string(got), value2)
+	}
+}
+
+func TestCache_ConcurrentAccess(t *testing.T) {
+	c := mustGetTestCache(t)
+	ctx := context.Background()
+
+	const numGoroutines = 10
+	const numOps = 100
+
+	done := make(chan bool, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			for j := 0; j < numOps; j++ {
+				key := fmt.Sprintf("concurrent-key-%d-%d", id, j)
+				value := fmt.Sprintf("value-%d-%d", id, j)
+
+				if err := c.Set(ctx, key, []byte(value), time.Minute); err != nil {
+					t.Errorf("concurrent Set() error = %v", err)
+				}
+
+				got, err := c.Get(ctx, key)
+				if err != nil {
+					t.Errorf("concurrent Get() error = %v", err)
+				}
+				if string(got) != value {
+					t.Errorf("concurrent Get() = %v, want %v", string(got), value)
+				}
+
+				c.Delete(ctx, key)
+			}
+			done <- true
+		}(i)
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+}

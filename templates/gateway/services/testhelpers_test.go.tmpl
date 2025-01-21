@@ -1,0 +1,187 @@
+package services
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+{{- if .HasCache}}
+	"{{.ModuleName}}/internals/cache"
+{{- end}}
+{{- if .HasRateLimiter}}
+	"{{.ModuleName}}/internals/ratelimiter"
+{{- end}}
+)
+
+{{- if .HasCache}}
+// testCache is the shared cache client for integration tests.
+var testCache cache.Cache
+{{- end}}
+
+{{- if .HasRateLimiter}}
+// testRateLimiter is the shared rate limiter for integration tests.
+var testRateLimiter ratelimiter.RateLimiter
+{{- end}}
+
+// TestMain sets up and tears down test infrastructure.
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	if testing.Short() {
+		fmt.Println("Skipping integration tests in short mode")
+		os.Exit(0)
+	}
+
+	var err error
+
+{{- if .HasCache}}
+	// Setup cache
+	testCache, err = setupTestCache()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup test cache: %v\n", err)
+		os.Exit(1)
+	}
+{{- end}}
+
+{{- if .HasRateLimiter}}
+	// Setup rate limiter
+	testRateLimiter, err = setupTestRateLimiter()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup test rate limiter: %v\n", err)
+		os.Exit(1)
+	}
+{{- end}}
+
+	code := m.Run()
+
+{{- if .HasCache}}
+	// Cleanup cache
+	if testCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		testCache.Close(ctx)
+	}
+{{- end}}
+
+	os.Exit(code)
+}
+
+{{- if .HasCache}}
+
+// setupTestCache creates a test cache client.
+func setupTestCache() (cache.Cache, error) {
+{{- if eq .CacheType "redis"}}
+	addr := getEnvOrDefault("TEST_REDIS_ADDR", "localhost:6379")
+	return cache.NewRedisCache(addr, "", 0)
+{{- else if eq .CacheType "valkey"}}
+	addr := getEnvOrDefault("TEST_VALKEY_ADDR", "localhost:6379")
+	return cache.NewValkeyCache(addr, "", 0)
+{{- else}}
+	return cache.NewMemoryCache(1000, 5*time.Minute), nil
+{{- end}}
+}
+{{- end}}
+
+{{- if .HasRateLimiter}}
+
+// setupTestRateLimiter creates a test rate limiter.
+func setupTestRateLimiter() (ratelimiter.RateLimiter, error) {
+{{- if eq .RateLimiterType "token-bucket"}}
+	return ratelimiter.NewTokenBucket(100, 10), nil // 100 tokens, 10 per second refill
+{{- else if eq .RateLimiterType "sliding-window"}}
+	return ratelimiter.NewSlidingWindow(100, time.Second), nil // 100 requests per second
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	return ratelimiter.NewLeakyBucket(100, 10), nil // 100 capacity, 10 per second
+{{- else if eq .RateLimiterType "fixed-window"}}
+	return ratelimiter.NewFixedWindow(100, time.Second), nil // 100 requests per second
+{{- else}}
+	return ratelimiter.NewTokenBucket(100, 10), nil
+{{- end}}
+}
+{{- end}}
+
+// getEnvOrDefault returns the environment variable value or a default.
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+{{- if .HasCache}}
+
+// mustGetTestCache returns the shared test cache, failing if not initialized.
+func mustGetTestCache(t *testing.T) cache.Cache {
+	t.Helper()
+	if testCache == nil {
+		t.Fatal("test cache not initialized - TestMain may have failed")
+	}
+	return testCache
+}
+{{- end}}
+
+{{- if .HasRateLimiter}}
+
+// mustGetTestRateLimiter returns the shared rate limiter, failing if not initialized.
+func mustGetTestRateLimiter(t *testing.T) ratelimiter.RateLimiter {
+	t.Helper()
+	if testRateLimiter == nil {
+		t.Fatal("test rate limiter not initialized - TestMain may have failed")
+	}
+	return testRateLimiter
+}
+{{- end}}
+
+// testRequest represents an HTTP request for testing.
+type testRequest struct {
+	method  string
+	path    string
+	body    any
+	headers map[string]string
+}
+
+// performRequest executes an HTTP request against the test handler.
+func performRequest(handler http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	var reqBody *bytes.Buffer
+	if body != nil {
+		jsonBody, _ := json.Marshal(body)
+		reqBody = bytes.NewBuffer(jsonBody)
+	} else {
+		reqBody = bytes.NewBuffer(nil)
+	}
+
+	req, _ := http.NewRequest(method, path, reqBody)
+	req.Header.Set("Content-Type", "application/json")
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	return w
+}
+
+// createTestBackend creates a simple test backend that returns the given status and body.
+func createTestBackend(status int, body string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}))
+}
+
+// createTestBackendWithDelay creates a test backend with artificial delay.
+func createTestBackendWithDelay(status int, body string, delay time.Duration) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay)
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}))
+}

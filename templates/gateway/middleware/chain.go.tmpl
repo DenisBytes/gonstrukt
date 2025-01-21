@@ -1,0 +1,90 @@
+package middleware
+
+import "net/http"
+
+// Middleware is a function that wraps an http.Handler
+type Middleware func(http.Handler) http.Handler
+
+// Chain chains multiple middleware functions together
+// Middleware are applied in the order they are provided
+func Chain(h http.Handler, middleware ...Middleware) http.Handler {
+	// Apply middleware in reverse order so they execute in the order provided
+	for i := len(middleware) - 1; i >= 0; i-- {
+		h = middleware[i](h)
+	}
+	return h
+}
+
+// ChainFunc chains middleware and wraps an http.HandlerFunc
+func ChainFunc(h http.HandlerFunc, middleware ...Middleware) http.Handler {
+	return Chain(h, middleware...)
+}
+
+// MiddlewareStack allows building a middleware chain incrementally
+type MiddlewareStack struct {
+	middleware []Middleware
+}
+
+// NewMiddlewareStack creates a new middleware stack
+func NewMiddlewareStack() *MiddlewareStack {
+	return &MiddlewareStack{
+		middleware: make([]Middleware, 0),
+	}
+}
+
+// Use adds middleware to the stack
+func (s *MiddlewareStack) Use(m ...Middleware) *MiddlewareStack {
+	s.middleware = append(s.middleware, m...)
+	return s
+}
+
+// Then applies the middleware stack to a handler
+func (s *MiddlewareStack) Then(h http.Handler) http.Handler {
+	return Chain(h, s.middleware...)
+}
+
+// ThenFunc applies the middleware stack to a handler function
+func (s *MiddlewareStack) ThenFunc(h http.HandlerFunc) http.Handler {
+	return s.Then(h)
+}
+
+// ConditionalMiddleware applies middleware only if the condition is true
+func ConditionalMiddleware(condition bool, m Middleware) Middleware {
+	return func(next http.Handler) http.Handler {
+		if condition {
+			return m(next)
+		}
+		return next
+	}
+}
+
+// PathPrefixMiddleware applies middleware only for requests with the given path prefix
+func PathPrefixMiddleware(prefix string, m Middleware) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(r.URL.Path) >= len(prefix) && r.URL.Path[:len(prefix)] == prefix {
+				m(next).ServeHTTP(w, r)
+			} else {
+				next.ServeHTTP(w, r)
+			}
+		})
+	}
+}
+
+// MethodMiddleware applies middleware only for specific HTTP methods
+func MethodMiddleware(methods []string, m Middleware) Middleware {
+	methodSet := make(map[string]struct{}, len(methods))
+	for _, method := range methods {
+		methodSet[method] = struct{}{}
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := methodSet[r.Method]; ok {
+				m(next).ServeHTTP(w, r)
+			} else {
+				next.ServeHTTP(w, r)
+			}
+		})
+	}
+}

@@ -1,0 +1,68 @@
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// HostValidationConfig holds configuration for host validation
+type HostValidationConfig struct {
+	AllowedHosts []string
+	AllowAll     bool
+}
+
+// HostValidation creates middleware that validates the Host header
+// This helps prevent DNS rebinding attacks and host header injection
+func HostValidation(cfg HostValidationConfig) func(http.Handler) http.Handler {
+	// Build a map for O(1) lookups
+	allowedHostsMap := make(map[string]bool)
+	for _, host := range cfg.AllowedHosts {
+		allowedHostsMap[strings.ToLower(host)] = true
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+{{- if .HasObservability}}
+			ctx := r.Context()
+			span := trace.SpanFromContext(ctx)
+			span.SetAttributes(
+				attribute.String("security.host", r.Host),
+				attribute.String("security.check", "host_validation"),
+			)
+{{- end}}
+
+			if cfg.AllowAll {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Extract host without port
+			host := r.Host
+			if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
+				host = host[:colonIdx]
+			}
+			host = strings.ToLower(host)
+
+			// Check if host is allowed
+			if !allowedHostsMap[host] {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Invalid host header")
+				span.SetAttributes(attribute.Bool("security.blocked", true))
+{{- end}}
+				http.Error(w, "Invalid host header", http.StatusBadRequest)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.Bool("security.allowed", true))
+{{- end}}
+			next.ServeHTTP(w, r)
+		})
+	}
+}

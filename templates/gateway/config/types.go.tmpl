@@ -1,0 +1,100 @@
+package config
+
+import "time"
+
+// Config holds all gateway configuration
+type Config struct {
+	Server           ServerConfig            `yaml:"server" json:"server" env:"SERVER"`
+	Environment      string                  `yaml:"environment" json:"environment" env:"ENVIRONMENT" envDefault:"development"`
+	UpstreamServices []UpstreamServiceConfig `yaml:"upstream_services" json:"upstream_services"`
+	CORS             CORSConfig              `yaml:"cors" json:"cors" env:"CORS"`
+{{- if .HasObservability}}
+	OTLPEndpoint     string                  `yaml:"otlp_endpoint" json:"otlp_endpoint" env:"OTLP_ENDPOINT" envDefault:"localhost:4317"`
+{{- end}}
+{{- if eq .CacheType "redis"}}
+	Redis            RedisConfig             `yaml:"redis" json:"redis" env:"REDIS"`
+{{- else if eq .CacheType "valkey"}}
+	Valkey           ValkeyConfig            `yaml:"valkey" json:"valkey" env:"VALKEY"`
+{{- else if eq .CacheType "memory"}}
+	Cache            MemoryCacheConfig       `yaml:"cache" json:"cache" env:"CACHE"`
+{{- end}}
+{{- if .HasRateLimiter}}
+	RateLimiter      RateLimiterConfig       `yaml:"rate_limiter" json:"rate_limiter" env:"RATE_LIMITER"`
+{{- end}}
+}
+
+// ServerConfig holds HTTP server configuration
+type ServerConfig struct {
+	Addr         string        `yaml:"addr" json:"addr" env:"ADDR" envDefault:":8080"`
+	ReadTimeout  time.Duration `yaml:"read_timeout" json:"read_timeout" env:"READ_TIMEOUT" envDefault:"15s"`
+	WriteTimeout time.Duration `yaml:"write_timeout" json:"write_timeout" env:"WRITE_TIMEOUT" envDefault:"15s"`
+	IdleTimeout  time.Duration `yaml:"idle_timeout" json:"idle_timeout" env:"IDLE_TIMEOUT" envDefault:"60s"`
+	TLSEnabled   bool          `yaml:"tls_enabled" json:"tls_enabled" env:"TLS_ENABLED" envDefault:"false"`
+	TLSCertFile  string        `yaml:"tls_cert_file" json:"tls_cert_file" env:"TLS_CERT_FILE"`
+	TLSKeyFile   string        `yaml:"tls_key_file" json:"tls_key_file" env:"TLS_KEY_FILE"`
+}
+
+// CORSConfig holds CORS configuration
+type CORSConfig struct {
+	AllowedOrigins   []string `yaml:"allowed_origins" json:"allowed_origins" env:"ALLOWED_ORIGINS"`
+	AllowedMethods   []string `yaml:"allowed_methods" json:"allowed_methods" env:"ALLOWED_METHODS"`
+	AllowedHeaders   []string `yaml:"allowed_headers" json:"allowed_headers" env:"ALLOWED_HEADERS"`
+	ExposedHeaders   []string `yaml:"exposed_headers" json:"exposed_headers" env:"EXPOSED_HEADERS"`
+	AllowCredentials bool     `yaml:"allow_credentials" json:"allow_credentials" env:"ALLOW_CREDENTIALS"`
+	MaxAge           int      `yaml:"max_age" json:"max_age" env:"MAX_AGE" envDefault:"86400"`
+}
+
+// UpstreamServiceConfig holds configuration for an upstream service
+type UpstreamServiceConfig struct {
+	Name        string        `yaml:"name" json:"name"`
+	URL         string        `yaml:"url" json:"url"`
+	PathPrefix  string        `yaml:"path_prefix" json:"path_prefix"`
+	Timeout     time.Duration `yaml:"timeout" json:"timeout" envDefault:"30s"`
+	RetryCount  int           `yaml:"retry_count" json:"retry_count" envDefault:"3"`
+	HealthCheck string        `yaml:"health_check" json:"health_check"`
+}
+
+{{- if eq .CacheType "redis"}}
+
+// RedisConfig holds Redis connection configuration
+type RedisConfig struct {
+	Addr     string `yaml:"addr" json:"addr" env:"ADDR" envDefault:"localhost:6379"`
+	Password string `yaml:"password" json:"password" env:"PASSWORD"`
+	DB       int    `yaml:"db" json:"db" env:"DB" envDefault:"0"`
+}
+{{- else if eq .CacheType "valkey"}}
+
+// ValkeyConfig holds Valkey connection configuration
+type ValkeyConfig struct {
+	Addr     string `yaml:"addr" json:"addr" env:"ADDR" envDefault:"localhost:6379"`
+	Password string `yaml:"password" json:"password" env:"PASSWORD"`
+	DB       int    `yaml:"db" json:"db" env:"DB" envDefault:"0"`
+}
+{{- else if eq .CacheType "memory"}}
+
+// MemoryCacheConfig holds in-memory cache configuration
+type MemoryCacheConfig struct {
+	MaxSize int           `yaml:"max_size" json:"max_size" env:"MAX_SIZE" envDefault:"10000"`
+	TTL     time.Duration `yaml:"ttl" json:"ttl" env:"TTL" envDefault:"5m"`
+}
+{{- end}}
+
+{{- if .HasRateLimiter}}
+
+// RateLimiterConfig holds rate limiter configuration
+type RateLimiterConfig struct {
+{{- if eq .RateLimiterType "token-bucket"}}
+	Rate  float64 `yaml:"rate" json:"rate" env:"RATE" envDefault:"100"`
+	Burst int     `yaml:"burst" json:"burst" env:"BURST" envDefault:"200"`
+{{- else if eq .RateLimiterType "sliding-window"}}
+	Rate       float64       `yaml:"rate" json:"rate" env:"RATE" envDefault:"100"`
+	WindowSize time.Duration `yaml:"window_size" json:"window_size" env:"WINDOW_SIZE" envDefault:"1s"`
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	Rate  float64 `yaml:"rate" json:"rate" env:"RATE" envDefault:"100"`
+	Burst int     `yaml:"burst" json:"burst" env:"BURST" envDefault:"200"`
+{{- else if eq .RateLimiterType "fixed-window"}}
+	Rate       float64       `yaml:"rate" json:"rate" env:"RATE" envDefault:"100"`
+	WindowSize time.Duration `yaml:"window_size" json:"window_size" env:"WINDOW_SIZE" envDefault:"1s"`
+{{- end}}
+}
+{{- end}}

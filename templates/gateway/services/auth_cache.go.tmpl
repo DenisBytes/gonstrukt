@@ -1,0 +1,326 @@
+{{- if .AuthCache}}
+package services
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+{{- end}}
+)
+
+// AuthCacheService handles caching of auth service responses
+type AuthCacheService struct {
+	gateway *Gateway
+}
+
+// UserSession represents cached user session data
+type UserSession struct {
+	UserID      string            `json:"user_id"`
+	Email       string            `json:"email"`
+	Roles       []string          `json:"roles"`
+	SessionID   string            `json:"session_id"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+	Permissions map[string]bool   `json:"permissions,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+}
+
+// AuthResponse represents cached auth responses
+type AuthResponse struct {
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	Body       json.RawMessage   `json:"body"`
+	Timestamp  time.Time         `json:"timestamp"`
+	TTL        time.Duration     `json:"ttl"`
+}
+
+// Cache keys and TTL constants
+const (
+	UserSessionPrefix     = "auth:session:"
+	AuthResponsePrefix    = "auth:response:"
+	UserProfilePrefix     = "auth:profile:"
+	TokenValidationPrefix = "auth:token:"
+
+	// TTL durations
+	SessionCacheTTL    = 15 * time.Minute // Session data cache
+	ProfileCacheTTL    = 30 * time.Minute // User profile cache
+	TokenValidationTTL = 5 * time.Minute  // Token validation cache
+	AuthResponseTTL    = 10 * time.Minute // General auth response cache
+	FailedAuthTTL      = 1 * time.Minute  // Failed auth attempts (short TTL)
+)
+
+// NewAuthCacheService creates a new auth cache service
+func NewAuthCacheService(gateway *Gateway) *AuthCacheService {
+	return &AuthCacheService{
+		gateway: gateway,
+	}
+}
+
+// CacheUserSession stores user session data in cache
+func (acs *AuthCacheService) CacheUserSession(ctx context.Context, sessionToken string, session *UserSession) error {
+{{- if .HasObservability}}
+	ctx, span := otel.Tracer("gateway").Start(ctx, "cache_user_session")
+	defer span.End()
+{{- end}}
+
+	if acs.gateway.cache == nil {
+		return nil // Graceful degradation
+	}
+
+	key := UserSessionPrefix + sessionToken
+	sessionData, err := json.Marshal(session)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return fmt.Errorf("failed to marshal session data: %w", err)
+	}
+
+	err = acs.gateway.cache.Set(ctx, key, sessionData, SessionCacheTTL)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return fmt.Errorf("failed to cache session: %w", err)
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("session.user_id", session.UserID),
+		attribute.String("session.cache_key", key),
+		attribute.String("session.ttl", SessionCacheTTL.String()),
+	)
+{{- end}}
+
+	return nil
+}
+
+// GetCachedUserSession retrieves user session data from cache
+func (acs *AuthCacheService) GetCachedUserSession(ctx context.Context, sessionToken string) (*UserSession, error) {
+{{- if .HasObservability}}
+	ctx, span := otel.Tracer("gateway").Start(ctx, "get_cached_user_session")
+	defer span.End()
+{{- end}}
+
+	if acs.gateway.cache == nil {
+		return nil, fmt.Errorf("cache not available")
+	}
+
+	key := UserSessionPrefix + sessionToken
+	sessionData, err := acs.gateway.cache.Get(ctx, key)
+	if err != nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "session not found in cache")
+{{- end}}
+		return nil, fmt.Errorf("session not found in cache: %w", err)
+	}
+
+	var session UserSession
+	if err := json.Unmarshal(sessionData, &session); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return nil, fmt.Errorf("failed to unmarshal session data: %w", err)
+	}
+
+	// Check if session is expired
+	if time.Now().After(session.ExpiresAt) {
+		// Remove expired session from cache
+		acs.gateway.cache.Delete(ctx, key)
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "session expired")
+{{- end}}
+		return nil, fmt.Errorf("session expired")
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("session.user_id", session.UserID),
+		attribute.String("session.cache_key", key),
+		attribute.Bool("session.found", true),
+	)
+{{- end}}
+
+	return &session, nil
+}
+
+// InvalidateUserSession removes user session from cache
+func (acs *AuthCacheService) InvalidateUserSession(ctx context.Context, sessionToken string) error {
+{{- if .HasObservability}}
+	ctx, span := otel.Tracer("gateway").Start(ctx, "invalidate_user_session")
+	defer span.End()
+{{- end}}
+
+	if acs.gateway.cache == nil {
+		return nil // Graceful degradation
+	}
+
+	key := UserSessionPrefix + sessionToken
+	err := acs.gateway.cache.Delete(ctx, key)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return fmt.Errorf("failed to invalidate session: %w", err)
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(attribute.String("session.cache_key", key))
+{{- end}}
+
+	return nil
+}
+
+// CacheAuthResponse caches general auth service responses
+func (acs *AuthCacheService) CacheAuthResponse(ctx context.Context, cacheKey string, statusCode int, headers http.Header, body []byte, ttl time.Duration) error {
+	if acs.gateway.cache == nil {
+		return nil // Graceful degradation
+	}
+
+	// Don't cache error responses for too long
+	if statusCode >= 400 {
+		ttl = FailedAuthTTL
+	}
+
+{{- if .HasObservability}}
+	ctx, span := otel.Tracer("gateway").Start(ctx, "cache_auth_response")
+	defer span.End()
+{{- end}}
+
+	// Convert headers to map for JSON serialization
+	headerMap := make(map[string]string)
+	for key, values := range headers {
+		if len(values) > 0 {
+			headerMap[key] = values[0] // Take first value
+		}
+	}
+
+	authResp := AuthResponse{
+		StatusCode: statusCode,
+		Headers:    headerMap,
+		Body:       json.RawMessage(body),
+		Timestamp:  time.Now(),
+		TTL:        ttl,
+	}
+
+	responseData, err := json.Marshal(authResp)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return fmt.Errorf("failed to marshal auth response: %w", err)
+	}
+
+	key := AuthResponsePrefix + cacheKey
+	err = acs.gateway.cache.Set(ctx, key, responseData, ttl)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return fmt.Errorf("failed to cache auth response: %w", err)
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("cache.key", key),
+		attribute.Int("response.status_code", statusCode),
+		attribute.String("cache.ttl", ttl.String()),
+	)
+{{- end}}
+
+	return nil
+}
+
+// GetCachedAuthResponse retrieves cached auth service response
+func (acs *AuthCacheService) GetCachedAuthResponse(ctx context.Context, cacheKey string) (*AuthResponse, error) {
+	if acs.gateway.cache == nil {
+		return nil, fmt.Errorf("cache not available")
+	}
+
+{{- if .HasObservability}}
+	ctx, span := otel.Tracer("gateway").Start(ctx, "get_cached_auth_response")
+	defer span.End()
+{{- end}}
+
+	key := AuthResponsePrefix + cacheKey
+	responseData, err := acs.gateway.cache.Get(ctx, key)
+	if err != nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "auth response not found in cache")
+{{- end}}
+		return nil, fmt.Errorf("auth response not found in cache: %w", err)
+	}
+
+	var authResp AuthResponse
+	if err := json.Unmarshal(responseData, &authResp); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		return nil, fmt.Errorf("failed to unmarshal auth response: %w", err)
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("cache.key", key),
+		attribute.Int("response.status_code", authResp.StatusCode),
+		attribute.Bool("cache.hit", true),
+	)
+{{- end}}
+
+	return &authResp, nil
+}
+
+// GenerateCacheKey creates a cache key from request attributes
+func (acs *AuthCacheService) GenerateCacheKey(method, path, query string, headers map[string]string) string {
+	// Include relevant headers that affect auth (like session tokens)
+	relevantHeaders := []string{"authorization", "cookie", "x-session-token"}
+
+	var keyParts []string
+	keyParts = append(keyParts, method, path)
+
+	if query != "" {
+		keyParts = append(keyParts, query)
+	}
+
+	for _, headerName := range relevantHeaders {
+		if value, exists := headers[strings.ToLower(headerName)]; exists {
+			keyParts = append(keyParts, headerName+"="+value)
+		}
+	}
+
+	// Create hash of the key parts to avoid long keys
+	keyString := strings.Join(keyParts, "|")
+	hash := sha256.Sum256([]byte(keyString))
+	return fmt.Sprintf("%x", hash)
+}
+
+// ExtractSessionTokenFromRequest extracts session token from request
+func (acs *AuthCacheService) ExtractSessionTokenFromRequest(r *http.Request) string {
+	// Try Authorization header first
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if strings.HasPrefix(auth, "Bearer ") {
+			return strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+
+	// Try cookies
+	if cookie, err := r.Cookie("session-token"); err == nil {
+		return cookie.Value
+	}
+
+	if cookie, err := r.Cookie("__Host-session-token"); err == nil {
+		return cookie.Value
+	}
+
+	return ""
+}
+{{- end}}

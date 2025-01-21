@@ -1,0 +1,65 @@
+package ratelimiter
+
+import (
+	"context"
+	"net/http"
+)
+
+// RateLimiter defines the interface for rate limiting implementations
+type RateLimiter interface {
+	// Allow checks if a request should be allowed
+	// Returns true if the request is allowed, false otherwise
+	Allow(ctx context.Context, key string) (bool, error)
+
+	// AllowN checks if n requests should be allowed
+	AllowN(ctx context.Context, key string, n int) (bool, error)
+
+	// Reset resets the rate limit for a key
+	Reset(ctx context.Context, key string) error
+
+	// GetStats returns current rate limit statistics for a key
+	GetStats(ctx context.Context, key string) (*Stats, error)
+}
+
+// Stats holds rate limit statistics
+type Stats struct {
+	Key       string
+	Remaining int
+	Total     int
+	ResetAt   int64
+}
+
+// KeyFunc extracts the rate limiting key from a request
+type KeyFunc func(*http.Request) string
+
+// DefaultKeyFunc uses the client IP as the rate limiting key
+func DefaultKeyFunc(r *http.Request) string {
+	// Check X-Forwarded-For header first
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return xff
+	}
+
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+
+	// Fall back to RemoteAddr
+	return r.RemoteAddr
+}
+
+// ErrRateLimited is returned when a request is rate limited
+type ErrRateLimited struct {
+	Key      string
+	RetryAt  int64
+}
+
+func (e *ErrRateLimited) Error() string {
+	return "rate limit exceeded for: " + e.Key
+}
+
+// IsRateLimited checks if an error is a rate limit error
+func IsRateLimited(err error) bool {
+	_, ok := err.(*ErrRateLimited)
+	return ok
+}

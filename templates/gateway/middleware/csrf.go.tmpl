@@ -1,0 +1,156 @@
+package middleware
+
+import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"net/http"
+	"time"
+)
+
+const (
+	csrfTokenHeader  = "X-CSRF-Token"
+	csrfTokenCookie  = "_csrf"
+	csrfTokenLength  = 32
+)
+
+// CSRFConfig holds CSRF protection configuration
+type CSRFConfig struct {
+	// TokenLength is the length of the CSRF token in bytes
+	TokenLength int
+
+	// CookieName is the name of the CSRF cookie
+	CookieName string
+
+	// HeaderName is the name of the CSRF header
+	HeaderName string
+
+	// CookiePath is the path for the CSRF cookie
+	CookiePath string
+
+	// CookieDomain is the domain for the CSRF cookie
+	CookieDomain string
+
+	// CookieSecure sets the Secure flag on the cookie
+	CookieSecure bool
+
+	// CookieHTTPOnly sets the HttpOnly flag on the cookie
+	CookieHTTPOnly bool
+
+	// CookieSameSite sets the SameSite attribute
+	CookieSameSite http.SameSite
+
+	// MaxAge is the max age of the CSRF cookie in seconds
+	MaxAge int
+
+	// ExcludedPaths are paths that should not require CSRF validation
+	ExcludedPaths []string
+
+	// SafeMethods are HTTP methods that don't require CSRF validation
+	SafeMethods []string
+}
+
+// DefaultCSRFConfig returns the default CSRF configuration
+func DefaultCSRFConfig() CSRFConfig {
+	return CSRFConfig{
+		TokenLength:    csrfTokenLength,
+		CookieName:     csrfTokenCookie,
+		HeaderName:     csrfTokenHeader,
+		CookiePath:     "/",
+		CookieSecure:   true,
+		CookieHTTPOnly: true,
+		CookieSameSite: http.SameSiteStrictMode,
+		MaxAge:         86400,
+		SafeMethods:    []string{"GET", "HEAD", "OPTIONS", "TRACE"},
+		ExcludedPaths:  []string{"/health", "/readiness"},
+	}
+}
+
+// CSRF middleware provides CSRF protection
+func CSRF(cfg CSRFConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Check if path is excluded
+			for _, path := range cfg.ExcludedPaths {
+				if r.URL.Path == path {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			// Check if method is safe (doesn't require CSRF validation)
+			isSafe := false
+			for _, method := range cfg.SafeMethods {
+				if r.Method == method {
+					isSafe = true
+					break
+				}
+			}
+
+			// Get or create CSRF token
+			var token string
+			cookie, err := r.Cookie(cfg.CookieName)
+			if err != nil || cookie.Value == "" {
+				token = generateToken(cfg.TokenLength)
+				if token == "" {
+					http.Error(w, "Internal server error", http.StatusInternalServerError)
+					return
+				}
+				setCSRFCookie(w, cfg, token)
+			} else {
+				token = cookie.Value
+			}
+
+			// For unsafe methods, validate the token
+			if !isSafe {
+				headerToken := r.Header.Get(cfg.HeaderName)
+				if headerToken == "" {
+					http.Error(w, "CSRF token missing", http.StatusForbidden)
+					return
+				}
+
+				if !validateToken(token, headerToken) {
+					http.Error(w, "CSRF token invalid", http.StatusForbidden)
+					return
+				}
+			}
+
+			// Set token in response header for client to use
+			w.Header().Set(cfg.HeaderName, token)
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// generateToken generates a cryptographically secure random token
+// Returns empty string on error (caller should handle)
+func generateToken(length int) string {
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read should never fail on a properly configured system
+		// If it does, return empty string and let caller handle it
+		return ""
+	}
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+// validateToken validates the CSRF token using constant-time comparison
+func validateToken(expected, actual string) bool {
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+}
+
+// setCSRFCookie sets the CSRF cookie
+func setCSRFCookie(w http.ResponseWriter, cfg CSRFConfig, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     cfg.CookieName,
+		Value:    token,
+		Path:     cfg.CookiePath,
+		Domain:   cfg.CookieDomain,
+		MaxAge:   cfg.MaxAge,
+		Secure:   cfg.CookieSecure,
+		HttpOnly: cfg.CookieHTTPOnly,
+		SameSite: cfg.CookieSameSite,
+		Expires:  time.Now().Add(time.Duration(cfg.MaxAge) * time.Second),
+	})
+}

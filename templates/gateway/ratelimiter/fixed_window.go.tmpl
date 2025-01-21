@@ -1,0 +1,148 @@
+package ratelimiter
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// fixedWindow represents a single fixed window counter
+type fixedWindow struct {
+	count       int
+	windowStart time.Time
+}
+
+// FixedWindow implements a fixed window rate limiter
+// Simple approach that counts requests in discrete time windows
+// Best for non-critical endpoints where simplicity is preferred
+type FixedWindow struct {
+	limit      int           // maximum requests per window
+	window     time.Duration // window duration
+	windows    map[string]*fixedWindow
+	mu         sync.RWMutex
+	cleanupInt time.Duration
+	stopCh     chan struct{}
+}
+
+// NewFixedWindow creates a new fixed window rate limiter
+// limit is requests per window, window is the duration
+func NewFixedWindow(limit int, window time.Duration) *FixedWindow {
+	fw := &FixedWindow{
+		limit:      limit,
+		window:     window,
+		windows:    make(map[string]*fixedWindow),
+		cleanupInt: window * 2,
+		stopCh:     make(chan struct{}),
+	}
+
+	go fw.cleanup()
+
+	return fw
+}
+
+// Allow checks if one request is allowed
+func (f *FixedWindow) Allow(ctx context.Context, key string) (bool, error) {
+	return f.AllowN(ctx, key, 1)
+}
+
+// AllowN checks if n requests are allowed
+func (f *FixedWindow) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	now := time.Now()
+	windowStart := now.Truncate(f.window)
+
+	w, exists := f.windows[key]
+	if !exists || w.windowStart != windowStart {
+		// Start a new window
+		w = &fixedWindow{
+			count:       0,
+			windowStart: windowStart,
+		}
+		f.windows[key] = w
+	}
+
+	// Check if we're within limit
+	if w.count+n <= f.limit {
+		w.count += n
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// Reset resets the window for a key
+func (f *FixedWindow) Reset(ctx context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.windows, key)
+	return nil
+}
+
+// GetStats returns statistics for a key
+func (f *FixedWindow) GetStats(ctx context.Context, key string) (*Stats, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	now := time.Now()
+	windowStart := now.Truncate(f.window)
+
+	w, exists := f.windows[key]
+	if !exists || w.windowStart != windowStart {
+		return &Stats{
+			Key:       key,
+			Remaining: f.limit,
+			Total:     f.limit,
+			ResetAt:   windowStart.Add(f.window).Unix(),
+		}, nil
+	}
+
+	remaining := f.limit - w.count
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	return &Stats{
+		Key:       key,
+		Remaining: remaining,
+		Total:     f.limit,
+		ResetAt:   w.windowStart.Add(f.window).Unix(),
+	}, nil
+}
+
+// cleanup periodically removes old windows
+func (f *FixedWindow) cleanup() {
+	ticker := time.NewTicker(f.cleanupInt)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			f.removeOldWindows()
+		case <-f.stopCh:
+			return
+		}
+	}
+}
+
+// removeOldWindows removes windows that are no longer relevant
+func (f *FixedWindow) removeOldWindows() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	now := time.Now()
+	currentWindow := now.Truncate(f.window)
+
+	for key, w := range f.windows {
+		// Remove windows from previous periods
+		if w.windowStart.Before(currentWindow) {
+			delete(f.windows, key)
+		}
+	}
+}
+
+// Close stops the cleanup goroutine
+func (f *FixedWindow) Close() {
+	close(f.stopCh)
+}

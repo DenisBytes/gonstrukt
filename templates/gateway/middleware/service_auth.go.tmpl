@@ -1,0 +1,119 @@
+package middleware
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+const (
+	serviceAuthHeader = "X-Service-Auth"
+	timestampHeader   = "X-Timestamp"
+	serviceIDHeader   = "X-Service-ID"
+)
+
+// ServiceAuthConfig holds configuration for service authentication
+type ServiceAuthConfig struct {
+	// ServiceID is this service's identifier
+	ServiceID string
+
+	// SharedSecrets maps service IDs to their shared secrets
+	SharedSecrets map[string]string
+
+	// MaxClockSkew is the maximum allowed clock difference
+	MaxClockSkew time.Duration
+
+	// RequireAuth determines if authentication is required
+	RequireAuth bool
+}
+
+// DefaultServiceAuthConfig returns default service auth configuration
+func DefaultServiceAuthConfig() ServiceAuthConfig {
+	return ServiceAuthConfig{
+		MaxClockSkew: 5 * time.Minute,
+		RequireAuth:  true,
+	}
+}
+
+// ServiceAuth middleware validates inter-service authentication
+func ServiceAuth(cfg ServiceAuthConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Get auth headers
+			authSig := r.Header.Get(serviceAuthHeader)
+			timestamp := r.Header.Get(timestampHeader)
+			serviceID := r.Header.Get(serviceIDHeader)
+
+			// If no auth headers and auth is not required, proceed
+			if authSig == "" && timestamp == "" && serviceID == "" {
+				if cfg.RequireAuth {
+					http.Error(w, "service authentication required", http.StatusUnauthorized)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// All auth headers must be present
+			if authSig == "" || timestamp == "" || serviceID == "" {
+				http.Error(w, "incomplete service authentication", http.StatusUnauthorized)
+				return
+			}
+
+			// Verify timestamp is within acceptable range
+			ts, err := strconv.ParseInt(timestamp, 10, 64)
+			if err != nil {
+				http.Error(w, "invalid timestamp", http.StatusUnauthorized)
+				return
+			}
+
+			requestTime := time.Unix(ts, 0)
+			if time.Since(requestTime).Abs() > cfg.MaxClockSkew {
+				http.Error(w, "request timestamp expired", http.StatusUnauthorized)
+				return
+			}
+
+			// Get shared secret for the service
+			secret, ok := cfg.SharedSecrets[serviceID]
+			if !ok {
+				http.Error(w, "unknown service", http.StatusUnauthorized)
+				return
+			}
+
+			// Verify signature
+			expectedSig := computeSignature(serviceID, timestamp, r.Method, r.URL.Path, secret)
+			if !hmac.Equal([]byte(authSig), []byte(expectedSig)) {
+				http.Error(w, "invalid service signature", http.StatusUnauthorized)
+				return
+			}
+
+			// Add service info to request context or header
+			r.Header.Set("X-Authenticated-Service", serviceID)
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// computeSignature creates an HMAC signature for the request
+func computeSignature(serviceID, timestamp, method, path, secret string) string {
+	data := serviceID + ":" + timestamp + ":" + method + ":" + path
+
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(data))
+
+	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+}
+
+// SignRequest adds service authentication headers to an outgoing request
+func SignRequest(r *http.Request, serviceID, secret string) {
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	signature := computeSignature(serviceID, timestamp, r.Method, r.URL.Path, secret)
+
+	r.Header.Set(serviceIDHeader, serviceID)
+	r.Header.Set(timestampHeader, timestamp)
+	r.Header.Set(serviceAuthHeader, signature)
+}

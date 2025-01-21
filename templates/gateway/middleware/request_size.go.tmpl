@@ -1,0 +1,86 @@
+package middleware
+
+import (
+	"net/http"
+
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// RequestSizeConfig holds configuration for request size limiting
+type RequestSizeConfig struct {
+	MaxBodySize    int64 // Maximum request body size in bytes
+	MaxHeadersSize int   // Maximum total headers size in bytes
+}
+
+// DefaultRequestSizeConfig returns sensible defaults
+func DefaultRequestSizeConfig() RequestSizeConfig {
+	return RequestSizeConfig{
+		MaxBodySize:    10 * 1024 * 1024, // 10MB
+		MaxHeadersSize: 32 * 1024,        // 32KB
+	}
+}
+
+// RequestSizeLimit creates middleware that limits request size
+// This helps prevent denial of service attacks via large payloads
+func RequestSizeLimit(cfg RequestSizeConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+{{- if .HasObservability}}
+			ctx := r.Context()
+			span := trace.SpanFromContext(ctx)
+			span.SetAttributes(attribute.String("security.check", "request_size"))
+{{- end}}
+
+			// Check Content-Length header
+			if r.ContentLength > cfg.MaxBodySize {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Request body too large")
+				span.SetAttributes(
+					attribute.Bool("security.blocked", true),
+					attribute.Int64("security.content_length", r.ContentLength),
+					attribute.Int64("security.max_size", cfg.MaxBodySize),
+				)
+{{- end}}
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+
+			// Check total header size
+			headerSize := 0
+			for name, values := range r.Header {
+				headerSize += len(name)
+				for _, v := range values {
+					headerSize += len(v)
+				}
+			}
+
+			if headerSize > cfg.MaxHeadersSize {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Request headers too large")
+				span.SetAttributes(
+					attribute.Bool("security.blocked", true),
+					attribute.Int("security.header_size", headerSize),
+					attribute.Int("security.max_header_size", cfg.MaxHeadersSize),
+				)
+{{- end}}
+				http.Error(w, "Request headers too large", http.StatusRequestHeaderFieldsTooLarge)
+				return
+			}
+
+			// Wrap the body with a size limiter
+			r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxBodySize)
+
+{{- if .HasObservability}}
+			span.SetAttributes(
+				attribute.Bool("security.allowed", true),
+				attribute.Int64("security.content_length", r.ContentLength),
+			)
+{{- end}}
+			next.ServeHTTP(w, r)
+		})
+	}
+}

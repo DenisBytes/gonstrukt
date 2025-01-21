@@ -1,0 +1,102 @@
+package cache
+
+import (
+	"context"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// ValkeyCache implements Cache interface using Valkey (Redis-compatible)
+type ValkeyCache struct {
+	client *redis.Client
+}
+
+// NewValkeyCache creates a new Valkey cache client
+func NewValkeyCache(addr, password string, db int) (*ValkeyCache, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     100,
+		MinIdleConns: 10,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, err
+	}
+
+	return &ValkeyCache{client: client}, nil
+}
+
+// Get retrieves a value from Valkey
+func (c *ValkeyCache) Get(ctx context.Context, key string) ([]byte, error) {
+	val, err := c.client.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		return nil, &ErrCacheMiss{Key: key}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+// Set stores a value in Valkey
+func (c *ValkeyCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return c.client.Set(ctx, key, value, ttl).Err()
+}
+
+// Delete removes a value from Valkey
+func (c *ValkeyCache) Delete(ctx context.Context, key string) error {
+	return c.client.Del(ctx, key).Err()
+}
+
+// Exists checks if a key exists in Valkey
+func (c *ValkeyCache) Exists(ctx context.Context, key string) (bool, error) {
+	n, err := c.client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// Clear removes all entries from the current database
+func (c *ValkeyCache) Clear(ctx context.Context) error {
+	return c.client.FlushDB(ctx).Err()
+}
+
+// Close closes the Valkey connection
+func (c *ValkeyCache) Close(ctx context.Context) error {
+	return c.client.Close()
+}
+
+// GetClient returns the underlying client for advanced operations
+func (c *ValkeyCache) GetClient() *redis.Client {
+	return c.client
+}
+
+// SetNX sets a value only if it doesn't exist (for distributed locking)
+func (c *ValkeyCache) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	return c.client.SetNX(ctx, key, value, ttl).Result()
+}
+
+// Incr increments a counter
+func (c *ValkeyCache) Incr(ctx context.Context, key string) (int64, error) {
+	return c.client.Incr(ctx, key).Result()
+}
+
+// IncrBy increments a counter by a specific amount
+func (c *ValkeyCache) IncrBy(ctx context.Context, key string, value int64) (int64, error) {
+	return c.client.IncrBy(ctx, key, value).Result()
+}
+
+// Expire sets TTL on an existing key
+func (c *ValkeyCache) Expire(ctx context.Context, key string, ttl time.Duration) error {
+	return c.client.Expire(ctx, key, ttl).Err()
+}

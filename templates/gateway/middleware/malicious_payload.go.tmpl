@@ -1,0 +1,168 @@
+package middleware
+
+import (
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// MaliciousPayloadConfig holds configuration for payload detection
+type MaliciousPayloadConfig struct {
+	MaxBodySize     int64 // Maximum body size to scan (default 10KB)
+	EnableXSS       bool  // Enable XSS detection
+	EnableSQLi      bool  // Enable SQL injection detection
+	EnableCmdInject bool  // Enable command injection detection
+}
+
+// DefaultMaliciousPayloadConfig returns sensible defaults
+func DefaultMaliciousPayloadConfig() MaliciousPayloadConfig {
+	return MaliciousPayloadConfig{
+		MaxBodySize:     10 * 1024, // 10KB
+		EnableXSS:       true,
+		EnableSQLi:      true,
+		EnableCmdInject: true,
+	}
+}
+
+// MaliciousPayloadDetection creates middleware that detects potentially malicious payloads
+func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) http.Handler {
+	// XSS patterns
+	xssPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)<script[^>]*>`),
+		regexp.MustCompile(`(?i)javascript\s*:`),
+		regexp.MustCompile(`(?i)on\w+\s*=`),
+		regexp.MustCompile(`(?i)<iframe[^>]*>`),
+		regexp.MustCompile(`(?i)<object[^>]*>`),
+		regexp.MustCompile(`(?i)<embed[^>]*>`),
+		regexp.MustCompile(`(?i)expression\s*\(`),
+	}
+
+	// SQL injection patterns
+	sqliPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(union|select|insert|update|delete|drop|exec|execute|xp_|sp_)\s`),
+		regexp.MustCompile(`(?i)('\s*(or|and)\s*'[^']*')`),
+		regexp.MustCompile(`(?i)(--|\|\|)`),
+		regexp.MustCompile(`(?i)(;|')\s*(select|insert|update|delete|drop)`),
+		regexp.MustCompile(`(?i)sleep\s*\(\s*\d+\s*\)`),
+		regexp.MustCompile(`(?i)benchmark\s*\(`),
+	}
+
+	// Command injection patterns
+	cmdPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`[;&|]`),
+		regexp.MustCompile("(?i)`[^`]+`"),
+		regexp.MustCompile(`\$\([^)]+\)`),
+		regexp.MustCompile(`(?i)(cat|ls|whoami|id|curl|wget|nc|netcat)\s`),
+		regexp.MustCompile(`(?i)/etc/(passwd|shadow|hosts)`),
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+{{- if .HasObservability}}
+			ctx := r.Context()
+			span := trace.SpanFromContext(ctx)
+			span.SetAttributes(attribute.String("security.check", "malicious_payload"))
+{{- end}}
+
+			// Check URL parameters
+			for key, values := range r.URL.Query() {
+				for _, value := range values {
+					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
+{{- if .HasObservability}}
+						span.SetStatus(codes.Error, "Malicious payload detected in query")
+						span.SetAttributes(
+							attribute.Bool("security.blocked", true),
+							attribute.String("security.param", key),
+							attribute.String("security.detection", pattern),
+						)
+{{- end}}
+						http.Error(w, "Bad Request", http.StatusBadRequest)
+						return
+					}
+				}
+			}
+
+			// Check headers for common injection points
+			headersToCheck := []string{"User-Agent", "Referer", "X-Forwarded-For", "X-Forwarded-Host"}
+			for _, header := range headersToCheck {
+				if value := r.Header.Get(header); value != "" {
+					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
+{{- if .HasObservability}}
+						span.SetStatus(codes.Error, "Malicious payload detected in header")
+						span.SetAttributes(
+							attribute.Bool("security.blocked", true),
+							attribute.String("security.header", header),
+							attribute.String("security.detection", pattern),
+						)
+{{- end}}
+						http.Error(w, "Bad Request", http.StatusBadRequest)
+						return
+					}
+				}
+			}
+
+			// Check body for POST/PUT/PATCH requests
+			if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+				if r.ContentLength > 0 && r.ContentLength <= cfg.MaxBodySize {
+					body, err := io.ReadAll(io.LimitReader(r.Body, cfg.MaxBodySize))
+					if err == nil {
+						if blocked, pattern := checkMaliciousContent(string(body), cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
+{{- if .HasObservability}}
+							span.SetStatus(codes.Error, "Malicious payload detected in body")
+							span.SetAttributes(
+								attribute.Bool("security.blocked", true),
+								attribute.String("security.detection", pattern),
+							)
+{{- end}}
+							http.Error(w, "Bad Request", http.StatusBadRequest)
+							return
+						}
+						// Restore the body
+						r.Body = io.NopCloser(strings.NewReader(string(body)))
+					}
+				}
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.Bool("security.allowed", true))
+{{- end}}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// checkMaliciousContent checks content against patterns
+func checkMaliciousContent(content string, cfg MaliciousPayloadConfig, xssPatterns, sqliPatterns, cmdPatterns []*regexp.Regexp) (bool, string) {
+	if cfg.EnableXSS {
+		for _, pattern := range xssPatterns {
+			if pattern.MatchString(content) {
+				return true, "xss"
+			}
+		}
+	}
+
+	if cfg.EnableSQLi {
+		for _, pattern := range sqliPatterns {
+			if pattern.MatchString(content) {
+				return true, "sqli"
+			}
+		}
+	}
+
+	if cfg.EnableCmdInject {
+		for _, pattern := range cmdPatterns {
+			if pattern.MatchString(content) {
+				return true, "cmdi"
+			}
+		}
+	}
+
+	return false, ""
+}

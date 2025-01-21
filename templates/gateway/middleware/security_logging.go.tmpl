@@ -1,0 +1,210 @@
+package middleware
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// SecurityEvent represents a security-relevant event
+type SecurityEvent struct {
+	Timestamp    time.Time `json:"timestamp"`
+	EventType    string    `json:"event_type"`
+	IPHash       string    `json:"ip_hash"` // GDPR compliant - hashed IP
+	Method       string    `json:"method"`
+	Path         string    `json:"path"`
+	StatusCode   int       `json:"status_code"`
+	UserAgent    string    `json:"user_agent"`
+	Blocked      bool      `json:"blocked"`
+	BlockReason  string    `json:"block_reason,omitempty"`
+	ResponseTime int64     `json:"response_time_ms"`
+}
+
+// SecurityLoggingConfig holds configuration for security logging
+type SecurityLoggingConfig struct {
+	Logger       *zap.SugaredLogger
+	LogAll       bool // Log all requests, not just security events
+	LogHeaders   bool // Include sanitized headers in logs
+	HashSalt     string // Salt for IP hashing
+}
+
+// SecurityLogging creates middleware that logs security-relevant events
+func SecurityLogging(cfg SecurityLoggingConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+{{- if .HasObservability}}
+			ctx := r.Context()
+			span := trace.SpanFromContext(ctx)
+{{- end}}
+
+			// Create a response writer wrapper to capture status code
+			wrapped := &securityResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+			// Process the request
+			next.ServeHTTP(wrapped, r)
+
+			// Calculate response time
+			responseTime := time.Since(start).Milliseconds()
+
+			// Determine if this is a security event
+			isSecurityEvent := isSecurityRelevant(r, wrapped.statusCode)
+
+			if cfg.LogAll || isSecurityEvent {
+				event := SecurityEvent{
+					Timestamp:    time.Now(),
+					EventType:    determineEventType(r, wrapped.statusCode),
+					IPHash:       hashIP(extractIP(r), cfg.HashSalt),
+					Method:       r.Method,
+					Path:         r.URL.Path,
+					StatusCode:   wrapped.statusCode,
+					UserAgent:    sanitizeUserAgent(r.UserAgent()),
+					Blocked:      wrapped.statusCode >= 400,
+					ResponseTime: responseTime,
+				}
+
+				if wrapped.statusCode >= 400 {
+					event.BlockReason = http.StatusText(wrapped.statusCode)
+				}
+
+{{- if .HasObservability}}
+				span.SetAttributes(
+					attribute.String("security.event_type", event.EventType),
+					attribute.Int("security.status_code", event.StatusCode),
+					attribute.Bool("security.blocked", event.Blocked),
+				)
+{{- end}}
+
+				// Log the event
+				cfg.Logger.Infow("security_event",
+					"timestamp", event.Timestamp.Format(time.RFC3339),
+					"event_type", event.EventType,
+					"ip_hash", event.IPHash,
+					"method", event.Method,
+					"path", event.Path,
+					"status_code", event.StatusCode,
+					"user_agent", event.UserAgent,
+					"blocked", event.Blocked,
+					"block_reason", event.BlockReason,
+					"response_time_ms", event.ResponseTime,
+				)
+			}
+		})
+	}
+}
+
+// securityResponseWriter wraps http.ResponseWriter to capture status code
+type securityResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *securityResponseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// isSecurityRelevant determines if a request/response is security relevant
+func isSecurityRelevant(r *http.Request, statusCode int) bool {
+	// Log authentication endpoints
+	if strings.Contains(r.URL.Path, "/auth/") || strings.Contains(r.URL.Path, "/login") {
+		return true
+	}
+
+	// Log error responses
+	if statusCode >= 400 {
+		return true
+	}
+
+	// Log admin endpoints
+	if strings.Contains(r.URL.Path, "/admin/") {
+		return true
+	}
+
+	// Log GDPR endpoints
+	if strings.Contains(r.URL.Path, "/gdpr/") {
+		return true
+	}
+
+	return false
+}
+
+// determineEventType determines the type of security event
+func determineEventType(r *http.Request, statusCode int) string {
+	path := strings.ToLower(r.URL.Path)
+
+	switch {
+	case statusCode == http.StatusTooManyRequests:
+		return "rate_limited"
+	case statusCode == http.StatusUnauthorized:
+		return "auth_failed"
+	case statusCode == http.StatusForbidden:
+		return "access_denied"
+	case statusCode == http.StatusBadRequest:
+		return "invalid_request"
+	case strings.Contains(path, "/login"):
+		return "login_attempt"
+	case strings.Contains(path, "/logout"):
+		return "logout"
+	case strings.Contains(path, "/register") || strings.Contains(path, "/signup"):
+		return "registration"
+	case strings.Contains(path, "/gdpr/export"):
+		return "data_export"
+	case strings.Contains(path, "/gdpr/delete"):
+		return "account_deletion"
+	default:
+		return "request"
+	}
+}
+
+// extractIP extracts the client IP from the request
+func extractIP(r *http.Request) string {
+	// Check X-Forwarded-For header
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+
+	// Fall back to RemoteAddr
+	ip := r.RemoteAddr
+	if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
+		ip = ip[:colonIdx]
+	}
+
+	return ip
+}
+
+// hashIP hashes an IP address for GDPR compliance
+func hashIP(ip, salt string) string {
+	hash := sha256.Sum256([]byte(ip + salt))
+	return hex.EncodeToString(hash[:8]) // Use first 8 bytes for shorter logs
+}
+
+// sanitizeUserAgent sanitizes the user agent string
+func sanitizeUserAgent(ua string) string {
+	// Limit length
+	if len(ua) > 256 {
+		ua = ua[:256]
+	}
+
+	// Remove potentially dangerous characters
+	ua = strings.ReplaceAll(ua, "\n", "")
+	ua = strings.ReplaceAll(ua, "\r", "")
+
+	return ua
+}

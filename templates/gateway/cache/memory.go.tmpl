@@ -1,0 +1,181 @@
+package cache
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// cacheEntry represents a single cache entry with expiration
+type cacheEntry struct {
+	value     []byte
+	expiresAt time.Time
+}
+
+// isExpired checks if the entry has expired
+func (e *cacheEntry) isExpired() bool {
+	if e.expiresAt.IsZero() {
+		return false
+	}
+	return time.Now().After(e.expiresAt)
+}
+
+// MemoryCache implements Cache interface using in-memory storage
+type MemoryCache struct {
+	data    map[string]*cacheEntry
+	mu      sync.RWMutex
+	maxSize int
+	ttl     time.Duration
+	stopCh  chan struct{}
+}
+
+// NewMemoryCache creates a new in-memory cache
+func NewMemoryCache(maxSize int, defaultTTL time.Duration) *MemoryCache {
+	c := &MemoryCache{
+		data:    make(map[string]*cacheEntry),
+		maxSize: maxSize,
+		ttl:     defaultTTL,
+		stopCh:  make(chan struct{}),
+	}
+
+	// Start cleanup goroutine
+	go c.cleanup()
+
+	return c
+}
+
+// Get retrieves a value from the cache
+func (c *MemoryCache) Get(ctx context.Context, key string) ([]byte, error) {
+	c.mu.RLock()
+	entry, exists := c.data[key]
+	c.mu.RUnlock()
+
+	if !exists {
+		return nil, &ErrCacheMiss{Key: key}
+	}
+
+	if entry.isExpired() {
+		c.Delete(ctx, key)
+		return nil, &ErrCacheMiss{Key: key}
+	}
+
+	return entry.value, nil
+}
+
+// Set stores a value in the cache
+func (c *MemoryCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if we need to evict entries
+	if c.maxSize > 0 && len(c.data) >= c.maxSize {
+		c.evictOldest()
+	}
+
+	if ttl == 0 {
+		ttl = c.ttl
+	}
+
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
+
+	// Make a copy of the value
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+
+	c.data[key] = &cacheEntry{
+		value:     valueCopy,
+		expiresAt: expiresAt,
+	}
+
+	return nil
+}
+
+// Delete removes a value from the cache
+func (c *MemoryCache) Delete(ctx context.Context, key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.data, key)
+	return nil
+}
+
+// Exists checks if a key exists in the cache
+func (c *MemoryCache) Exists(ctx context.Context, key string) (bool, error) {
+	c.mu.RLock()
+	entry, exists := c.data[key]
+	c.mu.RUnlock()
+
+	if !exists || entry.isExpired() {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// Clear removes all entries from the cache
+func (c *MemoryCache) Clear(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data = make(map[string]*cacheEntry)
+	return nil
+}
+
+// Close stops the cleanup goroutine
+func (c *MemoryCache) Close(ctx context.Context) error {
+	close(c.stopCh)
+	return nil
+}
+
+// Size returns the current number of entries
+func (c *MemoryCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.data)
+}
+
+// evictOldest removes the oldest entry (simple LRU eviction)
+func (c *MemoryCache) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, entry := range c.data {
+		if oldestKey == "" || entry.expiresAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.expiresAt
+		}
+	}
+
+	if oldestKey != "" {
+		delete(c.data, oldestKey)
+	}
+}
+
+// cleanup periodically removes expired entries
+func (c *MemoryCache) cleanup() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.removeExpired()
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+// removeExpired removes all expired entries
+func (c *MemoryCache) removeExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, entry := range c.data {
+		if !entry.expiresAt.IsZero() && entry.expiresAt.Before(now) {
+			delete(c.data, key)
+		}
+	}
+}

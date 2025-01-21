@@ -1,0 +1,171 @@
+package ratelimiter
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// leakyBucket represents a single leaky bucket
+type leakyBucket struct {
+	queue      int       // current queue size
+	lastLeak   time.Time // last time we leaked
+}
+
+// LeakyBucket implements a leaky bucket rate limiter
+// Requests are processed at a constant rate, providing smooth output
+// Best for scenarios requiring consistent throughput
+type LeakyBucket struct {
+	rate       float64 // requests leaked per second
+	capacity   int     // maximum queue size (burst)
+	buckets    map[string]*leakyBucket
+	mu         sync.RWMutex
+	cleanupInt time.Duration
+	stopCh     chan struct{}
+}
+
+// NewLeakyBucket creates a new leaky bucket rate limiter
+// rate is requests processed per second, capacity is the maximum queue size
+func NewLeakyBucket(rate float64, capacity int) *LeakyBucket {
+	lb := &LeakyBucket{
+		rate:       rate,
+		capacity:   capacity,
+		buckets:    make(map[string]*leakyBucket),
+		cleanupInt: time.Minute,
+		stopCh:     make(chan struct{}),
+	}
+
+	go lb.cleanup()
+
+	return lb
+}
+
+// Allow checks if one request is allowed
+func (l *LeakyBucket) Allow(ctx context.Context, key string) (bool, error) {
+	return l.AllowN(ctx, key, 1)
+}
+
+// AllowN checks if n requests are allowed
+func (l *LeakyBucket) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+
+	b, exists := l.buckets[key]
+	if !exists {
+		b = &leakyBucket{
+			queue:    0,
+			lastLeak: now,
+		}
+		l.buckets[key] = b
+	}
+
+	// Calculate how many requests have leaked since last check
+	elapsed := now.Sub(b.lastLeak).Seconds()
+	leaked := int(elapsed * l.rate)
+
+	// Remove leaked requests from queue
+	b.queue -= leaked
+	if b.queue < 0 {
+		b.queue = 0
+	}
+	b.lastLeak = now
+
+	// Check if we have capacity for new requests
+	if b.queue+n <= l.capacity {
+		b.queue += n
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// Reset resets the bucket for a key
+func (l *LeakyBucket) Reset(ctx context.Context, key string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.buckets, key)
+	return nil
+}
+
+// GetStats returns statistics for a key
+func (l *LeakyBucket) GetStats(ctx context.Context, key string) (*Stats, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	b, exists := l.buckets[key]
+	if !exists {
+		return &Stats{
+			Key:       key,
+			Remaining: l.capacity,
+			Total:     l.capacity,
+			ResetAt:   0,
+		}, nil
+	}
+
+	// Calculate current queue size
+	now := time.Now()
+	elapsed := now.Sub(b.lastLeak).Seconds()
+	leaked := int(elapsed * l.rate)
+	currentQueue := b.queue - leaked
+	if currentQueue < 0 {
+		currentQueue = 0
+	}
+
+	remaining := l.capacity - currentQueue
+
+	// Calculate reset time (when queue will be empty)
+	var resetAt int64
+	if currentQueue > 0 {
+		timeToEmpty := float64(currentQueue) / l.rate
+		resetAt = now.Add(time.Duration(timeToEmpty * float64(time.Second))).Unix()
+	}
+
+	return &Stats{
+		Key:       key,
+		Remaining: remaining,
+		Total:     l.capacity,
+		ResetAt:   resetAt,
+	}, nil
+}
+
+// cleanup periodically removes old buckets
+func (l *LeakyBucket) cleanup() {
+	ticker := time.NewTicker(l.cleanupInt)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			l.removeOldBuckets()
+		case <-l.stopCh:
+			return
+		}
+	}
+}
+
+// removeOldBuckets removes buckets that have been empty for a while
+func (l *LeakyBucket) removeOldBuckets() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	threshold := time.Duration(float64(l.capacity)/l.rate) * time.Second * 2
+
+	for key, b := range l.buckets {
+		// Remove if empty and inactive
+		elapsed := now.Sub(b.lastLeak).Seconds()
+		leaked := int(elapsed * l.rate)
+		currentQueue := b.queue - leaked
+
+		if currentQueue <= 0 && now.Sub(b.lastLeak) > threshold {
+			delete(l.buckets, key)
+		}
+	}
+}
+
+// Close stops the cleanup goroutine
+func (l *LeakyBucket) Close() {
+	close(l.stopCh)
+}

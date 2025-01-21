@@ -1,0 +1,186 @@
+package ratelimiter
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// window represents a sliding window counter
+type window struct {
+	prevCount  int
+	currCount  int
+	windowStart time.Time
+}
+
+// SlidingWindow implements an approximated sliding window rate limiter
+type SlidingWindow struct {
+	rate       int           // requests per window
+	windowSize time.Duration // window duration
+	windows    map[string]*window
+	mu         sync.RWMutex
+	stopCh     chan struct{}
+}
+
+// NewSlidingWindow creates a new sliding window rate limiter
+func NewSlidingWindow(rate int, windowSize time.Duration) *SlidingWindow {
+	sw := &SlidingWindow{
+		rate:       rate,
+		windowSize: windowSize,
+		windows:    make(map[string]*window),
+		stopCh:     make(chan struct{}),
+	}
+
+	go sw.cleanup()
+
+	return sw
+}
+
+// Allow checks if one request is allowed
+func (s *SlidingWindow) Allow(ctx context.Context, key string) (bool, error) {
+	return s.AllowN(ctx, key, 1)
+}
+
+// AllowN checks if n requests are allowed
+func (s *SlidingWindow) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	w, exists := s.windows[key]
+	if !exists {
+		w = &window{
+			prevCount:   0,
+			currCount:   0,
+			windowStart: now.Truncate(s.windowSize),
+		}
+		s.windows[key] = w
+	}
+
+	// Check if we need to advance the window
+	currentWindowStart := now.Truncate(s.windowSize)
+	if currentWindowStart.After(w.windowStart) {
+		// Calculate how many windows have passed
+		windowsPassed := int(currentWindowStart.Sub(w.windowStart) / s.windowSize)
+
+		if windowsPassed >= 2 {
+			// More than one full window has passed, reset everything
+			w.prevCount = 0
+			w.currCount = 0
+		} else {
+			// One window has passed, shift counts
+			w.prevCount = w.currCount
+			w.currCount = 0
+		}
+		w.windowStart = currentWindowStart
+	}
+
+	// Calculate the weighted count using sliding window approximation
+	// Weight is based on how far we are into the current window
+	elapsedInWindow := now.Sub(w.windowStart)
+	weight := float64(s.windowSize-elapsedInWindow) / float64(s.windowSize)
+
+	approximateCount := float64(w.prevCount)*weight + float64(w.currCount)
+
+	// Check if adding n requests would exceed the limit
+	if int(approximateCount)+n > s.rate {
+		return false, nil
+	}
+
+	// Allow the requests
+	w.currCount += n
+	return true, nil
+}
+
+// Reset resets the window for a key
+func (s *SlidingWindow) Reset(ctx context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.windows, key)
+	return nil
+}
+
+// GetStats returns statistics for a key
+func (s *SlidingWindow) GetStats(ctx context.Context, key string) (*Stats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+
+	w, exists := s.windows[key]
+	if !exists {
+		return &Stats{
+			Key:       key,
+			Remaining: s.rate,
+			Total:     s.rate,
+			ResetAt:   now.Truncate(s.windowSize).Add(s.windowSize).Unix(),
+		}, nil
+	}
+
+	// Calculate current approximate count
+	currentWindowStart := now.Truncate(s.windowSize)
+
+	var approximateCount float64
+	if currentWindowStart.After(w.windowStart) {
+		windowsPassed := int(currentWindowStart.Sub(w.windowStart) / s.windowSize)
+		if windowsPassed >= 2 {
+			approximateCount = 0
+		} else {
+			elapsedInWindow := now.Sub(currentWindowStart)
+			weight := float64(s.windowSize-elapsedInWindow) / float64(s.windowSize)
+			approximateCount = float64(w.currCount) * weight
+		}
+	} else {
+		elapsedInWindow := now.Sub(w.windowStart)
+		weight := float64(s.windowSize-elapsedInWindow) / float64(s.windowSize)
+		approximateCount = float64(w.prevCount)*weight + float64(w.currCount)
+	}
+
+	remaining := s.rate - int(approximateCount)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	return &Stats{
+		Key:       key,
+		Remaining: remaining,
+		Total:     s.rate,
+		ResetAt:   currentWindowStart.Add(s.windowSize).Unix(),
+	}, nil
+}
+
+// cleanup periodically removes old windows
+func (s *SlidingWindow) cleanup() {
+	ticker := time.NewTicker(s.windowSize)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.removeOldWindows()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// removeOldWindows removes windows that are too old
+func (s *SlidingWindow) removeOldWindows() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	threshold := s.windowSize * 2
+
+	for key, w := range s.windows {
+		if now.Sub(w.windowStart) > threshold {
+			delete(s.windows, key)
+		}
+	}
+}
+
+// Close stops the cleanup goroutine
+func (s *SlidingWindow) Close() {
+	close(s.stopCh)
+}

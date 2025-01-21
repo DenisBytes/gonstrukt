@@ -1,0 +1,148 @@
+package services
+
+import (
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"time"
+
+{{- if .HasCache}}
+	"{{.ModuleName}}/internals/cache"
+{{- end}}
+{{- if .HasRateLimiter}}
+	"{{.ModuleName}}/internals/ratelimiter"
+{{- end}}
+)
+
+// UpstreamService represents a backend service configuration
+type UpstreamService struct {
+	Name        string
+	URL         string
+	PathPrefix  string
+	Timeout     time.Duration
+	RetryCount  int
+	HealthCheck string
+}
+
+// GatewayConfig holds gateway configuration
+type GatewayConfig struct {
+	UpstreamServices []UpstreamService
+{{- if .HasCache}}
+	Cache            cache.Cache
+{{- end}}
+{{- if .HasRateLimiter}}
+	RateLimiter      ratelimiter.RateLimiter
+{{- end}}
+}
+
+// Gateway handles routing requests to upstream services
+type Gateway struct {
+	config   GatewayConfig
+	proxies  map[string]*httputil.ReverseProxy
+	mu       sync.RWMutex
+{{- if .HasCache}}
+	cache    cache.Cache
+{{- end}}
+{{- if .HasRateLimiter}}
+	limiter  ratelimiter.RateLimiter
+{{- end}}
+}
+
+// NewGateway creates a new gateway instance
+func NewGateway(cfg GatewayConfig) *Gateway {
+	g := &Gateway{
+		config:  cfg,
+		proxies: make(map[string]*httputil.ReverseProxy),
+{{- if .HasCache}}
+		cache:   cfg.Cache,
+{{- end}}
+{{- if .HasRateLimiter}}
+		limiter: cfg.RateLimiter,
+{{- end}}
+	}
+
+	// Initialize proxies for each upstream service
+	for _, svc := range cfg.UpstreamServices {
+		proxy, err := g.createProxy(svc)
+		if err != nil {
+			continue
+		}
+		g.proxies[svc.Name] = proxy
+	}
+
+	return g
+}
+
+// createProxy creates a reverse proxy for an upstream service
+func (g *Gateway) createProxy(svc UpstreamService) (*httputil.ReverseProxy, error) {
+	targetURL, err := url.Parse(svc.URL)
+	if err != nil {
+		return nil, err
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Custom transport with timeout
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: svc.Timeout,
+	}
+
+	// Modify request before forwarding
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Host = targetURL.Host
+		req.Header.Set("X-Forwarded-Host", req.Header.Get("Host"))
+		req.Header.Set("X-Gateway-Service", svc.Name)
+	}
+
+	// Custom error handler
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`{"error":"upstream service unavailable"}`))
+	}
+
+	return proxy, nil
+}
+
+// RegisterRoutes registers gateway routes with the mux
+func (g *Gateway) RegisterRoutes(mux *http.ServeMux) {
+	for _, svc := range g.config.UpstreamServices {
+		prefix := svc.PathPrefix
+		if prefix == "" {
+			prefix = "/" + svc.Name
+		}
+
+		handler := g.createServiceHandler(svc)
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, handler))
+	}
+}
+
+// createServiceHandler creates a handler for a specific service
+func (g *Gateway) createServiceHandler(svc UpstreamService) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.mu.RLock()
+		proxy, exists := g.proxies[svc.Name]
+		g.mu.RUnlock()
+
+		if !exists {
+			http.Error(w, "service not found", http.StatusNotFound)
+			return
+		}
+
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// GetService returns the proxy for a service
+func (g *Gateway) GetService(name string) (*httputil.ReverseProxy, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	proxy, exists := g.proxies[name]
+	return proxy, exists
+}

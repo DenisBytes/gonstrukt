@@ -1,0 +1,125 @@
+package ratelimiter
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+)
+
+// MiddlewareConfig holds configuration for the rate limiter middleware
+type MiddlewareConfig struct {
+	// KeyFunc extracts the rate limiting key from the request
+	KeyFunc KeyFunc
+
+	// OnLimited is called when a request is rate limited
+	OnLimited func(w http.ResponseWriter, r *http.Request, stats *Stats)
+
+	// ExcludePaths are paths that should not be rate limited
+	ExcludePaths []string
+
+	// IncludeHeaders determines whether to include rate limit headers
+	IncludeHeaders bool
+}
+
+// DefaultMiddlewareConfig returns the default middleware configuration
+func DefaultMiddlewareConfig() MiddlewareConfig {
+	return MiddlewareConfig{
+		KeyFunc:        DefaultKeyFunc,
+		OnLimited:      defaultOnLimited,
+		ExcludePaths:   []string{"/health", "/readiness", "/liveness"},
+		IncludeHeaders: true,
+	}
+}
+
+// Middleware creates a rate limiting middleware with the given limiter
+func Middleware(limiter RateLimiter) func(http.Handler) http.Handler {
+	return MiddlewareWithConfig(limiter, DefaultMiddlewareConfig())
+}
+
+// MiddlewareWithConfig creates a rate limiting middleware with custom config
+func MiddlewareWithConfig(limiter RateLimiter, cfg MiddlewareConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Check if path is excluded
+			for _, path := range cfg.ExcludePaths {
+				if r.URL.Path == path {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			// Get the rate limiting key
+			key := cfg.KeyFunc(r)
+
+			// Check rate limit
+			allowed, err := limiter.Allow(r.Context(), key)
+			if err != nil {
+				// On error, allow the request but log it
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Get stats for headers
+			stats, _ := limiter.GetStats(r.Context(), key)
+
+			// Add rate limit headers if configured
+			if cfg.IncludeHeaders && stats != nil {
+				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(stats.Total))
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(stats.Remaining))
+				if stats.ResetAt > 0 {
+					w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(stats.ResetAt, 10))
+				}
+			}
+
+			if !allowed {
+				cfg.OnLimited(w, r, stats)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// defaultOnLimited is the default handler for rate limited requests
+func defaultOnLimited(w http.ResponseWriter, r *http.Request, stats *Stats) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", strconv.FormatInt(stats.ResetAt, 10))
+	w.WriteHeader(http.StatusTooManyRequests)
+
+	response := map[string]interface{}{
+		"error":       "rate limit exceeded",
+		"retry_after": stats.ResetAt,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// PerEndpointMiddleware creates a middleware that rate limits per endpoint
+func PerEndpointMiddleware(limiter RateLimiter, cfg MiddlewareConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Create a key that includes the path
+			baseKey := cfg.KeyFunc(r)
+			key := baseKey + ":" + r.URL.Path
+
+			allowed, _ := limiter.Allow(r.Context(), key)
+			stats, _ := limiter.GetStats(r.Context(), key)
+
+			if cfg.IncludeHeaders && stats != nil {
+				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(stats.Total))
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(stats.Remaining))
+				if stats.ResetAt > 0 {
+					w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(stats.ResetAt, 10))
+				}
+			}
+
+			if !allowed {
+				cfg.OnLimited(w, r, stats)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

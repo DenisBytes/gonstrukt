@@ -1,0 +1,84 @@
+package middleware
+
+import (
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+// CORSConfig holds CORS configuration
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+// DefaultCORSConfig returns a permissive CORS configuration for development
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID"},
+		ExposedHeaders:   []string{"X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining"},
+		AllowCredentials: false,
+		MaxAge:           86400,
+	}
+}
+
+// CORS middleware adds CORS headers to responses
+func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// Check if origin is allowed
+			allowedOrigin := ""
+			for _, o := range cfg.AllowedOrigins {
+				if o == "*" || o == origin {
+					allowedOrigin = o
+					break
+				}
+			}
+
+			if allowedOrigin == "" && len(cfg.AllowedOrigins) > 0 {
+				// Origin not allowed, but still process the request
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Set CORS headers
+			if allowedOrigin == "*" && !cfg.AllowCredentials {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else if allowedOrigin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			}
+
+			if cfg.AllowCredentials {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+
+			if len(cfg.ExposedHeaders) > 0 {
+				w.Header().Set("Access-Control-Expose-Headers", strings.Join(cfg.ExposedHeaders, ", "))
+			}
+
+			// Handle preflight requests
+			if r.Method == http.MethodOptions {
+				w.Header().Set("Access-Control-Allow-Methods", strings.Join(cfg.AllowedMethods, ", "))
+				w.Header().Set("Access-Control-Allow-Headers", strings.Join(cfg.AllowedHeaders, ", "))
+
+				if cfg.MaxAge > 0 {
+					w.Header().Set("Access-Control-Max-Age", strconv.Itoa(cfg.MaxAge))
+				}
+
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
