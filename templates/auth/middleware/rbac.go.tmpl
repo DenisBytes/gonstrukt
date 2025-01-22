@@ -1,0 +1,204 @@
+{{- if .EnableRBAC}}
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/casbin/casbin/v2"
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// RBACMiddleware provides role-based access control
+type RBACMiddleware struct {
+	enforcer *casbin.Enforcer
+}
+
+// NewRBACMiddleware creates a new RBAC middleware
+func NewRBACMiddleware(modelPath, policyPath string) (*RBACMiddleware, error) {
+	enforcer, err := casbin.NewEnforcer(modelPath, policyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RBACMiddleware{
+		enforcer: enforcer,
+	}, nil
+}
+
+// NewRBACMiddlewareWithAdapter creates RBAC middleware with a database adapter
+func NewRBACMiddlewareWithAdapter(modelPath string, adapter interface{}) (*RBACMiddleware, error) {
+	enforcer, err := casbin.NewEnforcer(modelPath, adapter)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load policies from the adapter
+	if err := enforcer.LoadPolicy(); err != nil {
+		return nil, err
+	}
+
+	return &RBACMiddleware{
+		enforcer: enforcer,
+	}, nil
+}
+
+// RequirePermission creates middleware that requires a specific permission
+func (m *RBACMiddleware) RequirePermission(resource, action string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
+{{- if .HasObservability}}
+			span := trace.SpanFromContext(ctx)
+			span.SetAttributes(
+				attribute.String("rbac.resource", resource),
+				attribute.String("rbac.action", action),
+			)
+{{- end}}
+
+			// Get user from context
+			user, ok := ctx.Value("user").(*types.User)
+			if !ok || user == nil {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.String("rbac.user_id", user.ID))
+{{- end}}
+
+			// Check permissions for each role
+			allowed := false
+			for _, role := range user.Roles {
+				ok, err := m.enforcer.Enforce(role, resource, action)
+				if err != nil {
+{{- if .HasObservability}}
+					span.RecordError(err)
+{{- end}}
+					http.Error(w, "authorization error", http.StatusInternalServerError)
+					return
+				}
+				if ok {
+					allowed = true
+					break
+				}
+			}
+
+			if !allowed {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Permission denied")
+				span.SetAttributes(attribute.Bool("rbac.allowed", false))
+{{- end}}
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.Bool("rbac.allowed", true))
+{{- end}}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequireRole creates middleware that requires a specific role
+func (m *RBACMiddleware) RequireRole(roles ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
+{{- if .HasObservability}}
+			span := trace.SpanFromContext(ctx)
+			span.SetAttributes(attribute.StringSlice("rbac.required_roles", roles))
+{{- end}}
+
+			// Get user from context
+			user, ok := ctx.Value("user").(*types.User)
+			if !ok || user == nil {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(
+				attribute.String("rbac.user_id", user.ID),
+				attribute.StringSlice("rbac.user_roles", user.Roles),
+			)
+{{- end}}
+
+			// Check if user has any of the required roles
+			hasRole := false
+			for _, requiredRole := range roles {
+				for _, userRole := range user.Roles {
+					if strings.EqualFold(userRole, requiredRole) {
+						hasRole = true
+						break
+					}
+				}
+				if hasRole {
+					break
+				}
+			}
+
+			if !hasRole {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Role not found")
+				span.SetAttributes(attribute.Bool("rbac.has_role", false))
+{{- end}}
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.Bool("rbac.has_role", true))
+{{- end}}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// AddRoleForUser adds a role for a user
+func (m *RBACMiddleware) AddRoleForUser(user, role string) error {
+	_, err := m.enforcer.AddGroupingPolicy(user, role)
+	return err
+}
+
+// RemoveRoleForUser removes a role from a user
+func (m *RBACMiddleware) RemoveRoleForUser(user, role string) error {
+	_, err := m.enforcer.RemoveGroupingPolicy(user, role)
+	return err
+}
+
+// GetRolesForUser returns all roles for a user
+func (m *RBACMiddleware) GetRolesForUser(user string) ([]string, error) {
+	return m.enforcer.GetRolesForUser(user)
+}
+
+// AddPolicy adds a permission policy
+func (m *RBACMiddleware) AddPolicy(role, resource, action string) error {
+	_, err := m.enforcer.AddPolicy(role, resource, action)
+	return err
+}
+
+// RemovePolicy removes a permission policy
+func (m *RBACMiddleware) RemovePolicy(role, resource, action string) error {
+	_, err := m.enforcer.RemovePolicy(role, resource, action)
+	return err
+}
+
+// ReloadPolicy reloads policies from the adapter
+func (m *RBACMiddleware) ReloadPolicy() error {
+	return m.enforcer.LoadPolicy()
+}
+{{- end}}

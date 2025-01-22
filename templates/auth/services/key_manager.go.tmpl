@@ -1,0 +1,183 @@
+package services
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"os"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+)
+
+// JWTConfig holds JWT configuration
+type JWTConfig struct {
+	PrivateKeyPath  string
+	PublicKeyPath   string
+	Algorithm       string
+	Issuer          string
+	Audience        string // Service or API identifier
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+}
+
+// KeyManager manages JWT signing keys
+type KeyManager struct {
+	privateKey *ecdsa.PrivateKey
+	publicKey  *ecdsa.PublicKey
+	algorithm  string
+	issuer     string
+	audience   string
+}
+
+// NewKeyManager creates a new key manager
+func NewKeyManager(cfg JWTConfig) (*KeyManager, error) {
+	var privateKey *ecdsa.PrivateKey
+	var publicKey *ecdsa.PublicKey
+
+	// Try to load existing keys
+	if cfg.PrivateKeyPath != "" {
+		key, err := loadPrivateKey(cfg.PrivateKeyPath)
+		if err == nil {
+			privateKey = key
+			publicKey = &key.PublicKey
+		}
+	}
+
+	// Generate new keys if not loaded
+	if privateKey == nil {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		privateKey = key
+		publicKey = &key.PublicKey
+
+		// Save keys if paths are provided
+		if cfg.PrivateKeyPath != "" {
+			if err := savePrivateKey(cfg.PrivateKeyPath, privateKey); err != nil {
+				return nil, err
+			}
+		}
+		if cfg.PublicKeyPath != "" {
+			if err := savePublicKey(cfg.PublicKeyPath, publicKey); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return &KeyManager{
+		privateKey: privateKey,
+		publicKey:  publicKey,
+		algorithm:  cfg.Algorithm,
+		issuer:     cfg.Issuer,
+		audience:   cfg.Audience,
+	}, nil
+}
+
+// GenerateAccessToken generates a JWT access token with standard claims
+func (km *KeyManager) GenerateAccessToken(user *types.User, sessionID string, ttl time.Duration) (string, error) {
+	now := time.Now()
+
+	claims := jwt.MapClaims{
+		"jti":   uuid.New().String(),        // Unique token ID for revocation tracking
+		"sub":   user.ID,                    // Subject (user ID)
+		"sid":   sessionID,                  // Session ID for device management
+		"email": user.Email,
+		"iss":   km.issuer,                  // Issuer
+		"aud":   km.audience,                // Audience (intended recipient)
+		"iat":   now.Unix(),                 // Issued at
+		"nbf":   now.Unix(),                 // Not valid before
+		"exp":   now.Add(ttl).Unix(),        // Expiration
+		"type":  "access",
+	}
+
+	if user.Roles != nil {
+		claims["roles"] = user.Roles
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+
+	return token.SignedString(km.privateKey)
+}
+
+// ValidateToken validates a JWT token and returns the claims
+func (km *KeyManager) ValidateToken(tokenString string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return km.publicKey, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, errors.New("invalid claims")
+	}
+
+	return claims, nil
+}
+
+// GetPublicKey returns the public key for token verification
+func (km *KeyManager) GetPublicKey() *ecdsa.PublicKey {
+	return km.publicKey
+}
+
+// loadPrivateKey loads an ECDSA private key from a PEM file
+func loadPrivateKey(path string) (*ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+
+	return x509.ParseECPrivateKey(block.Bytes)
+}
+
+// savePrivateKey saves an ECDSA private key to a PEM file
+func savePrivateKey(path string, key *ecdsa.PrivateKey) error {
+	data, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+
+	block := &pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: data,
+	}
+
+	return os.WriteFile(path, pem.EncodeToMemory(block), 0600)
+}
+
+// savePublicKey saves an ECDSA public key to a PEM file
+func savePublicKey(path string, key *ecdsa.PublicKey) error {
+	data, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		return err
+	}
+
+	block := &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: data,
+	}
+
+	return os.WriteFile(path, pem.EncodeToMemory(block), 0644)
+}

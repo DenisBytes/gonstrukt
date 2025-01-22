@@ -1,0 +1,52 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+	"runtime"
+	"time"
+)
+
+var startTime = time.Now()
+
+// HealthResponse represents the health check response
+type HealthResponse struct {
+	Status    string            `json:"status"`
+	Timestamp string            `json:"timestamp"`
+	Uptime    string            `json:"uptime"`
+	Version   string            `json:"version"`
+	Checks    map[string]string `json:"checks,omitempty"`
+	System    *SystemInfo       `json:"system,omitempty"`
+}
+
+// SystemInfo contains system metrics
+type SystemInfo struct {
+	Goroutines int    `json:"goroutines"`
+	GoVersion  string `json:"go_version"`
+	GOOS       string `json:"goos"`
+	GOARCH     string `json:"goarch"`
+}
+
+// HealthHandler handles health check requests
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	response := HealthResponse{
+		Status:    "healthy",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Uptime:    time.Since(startTime).String(),
+		Version:   "1.0.0",
+	}
+
+	// Include system info if requested
+	if r.URL.Query().Get("verbose") == "true" {
+		response.System = &SystemInfo{
+			Goroutines: runtime.NumGoroutine(),
+			GoVersion:  runtime.Version(),
+			GOOS:       runtime.GOOS,
+			GOARCH:     runtime.GOARCH,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}

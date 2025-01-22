@@ -1,0 +1,176 @@
+package types
+
+import (
+	"errors"
+	"regexp"
+	"time"
+)
+
+// User represents a user in the system
+type User struct {
+	ID           string    `json:"id"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-"`
+	FirstName    string    `json:"first_name,omitempty"`
+	LastName     string    `json:"last_name,omitempty"`
+	MFAEnabled   bool      `json:"mfa_enabled"`
+	MFASecret    string    `json:"-"`
+	Roles        []string  `json:"roles,omitempty"`
+{{- if .HasOAuth}}
+	OAuthProvider string    `json:"oauth_provider,omitempty"`
+	OAuthID       string    `json:"oauth_id,omitempty"`
+{{- end}}
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	DeletedAt    *time.Time `json:"deleted_at,omitempty"`
+}
+
+// Session represents a user session
+type Session struct {
+	ID           string    `json:"id"`
+	UserID       string    `json:"user_id"`
+	RefreshToken string    `json:"-"`
+	UserAgent    string    `json:"user_agent,omitempty"`
+	IP           string    `json:"ip,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// SessionInfo represents public session info (returned in API responses)
+type SessionInfo struct {
+	ID        string    `json:"id"`
+	UserAgent string    `json:"user_agent,omitempty"`
+	IPAddress string    `json:"ip_address,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	IsCurrent bool      `json:"is_current"`
+}
+
+// Consent represents user consent for GDPR
+type Consent struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	Type        string     `json:"type"`
+	Granted     bool       `json:"granted"`
+	GrantedAt   time.Time  `json:"granted_at,omitempty"`
+	ExpiresAt   time.Time  `json:"expires_at,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
+	Version     string     `json:"version"`
+	Description string     `json:"description"`
+}
+
+// MFABackup represents backup codes for MFA
+type MFABackup struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Code      string    `json:"-"`
+	Used      bool      `json:"used"`
+	UsedAt    *time.Time `json:"used_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// RegisterRequest represents a user registration request
+type RegisterRequest struct {
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	FirstName string `json:"first_name,omitempty"`
+	LastName  string `json:"last_name,omitempty"`
+}
+
+// Validate validates the registration request
+func (r *RegisterRequest) Validate() error {
+	if r.Email == "" {
+		return errors.New("email is required")
+	}
+	if !isValidEmail(r.Email) {
+		return errors.New("invalid email format")
+	}
+	if r.Password == "" {
+		return errors.New("password is required")
+	}
+	if len(r.Password) < 8 {
+		return errors.New("password must be at least 8 characters")
+	}
+	return nil
+}
+
+// LoginRequest represents a login request
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// Validate validates the login request
+func (r *LoginRequest) Validate() error {
+	if r.Email == "" {
+		return errors.New("email is required")
+	}
+	if r.Password == "" {
+		return errors.New("password is required")
+	}
+	return nil
+}
+
+// RefreshRequest represents a token refresh request
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// TokenResponse represents an authentication token response
+type TokenResponse struct {
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenType    string `json:"token_type,omitempty"`
+	ExpiresIn    int    `json:"expires_in,omitempty"`
+	MFARequired  bool   `json:"mfa_required,omitempty"`
+	MFAToken     string `json:"mfa_token,omitempty"`
+}
+
+// MFASetupResponse represents an MFA setup response
+type MFASetupResponse struct {
+	Secret      string   `json:"secret"`
+	QRCode      string   `json:"qr_code"`
+	BackupCodes []string `json:"backup_codes"`
+}
+
+// MFAVerifyRequest represents an MFA verification request
+type MFAVerifyRequest struct {
+	MFAToken string `json:"mfa_token"`
+	Code     string `json:"code"`
+}
+
+// ChangePasswordRequest represents a password change request
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// Validate validates the password change request
+func (r *ChangePasswordRequest) Validate() error {
+	if r.CurrentPassword == "" {
+		return errors.New("current password is required")
+	}
+	if r.NewPassword == "" {
+		return errors.New("new password is required")
+	}
+	if len(r.NewPassword) < 8 {
+		return errors.New("new password must be at least 8 characters")
+	}
+	if r.CurrentPassword == r.NewPassword {
+		return errors.New("new password must be different from current password")
+	}
+	return nil
+}
+
+// UpdateConsentRequest represents a consent update request
+type UpdateConsentRequest struct {
+	Type    string `json:"type"`
+	Granted bool   `json:"granted"`
+}
+
+// isValidEmail validates an email address format
+func isValidEmail(email string) bool {
+	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	matched, _ := regexp.MatchString(pattern, email)
+	return matched
+}

@@ -1,0 +1,79 @@
+{{- if .HasGDPR}}
+package types
+
+import (
+	"time"
+)
+
+// DataProcessingLog represents a GDPR data processing audit log
+type DataProcessingLog struct {
+	ID            string     `json:"id"`
+	UserID        string     `json:"user_id,omitempty"`
+	ProcessType   string     `json:"process_type"` // e.g., "consent_update", "data_export", "account_deletion"
+	ProcessedData string     `json:"processed_data"`
+	Status        string     `json:"status"` // "processing", "completed", "failed"
+	RequestIP     string     `json:"request_ip,omitempty"`
+	ProcessorID   string     `json:"processor_id"` // Service that processed the data
+	LegalBasis    string     `json:"legal_basis"`  // e.g., "consent", "GDPR_Article_17", "GDPR_Article_20"
+	Purpose       string     `json:"purpose"`
+	DataSubject   string     `json:"data_subject,omitempty"`
+	ErrorDetails  string     `json:"error_details,omitempty"`
+	RequestedAt   time.Time  `json:"requested_at"`
+	CompletedAt   time.Time  `json:"completed_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// UserDataExport represents exported user data for GDPR compliance
+type UserDataExport struct {
+	ExportedAt     time.Time           `json:"exported_at"`
+	User           UserExportData      `json:"user"`
+	Sessions       []SessionExportData `json:"sessions,omitempty"`
+	Consents       []ConsentExportData `json:"consents,omitempty"`
+	ProcessingLogs []ProcessingLogExportData `json:"processing_logs,omitempty"`
+}
+
+// UserExportData represents user data in the export
+type UserExportData struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	FirstName string    `json:"first_name,omitempty"`
+	LastName  string    `json:"last_name,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// SessionExportData represents session data in the export
+type SessionExportData struct {
+	ID        string    `json:"id"`
+	UserAgent string    `json:"user_agent,omitempty"`
+	IP        string    `json:"ip,omitempty"` // Hashed for privacy
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ConsentExportData represents consent data in the export
+type ConsentExportData struct {
+	Type      string     `json:"type"`
+	Granted   bool       `json:"granted"`
+	Version   string     `json:"version"`
+	GrantedAt time.Time  `json:"granted_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+}
+
+// ProcessingLogExportData represents processing log data in the export
+type ProcessingLogExportData struct {
+	ProcessType string    `json:"process_type"`
+	Purpose     string    `json:"purpose"`
+	LegalBasis  string    `json:"legal_basis"`
+	ProcessedAt time.Time `json:"processed_at"`
+}
+
+{{- if .HasGDPRConsent}}
+// ConsentWithHistory extends Consent with expiry tracking
+type ConsentWithHistory struct {
+	Consent
+	ExpiresAt time.Time `json:"expires_at"`
+	IsActive  bool      `json:"is_active"`
+}
+{{- end}}
+{{- end}}

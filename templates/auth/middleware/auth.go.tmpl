@@ -1,0 +1,127 @@
+package middleware
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+)
+
+// ContextKey is a type for context keys
+type ContextKey string
+
+const (
+	// UserContextKey is the context key for the authenticated user
+	UserContextKey ContextKey = "user"
+	// ClaimsContextKey is the context key for JWT claims
+	ClaimsContextKey ContextKey = "claims"
+)
+
+// TokenValidator validates JWT tokens and returns claims
+type TokenValidator interface {
+	ValidateToken(tokenString string) (map[string]any, error)
+}
+
+// TokenBlacklistChecker checks if a token is blacklisted
+type TokenBlacklistChecker interface {
+	IsTokenBlacklisted(ctx context.Context, token string) bool
+}
+
+// AuthConfig holds authentication middleware configuration
+type AuthConfig struct {
+	TokenValidator   TokenValidator
+	BlacklistChecker TokenBlacklistChecker
+	ExcludedPaths    []string
+	OptionalPaths    []string
+}
+
+// Auth middleware validates JWT tokens
+func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Check if path is excluded
+			for _, path := range cfg.ExcludedPaths {
+				if strings.HasPrefix(r.URL.Path, path) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			// Check for authorization header
+			authHeader := r.Header.Get("Authorization")
+			isOptional := false
+			for _, path := range cfg.OptionalPaths {
+				if strings.HasPrefix(r.URL.Path, path) {
+					isOptional = true
+					break
+				}
+			}
+
+			if authHeader == "" {
+				if isOptional {
+					next.ServeHTTP(w, r)
+					return
+				}
+				writeAuthError(w, http.StatusUnauthorized, "missing authorization header")
+				return
+			}
+
+			// Parse bearer token
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+				writeAuthError(w, http.StatusUnauthorized, "invalid authorization header format")
+				return
+			}
+
+			tokenString := parts[1]
+
+			// Validate token
+			claims, err := cfg.TokenValidator.ValidateToken(tokenString)
+			if err != nil {
+				writeAuthError(w, http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+
+			// Check if token is blacklisted (revoked)
+			if cfg.BlacklistChecker != nil && cfg.BlacklistChecker.IsTokenBlacklisted(r.Context(), tokenString) {
+				writeAuthError(w, http.StatusUnauthorized, "token has been revoked")
+				return
+			}
+
+			// Check token type
+			tokenType, _ := claims["type"].(string)
+			if tokenType != "access" {
+				writeAuthError(w, http.StatusUnauthorized, "invalid token type")
+				return
+			}
+
+			// Add claims to context
+			ctx := context.WithValue(r.Context(), ClaimsContextKey, claims)
+
+			// Extract user info from claims
+			if userID, ok := claims["sub"].(string); ok {
+				ctx = context.WithValue(ctx, UserContextKey, userID)
+			}
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// GetUserID extracts the user ID from the request context
+func GetUserID(ctx context.Context) (string, bool) {
+	userID, ok := ctx.Value(UserContextKey).(string)
+	return userID, ok
+}
+
+// GetClaims extracts the claims from the request context
+func GetClaims(ctx context.Context) (map[string]interface{}, bool) {
+	claims, ok := ctx.Value(ClaimsContextKey).(map[string]interface{})
+	return claims, ok
+}
+
+func writeAuthError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}

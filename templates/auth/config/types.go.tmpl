@@ -1,0 +1,51 @@
+package config
+
+import "time"
+
+// Config holds all auth service configuration
+type Config struct {
+	Server       ServerConfig   `yaml:"server" json:"server" env:"SERVER"`
+	Environment  string         `yaml:"environment" json:"environment" env:"ENVIRONMENT" envDefault:"development"`
+	Database     DatabaseConfig `yaml:"database" json:"database" env:"DATABASE"`
+	JWT          JWTConfig      `yaml:"jwt" json:"jwt" env:"JWT"`
+{{- if .HasObservability}}
+	OTLPEndpoint string         `yaml:"otlp_endpoint" json:"otlp_endpoint" env:"OTLP_ENDPOINT" envDefault:"localhost:4317"`
+{{- end}}
+}
+
+// ServerConfig holds HTTP server configuration
+type ServerConfig struct {
+	Addr         string        `yaml:"addr" json:"addr" env:"ADDR" envDefault:":8081"`
+	ReadTimeout  time.Duration `yaml:"read_timeout" json:"read_timeout" env:"READ_TIMEOUT" envDefault:"15s"`
+	WriteTimeout time.Duration `yaml:"write_timeout" json:"write_timeout" env:"WRITE_TIMEOUT" envDefault:"15s"`
+	IdleTimeout  time.Duration `yaml:"idle_timeout" json:"idle_timeout" env:"IDLE_TIMEOUT" envDefault:"60s"`
+	TLSEnabled   bool          `yaml:"tls_enabled" json:"tls_enabled" env:"TLS_ENABLED" envDefault:"false"`
+	TLSCertFile  string        `yaml:"tls_cert_file" json:"tls_cert_file" env:"TLS_CERT_FILE"`
+	TLSKeyFile   string        `yaml:"tls_key_file" json:"tls_key_file" env:"TLS_KEY_FILE"`
+}
+
+// DatabaseConfig holds database connection configuration
+type DatabaseConfig struct {
+{{- if eq .Database "postgres"}}
+	URL string `yaml:"url" json:"url" env:"URL" envRequired:"true"`
+{{- else if eq .Database "mysql"}}
+	URL string `yaml:"url" json:"url" env:"URL" envRequired:"true"`
+{{- else if eq .Database "sqlite"}}
+	Path string `yaml:"path" json:"path" env:"PATH" envDefault:"auth.db"`
+{{- else if eq .Database "mongodb"}}
+	URL  string `yaml:"url" json:"url" env:"URL" envRequired:"true"`
+	Name string `yaml:"name" json:"name" env:"NAME" envDefault:"auth"`
+{{- else if eq .Database "arangodb"}}
+	URL  string `yaml:"url" json:"url" env:"URL" envRequired:"true"`
+	Name string `yaml:"name" json:"name" env:"NAME" envDefault:"auth"`
+{{- end}}
+}
+
+// JWTConfig holds JWT signing configuration
+type JWTConfig struct {
+	Issuer          string        `yaml:"issuer" json:"issuer" env:"ISSUER" envDefault:"auth-service"`
+	AccessTokenTTL  time.Duration `yaml:"access_token_ttl" json:"access_token_ttl" env:"ACCESS_TOKEN_TTL" envDefault:"15m"`
+	RefreshTokenTTL time.Duration `yaml:"refresh_token_ttl" json:"refresh_token_ttl" env:"REFRESH_TOKEN_TTL" envDefault:"7d"`
+	PrivateKeyPath  string        `yaml:"private_key_path" json:"private_key_path" env:"PRIVATE_KEY_PATH"`
+	PublicKeyPath   string        `yaml:"public_key_path" json:"public_key_path" env:"PUBLIC_KEY_PATH"`
+}

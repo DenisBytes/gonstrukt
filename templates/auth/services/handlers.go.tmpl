@@ -1,0 +1,292 @@
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"{{.ModuleName}}/internals/middleware"
+	"{{.ModuleName}}/internals/types"
+)
+
+// handleRegister handles user registration
+func (s *AuthService) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req types.RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	user, err := s.Register(r.Context(), &req)
+	if err != nil {
+		switch err {
+		case ErrUserExists:
+			writeError(w, http.StatusConflict, "user already exists")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to register user")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, user)
+}
+
+// handleLogin handles user login
+func (s *AuthService) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req types.LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tokens, err := s.Login(r.Context(), &req)
+	if err != nil {
+		switch err {
+		case ErrInvalidCredentials:
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+		default:
+			writeError(w, http.StatusInternalServerError, "login failed")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+// handleRefresh handles token refresh
+func (s *AuthService) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	var req types.RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	tokens, err := s.RefreshTokens(r.Context(), req.RefreshToken)
+	if err != nil {
+		switch err {
+		case ErrSessionNotFound, ErrTokenExpired:
+			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to refresh tokens")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+// handleLogout handles user logout
+func (s *AuthService) handleLogout(w http.ResponseWriter, r *http.Request) {
+	var req types.RefreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Delete refresh token from database
+	_ = s.Logout(r.Context(), req.RefreshToken)
+
+	// Blacklist access token if present in Authorization header
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+			accessToken := authHeader[7:]
+			// Parse token to get expiration time
+			if claims, err := s.keyManager.ValidateToken(accessToken); err == nil {
+				if exp, ok := claims["exp"].(float64); ok {
+					expiresAt := time.Unix(int64(exp), 0)
+					_ = s.BlacklistToken(r.Context(), accessToken, expiresAt)
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+{{- if not .EnableMFA}}
+// handleMFASetup handles MFA setup
+func (s *AuthService) handleMFASetup(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement MFA setup
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleMFAVerify handles MFA verification
+func (s *AuthService) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement MFA verification
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleMFADisable handles MFA disable
+func (s *AuthService) handleMFADisable(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement MFA disable
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+{{- end}}
+
+{{- if not .HasGDPRConsent}}
+// handleGetConsent handles getting user consent status
+func (s *AuthService) handleGetConsent(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement consent retrieval
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleUpdateConsent handles updating user consent
+func (s *AuthService) handleUpdateConsent(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement consent update
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+{{- end}}
+
+{{- if not .HasGDPRDataExport}}
+// handleExportData handles GDPR data export
+func (s *AuthService) handleExportData(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement data export
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+{{- end}}
+
+{{- if not .HasGDPRDataDeletion}}
+// handleDeleteData handles GDPR data deletion
+func (s *AuthService) handleDeleteData(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement data deletion
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+{{- end}}
+
+// handleGetUser handles getting current user info
+func (s *AuthService) handleGetUser(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement user retrieval
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleUpdateUser handles updating user info
+func (s *AuthService) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement user update
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleChangePassword handles password change
+func (s *AuthService) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement password change
+	writeError(w, http.StatusNotImplemented, "not implemented")
+}
+
+// handleGetSessions returns all active sessions for the authenticated user
+func (s *AuthService) handleGetSessions(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	sessions, err := s.GetUserSessions(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get sessions")
+		return
+	}
+
+	// Get current session ID from JWT claims
+	currentSessionID := getSessionIDFromClaims(r.Context())
+
+	// Return sessions without sensitive data
+	var response []types.SessionInfo
+	for _, session := range sessions {
+		response = append(response, types.SessionInfo{
+			ID:        session.ID,
+			UserAgent: session.UserAgent,
+			IPAddress: session.IP,
+			CreatedAt: session.CreatedAt,
+			ExpiresAt: session.ExpiresAt,
+			IsCurrent: session.ID == currentSessionID,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleRevokeSession revokes a specific session
+func (s *AuthService) handleRevokeSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "session ID required")
+		return
+	}
+
+	// Prevent revoking current session via this endpoint
+	currentSessionID := getSessionIDFromClaims(r.Context())
+	if sessionID == currentSessionID {
+		writeError(w, http.StatusBadRequest, "cannot revoke current session; use logout instead")
+		return
+	}
+
+	if err := s.RevokeSession(r.Context(), userID, sessionID); err != nil {
+		switch err {
+		case ErrSessionNotFound:
+			writeError(w, http.StatusNotFound, "session not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to revoke session")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "session revoked"})
+}
+
+// handleRevokeAllSessions revokes all sessions except the current one
+func (s *AuthService) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	currentSessionID := getSessionIDFromClaims(r.Context())
+
+	if err := s.RevokeAllSessions(r.Context(), userID, currentSessionID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke sessions")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "all other sessions revoked"})
+}
+
+// getSessionIDFromClaims extracts the session ID from JWT claims
+func getSessionIDFromClaims(ctx context.Context) string {
+	claims, ok := middleware.GetClaims(ctx)
+	if !ok {
+		return ""
+	}
+	if sid, ok := claims["sid"].(string); ok {
+		return sid
+	}
+	return ""
+}
+
+// writeJSON writes a JSON response
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// writeError writes an error response
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}

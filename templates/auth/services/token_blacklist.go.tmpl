@@ -1,0 +1,114 @@
+package services
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"sync"
+	"time"
+)
+
+// TokenBlacklist manages revoked tokens
+// Uses in-memory storage with automatic expiration cleanup
+type TokenBlacklist struct {
+	tokens map[string]time.Time // token hash -> expiration time
+	mu     sync.RWMutex
+	stopCh chan struct{}
+	doneCh chan struct{}
+}
+
+// NewTokenBlacklist creates a new token blacklist
+func NewTokenBlacklist() *TokenBlacklist {
+	tb := &TokenBlacklist{
+		tokens: make(map[string]time.Time),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+
+	// Start cleanup goroutine
+	go tb.cleanup()
+
+	return tb
+}
+
+// Blacklist adds a token to the blacklist until its expiration
+// ctx is accepted for interface compatibility with potential database-backed implementations
+func (tb *TokenBlacklist) Blacklist(_ context.Context, token string, expiresAt time.Time) error {
+	// Don't blacklist already expired tokens
+	if time.Now().After(expiresAt) {
+		return nil
+	}
+
+	hash := hashToken(token)
+
+	tb.mu.Lock()
+	tb.tokens[hash] = expiresAt
+	tb.mu.Unlock()
+
+	return nil
+}
+
+// IsBlacklisted checks if a token is blacklisted
+// ctx is accepted for interface compatibility with potential database-backed implementations
+func (tb *TokenBlacklist) IsBlacklisted(_ context.Context, token string) bool {
+	hash := hashToken(token)
+
+	tb.mu.RLock()
+	expiresAt, exists := tb.tokens[hash]
+	tb.mu.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	// Token in blacklist but expired - not blacklisted anymore
+	if time.Now().After(expiresAt) {
+		return false
+	}
+
+	return true
+}
+
+// Close stops the cleanup goroutine and waits for it to finish
+func (tb *TokenBlacklist) Close() {
+	close(tb.stopCh)
+	<-tb.doneCh // Wait for cleanup goroutine to finish
+}
+
+// cleanup periodically removes expired tokens from the blacklist
+func (tb *TokenBlacklist) cleanup() {
+	defer close(tb.doneCh)
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			tb.removeExpired()
+		case <-tb.stopCh:
+			return
+		}
+	}
+}
+
+// removeExpired removes all expired tokens from the blacklist
+func (tb *TokenBlacklist) removeExpired() {
+	now := time.Now()
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	for hash, expiresAt := range tb.tokens {
+		if now.After(expiresAt) {
+			delete(tb.tokens, hash)
+		}
+	}
+}
+
+// hashToken creates a SHA256 hash of the token for storage
+// We don't store the actual token to minimize exposure
+func hashToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
+}

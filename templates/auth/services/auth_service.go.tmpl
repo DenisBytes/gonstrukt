@@ -1,0 +1,335 @@
+package services
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"time"
+
+	"{{.ModuleName}}/internals/db"
+	"{{.ModuleName}}/internals/types"
+	"{{.ModuleName}}/internals/utils"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var (
+	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrUserNotFound       = errors.New("user not found")
+	ErrUserExists         = errors.New("user already exists")
+	ErrTokenExpired       = errors.New("token expired")
+	ErrTokenInvalid       = errors.New("token invalid")
+	ErrTokenBlacklisted   = errors.New("token has been revoked")
+	ErrSessionNotFound    = errors.New("session not found")
+	ErrMFARequired        = errors.New("mfa verification required")
+	ErrInvalidMFACode     = errors.New("invalid mfa code")
+	ErrConsentRequired    = errors.New("consent required")
+)
+
+// AuthServiceConfig holds configuration for the auth service
+type AuthServiceConfig struct {
+	DB             db.Database
+	KeyManager     *KeyManager
+	TokenBlacklist *TokenBlacklist
+	TokenTTL       time.Duration
+	RefreshTTL     time.Duration
+	Issuer         string
+}
+
+// AuthService handles authentication operations
+type AuthService struct {
+	db             db.Database
+	keyManager     *KeyManager
+	tokenBlacklist *TokenBlacklist
+	tokenTTL       time.Duration
+	refreshTTL     time.Duration
+	issuer         string
+}
+
+// NewAuthService creates a new auth service
+func NewAuthService(cfg AuthServiceConfig) *AuthService {
+	return &AuthService{
+		db:             cfg.DB,
+		keyManager:     cfg.KeyManager,
+		tokenBlacklist: cfg.TokenBlacklist,
+		tokenTTL:       cfg.TokenTTL,
+		refreshTTL:     cfg.RefreshTTL,
+		issuer:         cfg.Issuer,
+	}
+}
+
+// IsTokenBlacklisted checks if a token has been revoked
+func (s *AuthService) IsTokenBlacklisted(ctx context.Context, token string) bool {
+	if s.tokenBlacklist == nil {
+		return false
+	}
+	return s.tokenBlacklist.IsBlacklisted(ctx, token)
+}
+
+// BlacklistToken adds a token to the blacklist
+func (s *AuthService) BlacklistToken(ctx context.Context, token string, expiresAt time.Time) error {
+	if s.tokenBlacklist == nil {
+		return nil
+	}
+	return s.tokenBlacklist.Blacklist(ctx, token, expiresAt)
+}
+
+// RegisterRoutes registers auth routes with the mux
+func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
+	// Public routes
+	mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
+	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+
+	// MFA routes
+	mux.HandleFunc("POST /api/v1/auth/mfa/setup", s.handleMFASetup)
+	mux.HandleFunc("POST /api/v1/auth/mfa/verify", s.handleMFAVerify)
+	mux.HandleFunc("POST /api/v1/auth/mfa/disable", s.handleMFADisable)
+
+	// GDPR routes
+	mux.HandleFunc("GET /api/v1/auth/gdpr/consent", s.handleGetConsent)
+	mux.HandleFunc("POST /api/v1/auth/gdpr/consent", s.handleUpdateConsent)
+{{- if .HasGDPRConsent}}
+	mux.HandleFunc("GET /api/v1/auth/gdpr/consent/history", s.handleGetConsentHistory)
+{{- end}}
+	mux.HandleFunc("GET /api/v1/auth/gdpr/export", s.handleExportData)
+	mux.HandleFunc("DELETE /api/v1/auth/gdpr/delete", s.handleDeleteData)
+
+	// User management routes
+	mux.HandleFunc("GET /api/v1/auth/user", s.handleGetUser)
+	mux.HandleFunc("PUT /api/v1/auth/user", s.handleUpdateUser)
+	mux.HandleFunc("POST /api/v1/auth/user/password", s.handleChangePassword)
+
+	// Session management routes
+	mux.HandleFunc("GET /api/v1/auth/sessions", s.handleGetSessions)
+	mux.HandleFunc("DELETE /api/v1/auth/sessions/{id}", s.handleRevokeSession)
+	mux.HandleFunc("DELETE /api/v1/auth/sessions", s.handleRevokeAllSessions)
+}
+
+// Register creates a new user account
+func (s *AuthService) Register(ctx context.Context, req *types.RegisterRequest) (*types.User, error) {
+	// Check if user already exists
+	existing, err := s.db.GetUserByEmail(ctx, req.Email)
+	if err == nil && existing != nil {
+		return nil, ErrUserExists
+	}
+	// Note: err != nil means user not found (expected) or DB error
+	// We proceed with registration; if there's a real DB issue, CreateUser will fail
+
+	// Hash password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create user
+	user := &types.User{
+		ID:           uuid.New().String(),
+		Email:        req.Email,
+		PasswordHash: string(hashedPassword),
+		FirstName:    req.FirstName,
+		LastName:     req.LastName,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+
+	if err := s.db.CreateUser(ctx, user); err != nil {
+		return nil, err
+	}
+
+	// Clear password hash before returning
+	user.PasswordHash = ""
+
+	return user, nil
+}
+
+// Login authenticates a user and returns tokens
+func (s *AuthService) Login(ctx context.Context, req *types.LoginRequest) (*types.TokenResponse, error) {
+	// Get user by email
+	user, err := s.db.GetUserByEmail(ctx, req.Email)
+	if err != nil {
+		// Log failed login attempt (user not found)
+		utils.Warn("login attempt for unknown email",
+			zap.String("email", req.Email))
+		return nil, ErrInvalidCredentials
+	}
+
+	// Check password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		// Log failed login attempt (wrong password)
+		utils.Warn("failed login attempt",
+			zap.String("user_id", user.ID),
+			zap.String("email", user.Email),
+			zap.String("reason", "invalid_password"))
+		return nil, ErrInvalidCredentials
+	}
+
+	// Check if MFA is enabled
+	if user.MFAEnabled {
+		// Return partial response indicating MFA is required
+		return &types.TokenResponse{
+			MFARequired: true,
+			MFAToken:    s.generateMFAToken(user.ID),
+		}, nil
+	}
+
+	// Log successful login
+	utils.Info("user logged in",
+		zap.String("user_id", user.ID),
+		zap.String("email", user.Email))
+
+	// Generate tokens
+	return s.generateTokens(ctx, user)
+}
+
+// generateTokens creates access and refresh tokens
+func (s *AuthService) generateTokens(ctx context.Context, user *types.User) (*types.TokenResponse, error) {
+	now := time.Now()
+
+	// Generate session ID first so we can include it in the access token
+	sessionID := uuid.New().String()
+
+	// Generate access token with session ID
+	accessToken, err := s.keyManager.GenerateAccessToken(user, sessionID, s.tokenTTL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate refresh token
+	refreshToken := generateSecureToken(32)
+	if refreshToken == "" {
+		return nil, errors.New("failed to generate refresh token")
+	}
+
+	// Create session
+	session := &types.Session{
+		ID:           sessionID,
+		UserID:       user.ID,
+		RefreshToken: refreshToken,
+		ExpiresAt:    now.Add(s.refreshTTL),
+		CreatedAt:    now,
+	}
+
+	if err := s.db.CreateSession(ctx, session); err != nil {
+		return nil, err
+	}
+
+	return &types.TokenResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int(s.tokenTTL.Seconds()),
+	}, nil
+}
+
+// RefreshTokens refreshes the access token using a refresh token
+func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (*types.TokenResponse, error) {
+	// Get session by refresh token
+	session, err := s.db.GetSessionByRefreshToken(ctx, refreshToken)
+	if err != nil {
+		return nil, ErrSessionNotFound
+	}
+
+	// Check if session is expired
+	if time.Now().After(session.ExpiresAt) {
+		if err := s.db.DeleteSession(ctx, session.ID); err != nil {
+			utils.Warn("failed to delete expired session",
+				zap.String("session_id", session.ID),
+				zap.Error(err))
+		}
+		return nil, ErrTokenExpired
+	}
+
+	// Get user
+	user, err := s.db.GetUserByID(ctx, session.UserID)
+	if err != nil {
+		return nil, ErrUserNotFound
+	}
+
+	// Delete old session (token rotation)
+	if err := s.db.DeleteSession(ctx, session.ID); err != nil {
+		utils.Warn("failed to delete old session during refresh",
+			zap.String("session_id", session.ID),
+			zap.Error(err))
+	}
+
+	// Generate new tokens
+	return s.generateTokens(ctx, user)
+}
+
+// Logout invalidates the session
+func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
+	session, err := s.db.GetSessionByRefreshToken(ctx, refreshToken)
+	if err != nil {
+		return nil
+	}
+
+	return s.db.DeleteSession(ctx, session.ID)
+}
+
+// GetUserSessions retrieves all sessions for a user
+func (s *AuthService) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
+	return s.db.GetUserSessions(ctx, userID)
+}
+
+// RevokeSession revokes a specific session by ID
+func (s *AuthService) RevokeSession(ctx context.Context, userID, sessionID string) error {
+	// Get the session first to verify ownership
+	session, err := s.db.GetSessionByID(ctx, sessionID)
+	if err != nil {
+		return ErrSessionNotFound
+	}
+
+	// Verify the session belongs to the user
+	if session.UserID != userID {
+		return ErrSessionNotFound
+	}
+
+	return s.db.DeleteSession(ctx, sessionID)
+}
+
+// RevokeAllSessions revokes all sessions for a user except the current one
+func (s *AuthService) RevokeAllSessions(ctx context.Context, userID, currentSessionID string) error {
+	sessions, err := s.db.GetUserSessions(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	for _, session := range sessions {
+		// Skip the current session if provided
+		if currentSessionID != "" && session.ID == currentSessionID {
+			continue
+		}
+		if err := s.db.DeleteSession(ctx, session.ID); err != nil {
+			utils.Warn("failed to revoke session",
+				zap.String("session_id", session.ID),
+				zap.String("user_id", userID),
+				zap.Error(err))
+			lastErr = err
+		}
+	}
+
+	return lastErr
+}
+
+// generateMFAToken creates a temporary token for MFA verification
+func (s *AuthService) generateMFAToken(userID string) string {
+	return generateSecureToken(32)
+}
+
+// generateSecureToken generates a cryptographically secure random token
+// Returns empty string if crypto/rand fails (should never happen on properly configured systems)
+func generateSecureToken(length int) string {
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		utils.Error("crypto/rand.Read failed", zap.Error(err))
+		return ""
+	}
+	return base64.URLEncoding.EncodeToString(b)
+}

@@ -1,0 +1,81 @@
+package middleware
+
+import (
+	"net/http"
+	"strings"
+)
+
+// RequestValidationConfig holds request validation configuration
+type RequestValidationConfig struct {
+	MaxBodySize      int64
+	AllowedMethods   []string
+	RequireContentType bool
+	AllowedContentTypes []string
+}
+
+// DefaultRequestValidationConfig returns the default configuration
+func DefaultRequestValidationConfig() RequestValidationConfig {
+	return RequestValidationConfig{
+		MaxBodySize:      1 << 20, // 1 MB
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		RequireContentType: false,
+		AllowedContentTypes: []string{"application/json"},
+	}
+}
+
+// RequestValidation middleware validates incoming requests
+func RequestValidation() func(http.Handler) http.Handler {
+	return RequestValidationWithConfig(DefaultRequestValidationConfig())
+}
+
+// RequestValidationWithConfig creates a request validation middleware with custom config
+func RequestValidationWithConfig(cfg RequestValidationConfig) func(http.Handler) http.Handler {
+	methodSet := make(map[string]struct{}, len(cfg.AllowedMethods))
+	for _, m := range cfg.AllowedMethods {
+		methodSet[m] = struct{}{}
+	}
+
+	contentTypeSet := make(map[string]struct{}, len(cfg.AllowedContentTypes))
+	for _, ct := range cfg.AllowedContentTypes {
+		contentTypeSet[ct] = struct{}{}
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Check HTTP method
+			if _, ok := methodSet[r.Method]; !ok {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			// Check body size for non-GET requests
+			if r.Method != "GET" && r.Method != "HEAD" && r.Method != "OPTIONS" {
+				if cfg.MaxBodySize > 0 && r.ContentLength > cfg.MaxBodySize {
+					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+
+				// Limit body reader
+				r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxBodySize)
+
+				// Check content type
+				if cfg.RequireContentType {
+					contentType := r.Header.Get("Content-Type")
+					if contentType == "" {
+						http.Error(w, "content-type header required", http.StatusUnsupportedMediaType)
+						return
+					}
+
+					// Extract media type without parameters
+					mediaType := strings.TrimSpace(strings.Split(contentType, ";")[0])
+					if _, ok := contentTypeSet[mediaType]; !ok {
+						http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
+						return
+					}
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
