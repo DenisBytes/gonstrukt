@@ -1,0 +1,145 @@
+{{- if .HasMicrosoftOAuth}}
+package oauth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"{{.ModuleName}}/internals/db"
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+	"golang.org/x/oauth2"
+)
+
+// MicrosoftOAuthConfig holds Microsoft OAuth configuration
+type MicrosoftOAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+	TenantID     string // Use "common" for multi-tenant, or specific tenant ID
+}
+
+// MicrosoftProvider handles Microsoft OAuth authentication
+type MicrosoftProvider struct {
+	config *oauth2.Config
+	db     db.Database
+}
+
+// MicrosoftUserInfo represents the user info returned by Microsoft Graph
+type MicrosoftUserInfo struct {
+	ID                string `json:"id"`
+	DisplayName       string `json:"displayName"`
+	GivenName         string `json:"givenName"`
+	Surname           string `json:"surname"`
+	Mail              string `json:"mail"`
+	UserPrincipalName string `json:"userPrincipalName"`
+}
+
+// NewMicrosoftProvider creates a new Microsoft OAuth provider
+func NewMicrosoftProvider(cfg MicrosoftOAuthConfig, database db.Database) *MicrosoftProvider {
+	tenantID := cfg.TenantID
+	if tenantID == "" {
+		tenantID = "common"
+	}
+
+	return &MicrosoftProvider{
+		config: &oauth2.Config{
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			RedirectURL:  cfg.RedirectURL,
+			Scopes: []string{
+				"openid",
+				"profile",
+				"email",
+				"User.Read",
+			},
+			Endpoint: oauth2.Endpoint{
+				AuthURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", tenantID),
+				TokenURL: fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID),
+			},
+		},
+		db: database,
+	}
+}
+
+// GetAuthURL returns the OAuth authorization URL
+func (p *MicrosoftProvider) GetAuthURL(state string) string {
+	return p.config.AuthCodeURL(state, oauth2.AccessTypeOffline)
+}
+
+// HandleCallback handles the OAuth callback and returns or creates a user
+func (p *MicrosoftProvider) HandleCallback(ctx context.Context, code string) (*types.User, error) {
+	// Exchange code for token
+	token, err := p.config.Exchange(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange code: %w", err)
+	}
+
+	// Get user info from Microsoft Graph
+	userInfo, err := p.getUserInfo(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user info: %w", err)
+	}
+
+	// Determine email (Microsoft may return mail or userPrincipalName)
+	email := userInfo.Mail
+	if email == "" {
+		email = userInfo.UserPrincipalName
+	}
+
+	// Check if user exists
+	user, err := p.db.GetUserByEmail(ctx, email)
+	if err == nil && user != nil {
+		// Update OAuth info if needed
+		return user, nil
+	}
+
+	// Create new user
+	user = &types.User{
+		ID:            uuid.New().String(),
+		Email:         email,
+		FirstName:     userInfo.GivenName,
+		LastName:      userInfo.Surname,
+		OAuthProvider: "microsoft",
+		OAuthID:       userInfo.ID,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+
+	if err := p.db.CreateUser(ctx, user); err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	return user, nil
+}
+
+// getUserInfo fetches user info from Microsoft Graph API
+func (p *MicrosoftProvider) getUserInfo(ctx context.Context, token *oauth2.Token) (*MicrosoftUserInfo, error) {
+	client := p.config.Client(ctx, token)
+	resp, err := client.Get("https://graph.microsoft.com/v1.0/me")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get user info: status %d", resp.StatusCode)
+	}
+
+	var userInfo MicrosoftUserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, err
+	}
+
+	return &userInfo, nil
+}
+
+// ProviderName returns the provider name
+func (p *MicrosoftProvider) ProviderName() string {
+	return "microsoft"
+}
+{{- end}}

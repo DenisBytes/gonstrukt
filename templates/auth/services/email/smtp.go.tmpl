@@ -1,0 +1,172 @@
+{{- if .HasSMTPEmail}}
+package email
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"html/template"
+	"net/smtp"
+)
+
+// SMTPConfig holds SMTP configuration
+type SMTPConfig struct {
+	Host        string
+	Port        int
+	Username    string
+	Password    string
+	FromAddress string
+	FromName    string
+	UseTLS      bool
+}
+
+// SMTPService handles email sending via SMTP
+type SMTPService struct {
+	host        string
+	port        int
+	username    string
+	password    string
+	fromAddress string
+	fromName    string
+	auth        smtp.Auth
+}
+
+// NewSMTPService creates a new SMTP email service
+func NewSMTPService(cfg SMTPConfig) *SMTPService {
+	var auth smtp.Auth
+	if cfg.Username != "" && cfg.Password != "" {
+		auth = smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+	}
+
+	return &SMTPService{
+		host:        cfg.Host,
+		port:        cfg.Port,
+		username:    cfg.Username,
+		password:    cfg.Password,
+		fromAddress: cfg.FromAddress,
+		fromName:    cfg.FromName,
+		auth:        auth,
+	}
+}
+
+// SendEmail sends a single email
+func (s *SMTPService) SendEmail(ctx context.Context, to, subject, htmlBody, textBody string) error {
+	// Build email message
+	var msg bytes.Buffer
+	msg.WriteString(fmt.Sprintf("From: %s <%s>\r\n", s.fromName, s.fromAddress))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	msg.WriteString("MIME-Version: 1.0\r\n")
+	msg.WriteString("Content-Type: multipart/alternative; boundary=\"boundary42\"\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString("--boundary42\r\n")
+	msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString(textBody)
+	msg.WriteString("\r\n")
+	msg.WriteString("--boundary42\r\n")
+	msg.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString(htmlBody)
+	msg.WriteString("\r\n")
+	msg.WriteString("--boundary42--\r\n")
+
+	addr := fmt.Sprintf("%s:%d", s.host, s.port)
+	err := smtp.SendMail(addr, s.auth, s.fromAddress, []string{to}, msg.Bytes())
+	if err != nil {
+		return fmt.Errorf("failed to send email: %w", err)
+	}
+
+	return nil
+}
+
+// SendVerificationEmail sends an email verification link
+func (s *SMTPService) SendVerificationEmail(ctx context.Context, to, verificationURL string) error {
+	subject := "Verify your email address"
+
+	htmlTmpl := `
+		<html>
+		<body>
+			<h2>Email Verification</h2>
+			<p>Please click the link below to verify your email address:</p>
+			<p><a href="{{"{{"}} .URL {{"}}"}}">Verify Email</a></p>
+			<p>If you didn't request this, please ignore this email.</p>
+			<p>This link will expire in 24 hours.</p>
+		</body>
+		</html>
+	`
+
+	var htmlBody bytes.Buffer
+	tmpl, _ := template.New("email").Parse(htmlTmpl)
+	tmpl.Execute(&htmlBody, map[string]string{"URL": verificationURL})
+
+	textBody := fmt.Sprintf("Please verify your email by visiting: %s\n\nIf you didn't request this, please ignore this email.", verificationURL)
+
+	return s.SendEmail(ctx, to, subject, htmlBody.String(), textBody)
+}
+
+// SendPasswordResetEmail sends a password reset OTP
+func (s *SMTPService) SendPasswordResetEmail(ctx context.Context, to, otp string) error {
+	subject := "Password Reset Request"
+
+	htmlTmpl := `
+		<html>
+		<body>
+			<h2>Password Reset</h2>
+			<p>Your password reset code is:</p>
+			<h1 style="font-size: 32px; letter-spacing: 5px;">{{"{{"}} .OTP {{"}}"}}</h1>
+			<p>This code will expire in 15 minutes.</p>
+			<p>If you didn't request this, please ignore this email and your password will remain unchanged.</p>
+		</body>
+		</html>
+	`
+
+	var htmlBody bytes.Buffer
+	tmpl, _ := template.New("email").Parse(htmlTmpl)
+	tmpl.Execute(&htmlBody, map[string]string{"OTP": otp})
+
+	textBody := fmt.Sprintf("Your password reset code is: %s\n\nThis code will expire in 15 minutes.\n\nIf you didn't request this, please ignore this email.", otp)
+
+	return s.SendEmail(ctx, to, subject, htmlBody.String(), textBody)
+}
+
+// SendWelcomeEmail sends a welcome email to new users
+func (s *SMTPService) SendWelcomeEmail(ctx context.Context, to, firstName string) error {
+	subject := "Welcome!"
+
+	htmlTmpl := `
+		<html>
+		<body>
+			<h2>Welcome, {{"{{"}} .FirstName {{"}}"}}!</h2>
+			<p>Thank you for creating an account. We're excited to have you on board.</p>
+			<p>If you have any questions, feel free to reach out to our support team.</p>
+		</body>
+		</html>
+	`
+
+	var htmlBody bytes.Buffer
+	tmpl, _ := template.New("email").Parse(htmlTmpl)
+	tmpl.Execute(&htmlBody, map[string]string{"FirstName": firstName})
+
+	textBody := fmt.Sprintf("Welcome, %s!\n\nThank you for creating an account. We're excited to have you on board.\n\nIf you have any questions, feel free to reach out to our support team.", firstName)
+
+	return s.SendEmail(ctx, to, subject, htmlBody.String(), textBody)
+}
+
+// SendAccountDeletionConfirmation sends confirmation after account deletion
+func (s *SMTPService) SendAccountDeletionConfirmation(ctx context.Context, to string) error {
+	subject := "Account Deleted"
+	htmlBody := `
+		<html>
+		<body>
+			<h2>Account Deletion Confirmed</h2>
+			<p>Your account has been successfully deleted and your personal data has been anonymized in accordance with GDPR requirements.</p>
+			<p>If you didn't request this, please contact our support team immediately.</p>
+		</body>
+		</html>
+	`
+	textBody := "Your account has been successfully deleted and your personal data has been anonymized in accordance with GDPR requirements.\n\nIf you didn't request this, please contact our support team immediately."
+
+	return s.SendEmail(ctx, to, subject, htmlBody, textBody)
+}
+{{- end}}

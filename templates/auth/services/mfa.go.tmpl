@@ -1,0 +1,565 @@
+{{- if .EnableMFA}}
+package services
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sync"
+	"time"
+
+{{- if not .HasGDPR}}
+	"{{.ModuleName}}/internals/middleware"
+{{- end}}
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/bcrypt"
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+const (
+	// MFA backup code count
+	MFABackupCodeCount = 10
+	// MFA backup code length
+	MFABackupCodeLength = 8
+	// MFA issuer name (shown in authenticator apps)
+	MFAIssuer = "{{.ProjectName}}"
+
+	// MFA rate limiting
+	mfaMaxAttempts     = 5               // Max failed attempts before lockout
+	mfaLockoutDuration = 15 * time.Minute // Lockout duration after max attempts
+)
+
+// mfaAttemptTracker tracks failed MFA attempts per user
+type mfaAttemptTracker struct {
+	attempts    int
+	lockedUntil time.Time
+	lastAttempt time.Time
+}
+
+// MFARateLimiter manages rate limiting for MFA attempts
+type MFARateLimiter struct {
+	attempts map[string]*mfaAttemptTracker
+	mu       sync.RWMutex
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+}
+
+// Global MFA rate limiter instance
+var mfaRateLimiter *MFARateLimiter
+
+// InitMFARateLimiter initializes the global MFA rate limiter
+func InitMFARateLimiter() *MFARateLimiter {
+	rl := &MFARateLimiter{
+		attempts: make(map[string]*mfaAttemptTracker),
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+	go rl.cleanup()
+	mfaRateLimiter = rl
+	return rl
+}
+
+// cleanup periodically removes expired rate limit entries
+func (rl *MFARateLimiter) cleanup() {
+	defer close(rl.doneCh)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rl.removeExpired()
+		case <-rl.stopCh:
+			return
+		}
+	}
+}
+
+// removeExpired removes all expired rate limit entries
+func (rl *MFARateLimiter) removeExpired() {
+	now := time.Now()
+	cleanupThreshold := now.Add(-mfaLockoutDuration) // Remove inactive entries older than lockout duration
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	for userID, tracker := range rl.attempts {
+		// Remove if:
+		// 1. Lockout has expired (user can retry, new tracker will be created if they fail again)
+		// 2. OR entry is stale (no attempts in lockout duration period)
+		lockoutExpired := tracker.lockedUntil.IsZero() || now.After(tracker.lockedUntil)
+		isStale := tracker.lastAttempt.Before(cleanupThreshold)
+
+		if lockoutExpired && isStale {
+			delete(rl.attempts, userID)
+		}
+	}
+}
+
+// Close stops the cleanup goroutine and waits for it to finish
+func (rl *MFARateLimiter) Close() {
+	close(rl.stopCh)
+	<-rl.doneCh
+}
+
+// checkMFARateLimit checks if user is rate limited for MFA attempts
+// Returns true if the user should be blocked
+func checkMFARateLimit(userID string) bool {
+	if mfaRateLimiter == nil {
+		return false
+	}
+
+	mfaRateLimiter.mu.RLock()
+	tracker, exists := mfaRateLimiter.attempts[userID]
+	mfaRateLimiter.mu.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	// Check if still locked out
+	if time.Now().Before(tracker.lockedUntil) {
+		return true
+	}
+
+	return false
+}
+
+// recordMFAAttempt records a failed MFA attempt
+func recordMFAAttempt(userID string, success bool) {
+	if mfaRateLimiter == nil {
+		return
+	}
+
+	mfaRateLimiter.mu.Lock()
+	defer mfaRateLimiter.mu.Unlock()
+
+	if success {
+		// Clear attempts on successful verification
+		delete(mfaRateLimiter.attempts, userID)
+		return
+	}
+
+	now := time.Now()
+	tracker, exists := mfaRateLimiter.attempts[userID]
+	if !exists {
+		tracker = &mfaAttemptTracker{}
+		mfaRateLimiter.attempts[userID] = tracker
+	}
+
+	// Reset if lockout expired
+	if now.After(tracker.lockedUntil) {
+		tracker.attempts = 0
+	}
+
+	tracker.attempts++
+	tracker.lastAttempt = now
+
+	// Lock out if too many attempts
+	if tracker.attempts >= mfaMaxAttempts {
+		tracker.lockedUntil = now.Add(mfaLockoutDuration)
+	}
+}
+
+// MFASetupResponse represents the response for MFA setup
+type MFASetupResponse struct {
+	Secret      string   `json:"secret"`
+	QRCode      string   `json:"qr_code"`
+	BackupCodes []string `json:"backup_codes"`
+}
+
+// MFAVerifyRequest represents an MFA verification request
+type MFAVerifyRequest struct {
+	Code string `json:"code"`
+}
+
+// handleMFASetup initiates MFA setup for a user
+// POST /api/v1/auth/mfa/setup
+func (s *AuthService) handleMFASetup(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("mfa.action", "setup"),
+	)
+{{- end}}
+
+	// Check if MFA is already enabled
+	if user.MFAEnabled {
+		http.Error(w, "MFA is already enabled", http.StatusBadRequest)
+		return
+	}
+
+	// Generate TOTP secret
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      MFAIssuer,
+		AccountName: user.Email,
+	})
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "failed to generate MFA secret", http.StatusInternalServerError)
+		return
+	}
+
+	// Store the secret temporarily (user must verify before it's active)
+	user.MFASecret = key.Secret()
+	if err := s.db.UpdateUser(ctx, user); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "failed to save MFA secret", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate backup codes
+	backupCodes, err := s.generateBackupCodes(ctx, user.ID)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "failed to generate backup codes", http.StatusInternalServerError)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "MFA setup initiated")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(MFASetupResponse{
+		Secret:      key.Secret(),
+		QRCode:      key.URL(),
+		BackupCodes: backupCodes,
+	})
+}
+
+// handleMFAVerify verifies MFA code and activates MFA
+// POST /api/v1/auth/mfa/verify
+func (s *AuthService) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("mfa.action", "verify"),
+	)
+{{- end}}
+
+	// Check rate limiting
+	if checkMFARateLimit(user.ID) {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "Rate limited")
+{{- end}}
+		http.Error(w, "too many failed attempts, please try again later", http.StatusTooManyRequests)
+		return
+	}
+
+	// Parse request
+	var req MFAVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Check if user has a pending MFA secret
+	if user.MFASecret == "" {
+		http.Error(w, "MFA setup not initiated", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the code
+	valid := totp.Validate(req.Code, user.MFASecret)
+	if !valid {
+		// Try backup codes
+		if !s.verifyBackupCode(ctx, user.ID, req.Code) {
+			recordMFAAttempt(user.ID, false)
+{{- if .HasObservability}}
+			span.SetStatus(codes.Error, "Invalid MFA code")
+{{- end}}
+			http.Error(w, "invalid MFA code", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Record successful attempt (clears rate limit)
+	recordMFAAttempt(user.ID, true)
+
+	// Enable MFA
+	user.MFAEnabled = true
+	if err := s.db.UpdateUser(ctx, user); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "failed to enable MFA", http.StatusInternalServerError)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "MFA enabled")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "MFA has been enabled",
+	})
+}
+
+// handleMFADisable disables MFA for a user
+// POST /api/v1/auth/mfa/disable
+func (s *AuthService) handleMFADisable(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("mfa.action", "disable"),
+	)
+{{- end}}
+
+	// Check rate limiting
+	if checkMFARateLimit(user.ID) {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "Rate limited")
+{{- end}}
+		http.Error(w, "too many failed attempts, please try again later", http.StatusTooManyRequests)
+		return
+	}
+
+	// Parse request - require password confirmation
+	var req struct {
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Verify password
+	if !s.verifyPassword(req.Password, user.PasswordHash) {
+		recordMFAAttempt(user.ID, false)
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "Invalid password")
+{{- end}}
+		http.Error(w, "invalid password", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify MFA code
+	if !totp.Validate(req.Code, user.MFASecret) {
+		// Try backup codes
+		if !s.verifyBackupCode(ctx, user.ID, req.Code) {
+			recordMFAAttempt(user.ID, false)
+{{- if .HasObservability}}
+			span.SetStatus(codes.Error, "Invalid MFA code")
+{{- end}}
+			http.Error(w, "invalid MFA code", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Record successful attempt (clears rate limit)
+	recordMFAAttempt(user.ID, true)
+
+	// Disable MFA
+	user.MFAEnabled = false
+	user.MFASecret = ""
+	if err := s.db.UpdateUser(ctx, user); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "failed to disable MFA", http.StatusInternalServerError)
+		return
+	}
+
+	// Delete backup codes (non-critical, errors logged but don't fail request)
+	_ = s.db.DeleteBackupCodes(ctx, user.ID)
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "MFA disabled")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "MFA has been disabled",
+	})
+}
+
+// generateBackupCodes generates and stores backup codes
+func (s *AuthService) generateBackupCodes(ctx context.Context, userID string) ([]string, error) {
+	// Delete existing backup codes
+	if err := s.db.DeleteBackupCodes(ctx, userID); err != nil {
+		return nil, err
+	}
+
+	codes := make([]string, MFABackupCodeCount)
+	for i := 0; i < MFABackupCodeCount; i++ {
+		code := generateRandomCode(MFABackupCodeLength)
+		if code == "" {
+			return nil, errors.New("failed to generate backup code")
+		}
+		codes[i] = code
+
+		// Hash and store the code
+		hashedCode := hashBackupCode(code)
+		if hashedCode == "" {
+			return nil, errors.New("failed to hash backup code")
+		}
+
+		backup := &types.MFABackup{
+			ID:        uuid.New().String(),
+			UserID:    userID,
+			Code:      hashedCode,
+			Used:      false,
+			CreatedAt: time.Now(),
+		}
+
+		if err := s.db.CreateBackupCode(ctx, backup); err != nil {
+			return nil, err
+		}
+	}
+
+	return codes, nil
+}
+
+// verifyBackupCode verifies and consumes a backup code
+func (s *AuthService) verifyBackupCode(ctx context.Context, userID, code string) bool {
+	// Get all backup codes for the user (bcrypt hashes can't be queried directly)
+	backups, err := s.db.GetMFABackups(ctx, userID)
+	if err != nil {
+		return false
+	}
+
+	// Find matching unused code using constant-time comparison
+	for _, backup := range backups {
+		if backup.Used {
+			continue
+		}
+		if verifyHashedBackupCode(code, backup.Code) {
+			// Mark code as used
+			now := time.Now()
+			backup.Used = true
+			backup.UsedAt = &now
+			if err := s.db.UpdateBackupCode(ctx, backup); err != nil {
+				return false
+			}
+			return true
+		}
+	}
+
+	return false
+}
+
+// generateRandomCode generates a cryptographically secure random code
+// Returns empty string on error (should never happen with crypto/rand)
+func generateRandomCode(length int) string {
+	// Generate enough random bytes to encode to desired length
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read should never fail on a properly configured system
+		return ""
+	}
+	// Use base32 encoding (no confusing chars like 0/O, 1/l)
+	encoded := base32.StdEncoding.EncodeToString(b)
+	if len(encoded) < length {
+		return encoded
+	}
+	return encoded[:length]
+}
+
+// hashBackupCode hashes a backup code for secure storage using bcrypt
+// Returns empty string on error (caller should handle)
+func hashBackupCode(code string) string {
+	hash, err := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+	if err != nil {
+		return ""
+	}
+	return string(hash)
+}
+
+// verifyHashedBackupCode compares a plaintext code against a bcrypt hash
+func verifyHashedBackupCode(code, hashedCode string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hashedCode), []byte(code)) == nil
+}
+
+{{- if not .HasGDPR}}
+// getUserFromContext extracts the authenticated user from request context
+func (s *AuthService) getUserFromContext(ctx context.Context) (*types.User, bool) {
+	userID, ok := middleware.GetUserID(ctx)
+	if !ok || userID == "" {
+		return nil, false
+	}
+	user, err := s.db.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, false
+	}
+	return user, true
+}
+
+// verifyPassword compares a plaintext password with a hash
+func (s *AuthService) verifyPassword(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+{{- end}}
+{{- end}}

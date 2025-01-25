@@ -1,0 +1,130 @@
+{{- if .HasGoogleOAuth}}
+package oauth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"{{.ModuleName}}/internals/db"
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+)
+
+// GoogleOAuthConfig holds Google OAuth configuration
+type GoogleOAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+}
+
+// GoogleProvider handles Google OAuth authentication
+type GoogleProvider struct {
+	config *oauth2.Config
+	db     db.Database
+}
+
+// GoogleUserInfo represents the user info returned by Google
+type GoogleUserInfo struct {
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	VerifiedEmail bool   `json:"verified_email"`
+	Name          string `json:"name"`
+	GivenName     string `json:"given_name"`
+	FamilyName    string `json:"family_name"`
+	Picture       string `json:"picture"`
+}
+
+// NewGoogleProvider creates a new Google OAuth provider
+func NewGoogleProvider(cfg GoogleOAuthConfig, database db.Database) *GoogleProvider {
+	return &GoogleProvider{
+		config: &oauth2.Config{
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			RedirectURL:  cfg.RedirectURL,
+			Scopes: []string{
+				"https://www.googleapis.com/auth/userinfo.email",
+				"https://www.googleapis.com/auth/userinfo.profile",
+			},
+			Endpoint: google.Endpoint,
+		},
+		db: database,
+	}
+}
+
+// GetAuthURL returns the OAuth authorization URL
+func (p *GoogleProvider) GetAuthURL(state string) string {
+	return p.config.AuthCodeURL(state, oauth2.AccessTypeOffline)
+}
+
+// HandleCallback handles the OAuth callback and returns or creates a user
+func (p *GoogleProvider) HandleCallback(ctx context.Context, code string) (*types.User, error) {
+	// Exchange code for token
+	token, err := p.config.Exchange(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange code: %w", err)
+	}
+
+	// Get user info from Google
+	userInfo, err := p.getUserInfo(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user info: %w", err)
+	}
+
+	// Check if user exists
+	user, err := p.db.GetUserByEmail(ctx, userInfo.Email)
+	if err == nil && user != nil {
+		// Update OAuth info if needed
+		return user, nil
+	}
+
+	// Create new user
+	user = &types.User{
+		ID:           uuid.New().String(),
+		Email:        userInfo.Email,
+		FirstName:    userInfo.GivenName,
+		LastName:     userInfo.FamilyName,
+		OAuthProvider: "google",
+		OAuthID:      userInfo.ID,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+
+	if err := p.db.CreateUser(ctx, user); err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	return user, nil
+}
+
+// getUserInfo fetches user info from Google API
+func (p *GoogleProvider) getUserInfo(ctx context.Context, token *oauth2.Token) (*GoogleUserInfo, error) {
+	client := p.config.Client(ctx, token)
+	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get user info: status %d", resp.StatusCode)
+	}
+
+	var userInfo GoogleUserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, err
+	}
+
+	return &userInfo, nil
+}
+
+// ProviderName returns the provider name
+func (p *GoogleProvider) ProviderName() string {
+	return "google"
+}
+{{- end}}

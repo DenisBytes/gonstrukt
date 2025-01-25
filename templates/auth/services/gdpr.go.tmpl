@@ -1,0 +1,513 @@
+package services
+
+import (
+	"context"
+{{- if .HasGDPRProcessingLogs}}
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+{{- end}}
+	"encoding/json"
+	"net/http"
+{{- if .HasGDPRProcessingLogs}}
+	"os"
+{{- end}}
+	"time"
+
+	"{{.ModuleName}}/internals/middleware"
+	"{{.ModuleName}}/internals/types"
+{{- if .HasGDPRProcessingLogs}}
+	"{{.ModuleName}}/internals/utils"
+{{- end}}
+
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+{{- if .HasObservability}}
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+{{- end}}
+)
+
+// Consent type constants
+const (
+	ConsentTypeEssential      = "essential"
+	ConsentTypeAnalytics      = "analytics"
+	ConsentTypeMarketing      = "marketing"
+	ConsentTypeDataProcessing = "data_processing"
+
+	// Consent version - increment when terms change
+	ConsentVersion = "1.0.0"
+
+	// Default consent expiry (1 year)
+	ConsentExpiryDuration = 365 * 24 * time.Hour
+)
+
+// ConsentResponse represents a consent record in API responses
+type ConsentResponse struct {
+	Type      string    `json:"type"`
+	Agreed    bool      `json:"agreed"`
+	Version   string    `json:"version"`
+	GrantedAt time.Time `json:"granted_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ConsentUpdateRequest represents a consent update request
+type ConsentUpdateRequest struct {
+	Type   string `json:"type"`
+	Agreed bool   `json:"agreed"`
+}
+
+{{- if .HasGDPRConsent}}
+
+// handleGetConsent returns all active consents for the authenticated user
+// GET /api/v1/auth/gdpr/consent
+func (s *AuthService) handleGetConsent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("gdpr.action", "get_consents"),
+	)
+{{- end}}
+
+	// Get active consents
+	consents, err := s.db.GetActiveConsentsByUserID(ctx, user.ID)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to response format
+	response := make([]ConsentResponse, len(consents))
+	for i, c := range consents {
+		response[i] = ConsentResponse{
+			Type:      c.Type,
+			Agreed:    c.Granted,
+			Version:   c.Version,
+			GrantedAt: c.GrantedAt,
+			ExpiresAt: c.ExpiresAt,
+		}
+	}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "Consents retrieved")
+{{- end}}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleUpdateConsent updates or creates a consent record
+// PUT /api/v1/auth/gdpr/consent
+func (s *AuthService) handleUpdateConsent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("gdpr.action", "update_consent"),
+	)
+{{- end}}
+
+	// Parse request
+	var req ConsentUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate consent type
+	validTypes := map[string]bool{
+		ConsentTypeEssential:      true,
+		ConsentTypeAnalytics:      true,
+		ConsentTypeMarketing:      true,
+		ConsentTypeDataProcessing: true,
+	}
+	if !validTypes[req.Type] {
+		http.Error(w, "invalid consent type", http.StatusBadRequest)
+		return
+	}
+
+	// Essential consent cannot be revoked
+	if req.Type == ConsentTypeEssential && !req.Agreed {
+		http.Error(w, "essential consent cannot be revoked", http.StatusBadRequest)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("consent.type", req.Type),
+		attribute.Bool("consent.agreed", req.Agreed),
+	)
+{{- end}}
+
+	// Create new consent record (versioned, never update in place)
+	expiresAt := time.Now().Add(ConsentExpiryDuration)
+	consent := &types.Consent{
+		ID:        uuid.New().String(),
+		UserID:    user.ID,
+		Type:      req.Type,
+		Granted:   req.Agreed,
+		GrantedAt: time.Now(),
+		ExpiresAt: expiresAt,
+		Version:   ConsentVersion,
+	}
+
+	if err := s.db.CreateConsent(ctx, consent); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+{{- if .HasGDPRProcessingLogs}}
+	// Log data processing for GDPR audit trail
+	legalBasis := "consent"
+	if !req.Agreed {
+		legalBasis = "consent_withdrawal"
+	}
+	s.logDataProcessing(ctx, user.ID, "consent_update", req.Type, r.RemoteAddr, legalBasis)
+{{- end}}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "Consent updated")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ConsentResponse{
+		Type:      consent.Type,
+		Agreed:    consent.Granted,
+		Version:   consent.Version,
+		GrantedAt: consent.GrantedAt,
+		ExpiresAt: consent.ExpiresAt,
+	})
+}
+
+// handleGetConsentHistory returns full consent audit trail
+// GET /api/v1/auth/gdpr/consent/history
+func (s *AuthService) handleGetConsentHistory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("gdpr.action", "get_consent_history"),
+	)
+{{- end}}
+
+	// Get consent history
+	consents, err := s.db.GetConsentHistory(ctx, user.ID)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to response format
+	response := make([]ConsentResponse, len(consents))
+	for i, c := range consents {
+		response[i] = ConsentResponse{
+			Type:      c.Type,
+			Agreed:    c.Granted,
+			Version:   c.Version,
+			GrantedAt: c.GrantedAt,
+			ExpiresAt: c.ExpiresAt,
+		}
+	}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "Consent history retrieved")
+{{- end}}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+
+// handleExportData exports all user data for GDPR data portability (Article 20)
+// GET /api/v1/auth/gdpr/export
+func (s *AuthService) handleExportData(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("gdpr.action", "data_export"),
+	)
+{{- end}}
+
+	// Export user data
+	exportData, err := s.db.ExportUserData(ctx, user.ID)
+	if err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+{{- if .HasGDPRProcessingLogs}}
+	// Log data processing for GDPR audit trail
+	s.logDataProcessing(ctx, user.ID, "data_export", "full user data export", r.RemoteAddr, "GDPR_Article_20")
+{{- end}}
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "Data exported successfully")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=user_data_export.json")
+	json.NewEncoder(w).Encode(exportData)
+}
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+
+// handleDeleteData handles GDPR right to erasure (Article 17)
+// DELETE /api/v1/auth/gdpr/delete
+func (s *AuthService) handleDeleteData(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+{{- if .HasObservability}}
+	span := trace.SpanFromContext(ctx)
+{{- end}}
+
+	// Get authenticated user from context
+	user, ok := s.getUserFromContext(ctx)
+	if !ok || user == nil {
+{{- if .HasObservability}}
+		span.SetStatus(codes.Error, "User not found in context")
+{{- end}}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+{{- if .HasObservability}}
+	span.SetAttributes(
+		attribute.String("user.id", user.ID),
+		attribute.String("gdpr.action", "delete_account"),
+	)
+{{- end}}
+
+	// Parse request - require password confirmation for security
+	var req struct {
+		Password string `json:"password"`
+		Confirm  bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+{{- end}}
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Require explicit confirmation
+	if !req.Confirm {
+		http.Error(w, "deletion not confirmed", http.StatusBadRequest)
+		return
+	}
+
+	// Verify password (skip for OAuth-only accounts)
+	if user.PasswordHash != "" {
+		if req.Password == "" {
+			http.Error(w, "password required", http.StatusBadRequest)
+			return
+		}
+		if !s.verifyPassword(req.Password, user.PasswordHash) {
+{{- if .HasObservability}}
+			span.SetStatus(codes.Error, "Invalid password")
+{{- end}}
+			http.Error(w, "invalid password", http.StatusUnauthorized)
+			return
+		}
+	}
+
+{{- if .HasGDPRProcessingLogs}}
+	// Log data processing BEFORE deletion for audit trail
+	s.logDataProcessing(ctx, user.ID, "account_deletion", "user account and personal data", r.RemoteAddr, "GDPR_Article_17")
+{{- end}}
+
+	// Perform soft delete (anonymize PII, revoke sessions)
+	if err := s.db.SoftDeleteUser(ctx, user.ID); err != nil {
+{{- if .HasObservability}}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to delete account")
+{{- end}}
+		http.Error(w, "failed to delete account", http.StatusInternalServerError)
+		return
+	}
+
+	// Clear session cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "__Host-session-token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+{{- if .HasObservability}}
+	span.SetStatus(codes.Ok, "Account deleted successfully")
+{{- end}}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Account has been deleted. Your personal data has been anonymized.",
+	})
+}
+{{- end}}
+
+{{- if .HasGDPRProcessingLogs}}
+
+// logDataProcessing creates a GDPR data processing log entry
+func (s *AuthService) logDataProcessing(ctx context.Context, userID, processType, processedData, requestIP, legalBasis string) {
+	log := &types.DataProcessingLog{
+		ID:            uuid.New().String(),
+		UserID:        userID,
+		ProcessType:   processType,
+		ProcessedData: processedData,
+		Status:        "completed",
+		RequestIP:     s.hashIP(requestIP),
+		ProcessorID:   "auth-service",
+		LegalBasis:    legalBasis,
+		Purpose:       s.getPurposeForProcessType(processType),
+		RequestedAt:   time.Now(),
+		CompletedAt:   time.Now(),
+		CreatedAt:     time.Now(),
+	}
+
+	if err := s.db.CreateDataProcessingLog(ctx, log); err != nil {
+		// Log error but don't fail the request
+		// The main operation succeeded, logging failure is non-critical
+	}
+}
+
+// getPurposeForProcessType returns the purpose description for a process type
+func (s *AuthService) getPurposeForProcessType(processType string) string {
+	purposes := map[string]string{
+		"consent_update":   "user consent management",
+		"data_export":      "data portability request",
+		"account_deletion": "right to erasure request",
+		"login":            "user authentication",
+		"registration":     "account creation",
+	}
+	if purpose, ok := purposes[processType]; ok {
+		return purpose
+	}
+	return "data processing"
+}
+
+// ipHashSaltWarned tracks if we've already warned about missing salt
+var ipHashSaltWarned bool
+
+// hashIP hashes an IP address for GDPR compliance (privacy by design)
+func (s *AuthService) hashIP(ip string) string {
+	// HMAC-SHA256 with a secret salt for GDPR-compliant IP anonymization
+	// The salt MUST be configured via environment variable in production
+	salt := os.Getenv("IP_HASH_SALT")
+	if salt == "" {
+		if !ipHashSaltWarned {
+			// Log warning once - using default salt compromises IP anonymization
+			utils.Warn("IP_HASH_SALT not configured, using default (not recommended for production)")
+			ipHashSaltWarned = true
+		}
+		salt = "default-salt-change-in-production"
+	} else if len(salt) < 32 {
+		// Salt should be at least 32 characters for proper security
+		if !ipHashSaltWarned {
+			utils.Warn("IP_HASH_SALT is too short (should be at least 32 characters)")
+			ipHashSaltWarned = true
+		}
+	}
+
+	h := hmac.New(sha256.New, []byte(salt))
+	h.Write([]byte(ip))
+	// Return full hash for better anonymization (no truncation)
+	return hex.EncodeToString(h.Sum(nil))
+}
+{{- end}}
+
+// getUserFromContext extracts the authenticated user from request context
+func (s *AuthService) getUserFromContext(ctx context.Context) (*types.User, bool) {
+	userID, ok := middleware.GetUserID(ctx)
+	if !ok || userID == "" {
+		return nil, false
+	}
+	user, err := s.db.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, false
+	}
+	return user, true
+}
+
+// verifyPassword compares a plaintext password with a hash
+func (s *AuthService) verifyPassword(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
