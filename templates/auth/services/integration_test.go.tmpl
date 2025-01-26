@@ -1,0 +1,493 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// Integration tests verify complete user flows against real infrastructure.
+
+func TestIntegration_FullAuthFlow(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	email := "integration@test.com"
+	password := "securepassword123"
+
+	// Step 1: Register a new user
+	t.Run("1_register", func(t *testing.T) {
+		body := map[string]string{
+			"email":      email,
+			"password":   password,
+			"first_name": "Integration",
+			"last_name":  "Test",
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/register", body, nil)
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("register failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+
+		var user types.User
+		if err := json.Unmarshal(w.Body.Bytes(), &user); err != nil {
+			t.Fatalf("failed to unmarshal user: %v", err)
+		}
+
+		if user.Email != email {
+			t.Errorf("user email = %v, want %v", user.Email, email)
+		}
+	})
+
+	// Step 2: Login with the registered user
+	var tokens types.TokenResponse
+	t.Run("2_login", func(t *testing.T) {
+		body := map[string]string{
+			"email":    email,
+			"password": password,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/login", body, nil)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("login failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+
+		if err := json.Unmarshal(w.Body.Bytes(), &tokens); err != nil {
+			t.Fatalf("failed to unmarshal tokens: %v", err)
+		}
+
+		if tokens.AccessToken == "" {
+			t.Error("access token is empty")
+		}
+		if tokens.RefreshToken == "" {
+			t.Error("refresh token is empty")
+		}
+	})
+
+	// Step 3: Access protected resource with token
+	t.Run("3_access_protected", func(t *testing.T) {
+		headers := map[string]string{
+			"Authorization": "Bearer " + tokens.AccessToken,
+		}
+
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/user", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("get user failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+
+		var user types.User
+		if err := json.Unmarshal(w.Body.Bytes(), &user); err != nil {
+			t.Fatalf("failed to unmarshal user: %v", err)
+		}
+
+		if user.Email != email {
+			t.Errorf("user email = %v, want %v", user.Email, email)
+		}
+	})
+
+	// Step 4: Refresh tokens
+	var newTokens types.TokenResponse
+	t.Run("4_refresh_tokens", func(t *testing.T) {
+		body := map[string]string{
+			"refresh_token": tokens.RefreshToken,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/refresh", body, nil)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("refresh failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+
+		if err := json.Unmarshal(w.Body.Bytes(), &newTokens); err != nil {
+			t.Fatalf("failed to unmarshal new tokens: %v", err)
+		}
+
+		if newTokens.AccessToken == "" {
+			t.Error("new access token is empty")
+		}
+		if newTokens.RefreshToken == tokens.RefreshToken {
+			t.Error("refresh token should be rotated")
+		}
+	})
+
+	// Step 5: Old refresh token should be invalid
+	t.Run("5_old_refresh_invalid", func(t *testing.T) {
+		body := map[string]string{
+			"refresh_token": tokens.RefreshToken,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/refresh", body, nil)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("old refresh token should fail: status = %v", w.Code)
+		}
+	})
+
+	// Step 6: Access with new token works
+	t.Run("6_new_token_works", func(t *testing.T) {
+		headers := map[string]string{
+			"Authorization": "Bearer " + newTokens.AccessToken,
+		}
+
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/user", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("get user with new token failed: status = %v", w.Code)
+		}
+	})
+
+	// Step 7: Logout
+	t.Run("7_logout", func(t *testing.T) {
+		body := map[string]string{
+			"refresh_token": newTokens.RefreshToken,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/logout", body, nil)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("logout failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	// Step 8: Refresh after logout should fail
+	t.Run("8_refresh_after_logout", func(t *testing.T) {
+		body := map[string]string{
+			"refresh_token": newTokens.RefreshToken,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/refresh", body, nil)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("refresh after logout should fail: status = %v", w.Code)
+		}
+	})
+}
+
+func TestIntegration_MultipleSessionsFlow(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	email := "multi-session@test.com"
+	password := "password123"
+
+	// Create user
+	createTestUser(t, email, password)
+
+	// Login from multiple "devices"
+	var sessions []types.TokenResponse
+	for i := 0; i < 3; i++ {
+		body := map[string]string{
+			"email":    email,
+			"password": password,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/login", body, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("login %d failed: status = %v", i+1, w.Code)
+		}
+
+		var tokens types.TokenResponse
+		json.Unmarshal(w.Body.Bytes(), &tokens)
+		sessions = append(sessions, tokens)
+	}
+
+	// Verify all sessions exist
+	t.Run("list_sessions", func(t *testing.T) {
+		headers := map[string]string{
+			"Authorization": "Bearer " + sessions[2].AccessToken,
+		}
+
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/sessions", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("get sessions failed: status = %v", w.Code)
+		}
+
+		var sessionList []types.SessionInfo
+		json.Unmarshal(w.Body.Bytes(), &sessionList)
+
+		if len(sessionList) != 3 {
+			t.Errorf("expected 3 sessions, got %d", len(sessionList))
+		}
+	})
+
+	// Revoke all other sessions
+	t.Run("revoke_all_other", func(t *testing.T) {
+		headers := map[string]string{
+			"Authorization": "Bearer " + sessions[2].AccessToken,
+		}
+
+		w := performRequest(router, http.MethodDelete, "/api/v1/auth/sessions", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("revoke all failed: status = %v", w.Code)
+		}
+	})
+
+	// Old sessions should be invalid
+	t.Run("old_sessions_invalid", func(t *testing.T) {
+		for i := 0; i < 2; i++ {
+			body := map[string]string{
+				"refresh_token": sessions[i].RefreshToken,
+			}
+
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/refresh", body, nil)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("old session %d should be invalid: status = %v", i+1, w.Code)
+			}
+		}
+	})
+
+	// Current session should still work
+	t.Run("current_session_valid", func(t *testing.T) {
+		headers := map[string]string{
+			"Authorization": "Bearer " + sessions[2].AccessToken,
+		}
+
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/user", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("current session should be valid: status = %v", w.Code)
+		}
+	})
+}
+
+func TestIntegration_PasswordChangeFlow(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	email := "password-change@test.com"
+	oldPassword := "oldpassword123"
+	newPassword := "newpassword456"
+
+	// Create user and login
+	createTestUser(t, email, oldPassword)
+	tokens := loginTestUser(t, email, oldPassword)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + tokens.AccessToken,
+	}
+
+	// Change password
+	t.Run("change_password", func(t *testing.T) {
+		body := map[string]string{
+			"current_password": oldPassword,
+			"new_password":     newPassword,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/user/password", body, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("change password failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	// Login with old password should fail
+	t.Run("old_password_fails", func(t *testing.T) {
+		body := map[string]string{
+			"email":    email,
+			"password": oldPassword,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/login", body, nil)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("login with old password should fail: status = %v", w.Code)
+		}
+	})
+
+	// Login with new password should work
+	t.Run("new_password_works", func(t *testing.T) {
+		body := map[string]string{
+			"email":    email,
+			"password": newPassword,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/login", body, nil)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("login with new password failed: status = %v", w.Code)
+		}
+	})
+}
+
+{{- if .HasGDPR}}
+
+func TestIntegration_GDPRFlow(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	email := "gdpr@test.com"
+	password := "password123"
+
+	// Create user and login
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + tokens.AccessToken,
+	}
+
+{{- if .HasGDPRConsent}}
+	// Update consent
+	t.Run("update_consent", func(t *testing.T) {
+		body := map[string]any{
+			"type":   "analytics",
+			"agreed": true,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/gdpr/consent", body, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("update consent failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	// Get consents
+	t.Run("get_consents", func(t *testing.T) {
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/gdpr/consent", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("get consents failed: status = %v", w.Code)
+		}
+	})
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+	// Export data
+	t.Run("export_data", func(t *testing.T) {
+		w := performRequest(router, http.MethodGet, "/api/v1/auth/gdpr/export", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("export data failed: status = %v", w.Code)
+		}
+
+		// Should return JSON
+		contentType := w.Header().Get("Content-Type")
+		if contentType != "application/json" {
+			t.Errorf("export content type = %v, want application/json", contentType)
+		}
+	})
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+	// Delete account
+	t.Run("delete_account", func(t *testing.T) {
+		body := map[string]any{
+			"password": password,
+			"confirm":  true,
+		}
+
+		w := performRequest(router, http.MethodDelete, "/api/v1/auth/gdpr/delete", body, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("delete account failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	// Login after deletion should fail
+	t.Run("login_after_deletion", func(t *testing.T) {
+		body := map[string]string{
+			"email":    email,
+			"password": password,
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/login", body, nil)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("login after deletion should fail: status = %v", w.Code)
+		}
+	})
+{{- end}}
+}
+{{- end}}
+
+{{- if .EnableMFA}}
+
+func TestIntegration_MFAFlow(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	email := "mfa@test.com"
+	password := "password123"
+
+	// Create user and login
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + tokens.AccessToken,
+	}
+
+	// Setup MFA
+	var mfaSetup struct {
+		Secret      string   `json:"secret"`
+		QRCode      string   `json:"qr_code"`
+		BackupCodes []string `json:"backup_codes"`
+	}
+
+	t.Run("setup_mfa", func(t *testing.T) {
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/mfa/setup", nil, headers)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("MFA setup failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+
+		if err := json.Unmarshal(w.Body.Bytes(), &mfaSetup); err != nil {
+			t.Fatalf("failed to unmarshal MFA setup: %v", err)
+		}
+
+		if mfaSetup.Secret == "" {
+			t.Error("MFA secret is empty")
+		}
+		if len(mfaSetup.BackupCodes) == 0 {
+			t.Error("no backup codes returned")
+		}
+	})
+
+	// Note: Full MFA verification would require generating a valid TOTP code
+	// which needs the secret. In integration tests, you might use backup codes.
+
+	t.Run("verify_mfa_with_backup", func(t *testing.T) {
+		if len(mfaSetup.BackupCodes) == 0 {
+			t.Skip("no backup codes available")
+		}
+
+		body := map[string]string{
+			"code": mfaSetup.BackupCodes[0],
+		}
+
+		w := performRequest(router, http.MethodPost, "/api/v1/auth/mfa/verify", body, headers)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("MFA verify with backup code failed: status = %v, body = %s", w.Code, w.Body.String())
+		}
+	})
+}
+{{- end}}

@@ -1,0 +1,482 @@
+package services
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+func TestAuthService_Register(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	svc := mustGetTestAuthService(t)
+
+	tests := []struct {
+		name    string
+		req     *types.RegisterRequest
+		wantErr error
+	}{
+		{
+			name:    "register new user successfully",
+			req:     newTestRegisterRequest("newuser@test.com", "password123"),
+			wantErr: nil,
+		},
+		{
+			name:    "register with different email",
+			req:     newTestRegisterRequest("another@test.com", "password456"),
+			wantErr: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			user, err := svc.Register(ctx, tt.req)
+
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Errorf("Register() expected error %v, got nil", tt.wantErr)
+					return
+				}
+				if err != tt.wantErr {
+					t.Errorf("Register() error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Register() unexpected error: %v", err)
+				return
+			}
+
+			if user == nil {
+				t.Error("Register() returned nil user")
+				return
+			}
+
+			if user.ID == "" {
+				t.Error("Register() user has empty ID")
+			}
+
+			if user.Email != tt.req.Email {
+				t.Errorf("Register() email = %v, want %v", user.Email, tt.req.Email)
+			}
+
+			// Password hash should be cleared before returning
+			if user.PasswordHash != "" {
+				t.Error("Register() password hash not cleared")
+			}
+		})
+	}
+}
+
+func TestAuthService_Register_DuplicateEmail(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	email := "duplicate@test.com"
+	req := newTestRegisterRequest(email, "password123")
+
+	// First registration should succeed
+	_, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("first Register() failed: %v", err)
+	}
+
+	// Second registration with same email should fail
+	_, err = svc.Register(ctx, req)
+	if err != ErrUserExists {
+		t.Errorf("duplicate Register() error = %v, want %v", err, ErrUserExists)
+	}
+}
+
+func TestAuthService_Login(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create a test user first
+	email := "login@test.com"
+	password := "correctpassword"
+	createTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+
+	tests := []struct {
+		name       string
+		req        *types.LoginRequest
+		wantErr    error
+		wantTokens bool
+	}{
+		{
+			name:       "login with correct credentials",
+			req:        newTestLoginRequest(email, password),
+			wantErr:    nil,
+			wantTokens: true,
+		},
+		{
+			name:       "login with wrong password",
+			req:        newTestLoginRequest(email, "wrongpassword"),
+			wantErr:    ErrInvalidCredentials,
+			wantTokens: false,
+		},
+		{
+			name:       "login with non-existent user",
+			req:        newTestLoginRequest("nonexistent@test.com", "password"),
+			wantErr:    ErrInvalidCredentials,
+			wantTokens: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resp, err := svc.Login(ctx, tt.req)
+
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Errorf("Login() expected error %v, got nil", tt.wantErr)
+					return
+				}
+				if err != tt.wantErr {
+					t.Errorf("Login() error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Login() unexpected error: %v", err)
+				return
+			}
+
+			if tt.wantTokens {
+				if resp.AccessToken == "" {
+					t.Error("Login() access token is empty")
+				}
+				if resp.RefreshToken == "" {
+					t.Error("Login() refresh token is empty")
+				}
+				if resp.TokenType != "Bearer" {
+					t.Errorf("Login() token type = %v, want Bearer", resp.TokenType)
+				}
+				if resp.ExpiresIn <= 0 {
+					t.Error("Login() expires_in should be positive")
+				}
+			}
+		})
+	}
+}
+
+func TestAuthService_RefreshTokens(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create and login a test user
+	email := "refresh@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+
+	tests := []struct {
+		name         string
+		refreshToken string
+		wantErr      error
+	}{
+		{
+			name:         "refresh with valid token",
+			refreshToken: tokens.RefreshToken,
+			wantErr:      nil,
+		},
+		{
+			name:         "refresh with invalid token",
+			refreshToken: "invalid-refresh-token",
+			wantErr:      ErrSessionNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resp, err := svc.RefreshTokens(ctx, tt.refreshToken)
+
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Errorf("RefreshTokens() expected error %v, got nil", tt.wantErr)
+					return
+				}
+				if err != tt.wantErr {
+					t.Errorf("RefreshTokens() error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("RefreshTokens() unexpected error: %v", err)
+				return
+			}
+
+			if resp.AccessToken == "" {
+				t.Error("RefreshTokens() new access token is empty")
+			}
+			if resp.RefreshToken == "" {
+				t.Error("RefreshTokens() new refresh token is empty")
+			}
+			// New refresh token should be different (token rotation)
+			if resp.RefreshToken == tt.refreshToken {
+				t.Error("RefreshTokens() should rotate refresh token")
+			}
+		})
+	}
+}
+
+func TestAuthService_Logout(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create and login a test user
+	email := "logout@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+
+	tests := []struct {
+		name         string
+		refreshToken string
+		wantErr      bool
+	}{
+		{
+			name:         "logout with valid token",
+			refreshToken: tokens.RefreshToken,
+			wantErr:      false,
+		},
+		{
+			name:         "logout with invalid token",
+			refreshToken: "invalid-token",
+			wantErr:      false, // Logout should not fail for invalid tokens
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			err := svc.Logout(ctx, tt.refreshToken)
+
+			if tt.wantErr && err == nil {
+				t.Error("Logout() expected error, got nil")
+				return
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Errorf("Logout() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthService_Logout_InvalidatesSession(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create and login a test user
+	email := "logout-verify@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Logout
+	if err := svc.Logout(ctx, tokens.RefreshToken); err != nil {
+		t.Fatalf("Logout() failed: %v", err)
+	}
+
+	// Try to refresh with the old token - should fail
+	_, err := svc.RefreshTokens(ctx, tokens.RefreshToken)
+	if err != ErrSessionNotFound {
+		t.Errorf("RefreshTokens() after logout error = %v, want %v", err, ErrSessionNotFound)
+	}
+}
+
+func TestAuthService_GetUserSessions(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create a test user
+	email := "sessions@test.com"
+	password := "password123"
+	user := createTestUser(t, email, password)
+
+	// Login multiple times to create multiple sessions
+	for i := 0; i < 3; i++ {
+		loginTestUser(t, email, password)
+	}
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sessions, err := svc.GetUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSessions() error: %v", err)
+	}
+
+	if len(sessions) != 3 {
+		t.Errorf("GetUserSessions() returned %d sessions, want 3", len(sessions))
+	}
+}
+
+func TestAuthService_RevokeSession(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create and login a test user
+	email := "revoke@test.com"
+	password := "password123"
+	user := createTestUser(t, email, password)
+	loginTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Get sessions
+	sessions, err := svc.GetUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSessions() error: %v", err)
+	}
+
+	if len(sessions) == 0 {
+		t.Fatal("no sessions found")
+	}
+
+	tests := []struct {
+		name      string
+		userID    string
+		sessionID string
+		wantErr   error
+	}{
+		{
+			name:      "revoke existing session",
+			userID:    user.ID,
+			sessionID: sessions[0].ID,
+			wantErr:   nil,
+		},
+		{
+			name:      "revoke non-existent session",
+			userID:    user.ID,
+			sessionID: "non-existent-session",
+			wantErr:   ErrSessionNotFound,
+		},
+		{
+			name:      "revoke session of different user",
+			userID:    "different-user-id",
+			sessionID: sessions[0].ID,
+			wantErr:   ErrSessionNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := svc.RevokeSession(ctx, tt.userID, tt.sessionID)
+
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Errorf("RevokeSession() expected error %v, got nil", tt.wantErr)
+					return
+				}
+				if err != tt.wantErr {
+					t.Errorf("RevokeSession() error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("RevokeSession() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthService_RevokeAllSessions(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	// Create a test user
+	email := "revokeall@test.com"
+	password := "password123"
+	user := createTestUser(t, email, password)
+
+	// Login multiple times
+	var currentSessionID string
+	for i := 0; i < 3; i++ {
+		tokens := loginTestUser(t, email, password)
+		if i == 2 {
+			// Extract session ID from the last token for testing
+			claims, _ := testKeyManager.ValidateToken(tokens.AccessToken)
+			if sid, ok := claims["sid"].(string); ok {
+				currentSessionID = sid
+			}
+		}
+	}
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Revoke all except current
+	if err := svc.RevokeAllSessions(ctx, user.ID, currentSessionID); err != nil {
+		t.Fatalf("RevokeAllSessions() error: %v", err)
+	}
+
+	// Only current session should remain
+	sessions, err := svc.GetUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSessions() error: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Errorf("RevokeAllSessions() left %d sessions, want 1", len(sessions))
+	}
+
+	if sessions[0].ID != currentSessionID {
+		t.Error("RevokeAllSessions() revoked the current session")
+	}
+}

@@ -1,0 +1,594 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+func setupAuthRouter(t *testing.T) http.Handler {
+	t.Helper()
+	svc := mustGetTestAuthService(t)
+
+	mux := http.NewServeMux()
+	svc.RegisterRoutes(mux)
+
+	return mux
+}
+
+func TestHandlers_Register(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	tests := []struct {
+		name       string
+		body       any
+		wantStatus int
+	}{
+		{
+			name: "register successfully",
+			body: map[string]string{
+				"email":      "handler-register@test.com",
+				"password":   "password123",
+				"first_name": "Test",
+				"last_name":  "User",
+			},
+			wantStatus: http.StatusCreated,
+		},
+		{
+			name: "register with missing email",
+			body: map[string]string{
+				"password": "password123",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "register with missing password",
+			body: map[string]string{
+				"email": "nopassword@test.com",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "register with invalid body",
+			body:       "invalid json",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/register", tt.body, nil)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("Register handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+				return
+			}
+
+			if tt.wantStatus == http.StatusCreated {
+				var resp types.User
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Errorf("failed to unmarshal response: %v", err)
+					return
+				}
+				if resp.ID == "" {
+					t.Error("response user has empty ID")
+				}
+			}
+		})
+	}
+}
+
+func TestHandlers_Register_Duplicate(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	body := map[string]string{
+		"email":      "duplicate-handler@test.com",
+		"password":   "password123",
+		"first_name": "Test",
+		"last_name":  "User",
+	}
+
+	// First registration
+	w := performRequest(router, http.MethodPost, "/api/v1/auth/register", body, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first register failed: status = %v", w.Code)
+	}
+
+	// Second registration with same email
+	w = performRequest(router, http.MethodPost, "/api/v1/auth/register", body, nil)
+	if w.Code != http.StatusConflict {
+		t.Errorf("duplicate register status = %v, want %v", w.Code, http.StatusConflict)
+	}
+}
+
+func TestHandlers_Login(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create a user first
+	email := "handler-login@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+
+	tests := []struct {
+		name       string
+		body       any
+		wantStatus int
+	}{
+		{
+			name: "login successfully",
+			body: map[string]string{
+				"email":    email,
+				"password": password,
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "login with wrong password",
+			body: map[string]string{
+				"email":    email,
+				"password": "wrongpassword",
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "login with non-existent user",
+			body: map[string]string{
+				"email":    "nonexistent@test.com",
+				"password": "password123",
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "login with invalid body",
+			body:       "invalid",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/login", tt.body, nil)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("Login handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+				return
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var resp types.TokenResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Errorf("failed to unmarshal response: %v", err)
+					return
+				}
+				if resp.AccessToken == "" {
+					t.Error("response has empty access token")
+				}
+				if resp.RefreshToken == "" {
+					t.Error("response has empty refresh token")
+				}
+			}
+		})
+	}
+}
+
+func TestHandlers_Refresh(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user
+	email := "handler-refresh@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	tests := []struct {
+		name       string
+		body       any
+		wantStatus int
+	}{
+		{
+			name: "refresh successfully",
+			body: map[string]string{
+				"refresh_token": tokens.RefreshToken,
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "refresh with invalid token",
+			body: map[string]string{
+				"refresh_token": "invalid-token",
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "refresh with missing token",
+			body:       map[string]string{},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/refresh", tt.body, nil)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("Refresh handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+				return
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var resp types.TokenResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Errorf("failed to unmarshal response: %v", err)
+					return
+				}
+				if resp.AccessToken == "" {
+					t.Error("response has empty access token")
+				}
+			}
+		})
+	}
+}
+
+func TestHandlers_Logout(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user
+	email := "handler-logout@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	tests := []struct {
+		name       string
+		body       any
+		wantStatus int
+	}{
+		{
+			name: "logout successfully",
+			body: map[string]string{
+				"refresh_token": tokens.RefreshToken,
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "logout with invalid token",
+			body: map[string]string{
+				"refresh_token": "invalid-token",
+			},
+			wantStatus: http.StatusOK, // Logout should succeed even with invalid token
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/logout", tt.body, nil)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("Logout handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlers_GetUser_Authenticated(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user
+	email := "handler-getuser@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	tests := []struct {
+		name       string
+		authHeader string
+		wantStatus int
+	}{
+		{
+			name:       "get user with valid token",
+			authHeader: "Bearer " + tokens.AccessToken,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "get user without token",
+			authHeader: "",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "get user with invalid token",
+			authHeader: "Bearer invalid-token",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "get user with malformed auth header",
+			authHeader: "NotBearer token",
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := make(map[string]string)
+			if tt.authHeader != "" {
+				headers["Authorization"] = tt.authHeader
+			}
+
+			w := performRequest(router, http.MethodGet, "/api/v1/auth/user", nil, headers)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("GetUser handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+				return
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var resp types.User
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Errorf("failed to unmarshal response: %v", err)
+					return
+				}
+				if resp.Email != email {
+					t.Errorf("GetUser email = %v, want %v", resp.Email, email)
+				}
+			}
+		})
+	}
+}
+
+func TestHandlers_GetSessions(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user multiple times
+	email := "handler-sessions@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+
+	// Login 3 times
+	var lastTokens *types.TokenResponse
+	for i := 0; i < 3; i++ {
+		lastTokens = loginTestUser(t, email, password)
+	}
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + lastTokens.AccessToken,
+	}
+
+	w := performRequest(router, http.MethodGet, "/api/v1/auth/sessions", nil, headers)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetSessions handler status = %v, want %v, body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var sessions []types.SessionInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if len(sessions) != 3 {
+		t.Errorf("GetSessions returned %d sessions, want 3", len(sessions))
+	}
+
+	// Verify one session is marked as current
+	currentCount := 0
+	for _, s := range sessions {
+		if s.IsCurrent {
+			currentCount++
+		}
+	}
+	if currentCount != 1 {
+		t.Errorf("GetSessions has %d current sessions, want 1", currentCount)
+	}
+}
+
+func TestHandlers_RevokeSession(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user twice
+	email := "handler-revoke@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+
+	firstTokens := loginTestUser(t, email, password)
+	secondTokens := loginTestUser(t, email, password)
+
+	// Get session IDs
+	firstClaims, _ := testKeyManager.ValidateToken(firstTokens.AccessToken)
+	firstSessionID := firstClaims["sid"].(string)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + secondTokens.AccessToken,
+	}
+
+	tests := []struct {
+		name       string
+		sessionID  string
+		wantStatus int
+	}{
+		{
+			name:       "revoke other session",
+			sessionID:  firstSessionID,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "revoke non-existent session",
+			sessionID:  "non-existent",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodDelete, "/api/v1/auth/sessions/"+tt.sessionID, nil, headers)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("RevokeSession handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlers_RevokeSession_CannotRevokeCurrent(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user
+	email := "handler-revoke-current@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	claims, _ := testKeyManager.ValidateToken(tokens.AccessToken)
+	currentSessionID := claims["sid"].(string)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + tokens.AccessToken,
+	}
+
+	w := performRequest(router, http.MethodDelete, "/api/v1/auth/sessions/"+currentSessionID, nil, headers)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("RevokeSession current session status = %v, want %v", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandlers_RevokeAllSessions(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user multiple times
+	email := "handler-revokeall@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+
+	// Login 3 times
+	for i := 0; i < 2; i++ {
+		loginTestUser(t, email, password)
+	}
+	lastTokens := loginTestUser(t, email, password)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + lastTokens.AccessToken,
+	}
+
+	w := performRequest(router, http.MethodDelete, "/api/v1/auth/sessions", nil, headers)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("RevokeAllSessions handler status = %v, want %v, body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Verify only current session remains
+	w = performRequest(router, http.MethodGet, "/api/v1/auth/sessions", nil, headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetSessions after revoke status = %v", w.Code)
+	}
+
+	var sessions []types.SessionInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Errorf("after RevokeAllSessions, %d sessions remain, want 1", len(sessions))
+	}
+}
+
+func TestHandlers_ChangePassword(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	router := setupAuthRouter(t)
+
+	// Create and login a user
+	email := "handler-password@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + tokens.AccessToken,
+	}
+
+	tests := []struct {
+		name       string
+		body       any
+		wantStatus int
+	}{
+		{
+			name: "change password successfully",
+			body: map[string]string{
+				"current_password": password,
+				"new_password":     "newpassword456",
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "change password with wrong current",
+			body: map[string]string{
+				"current_password": "wrongpassword",
+				"new_password":     "newpassword789",
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := performRequest(router, http.MethodPost, "/api/v1/auth/user/password", tt.body, headers)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("ChangePassword handler status = %v, want %v, body = %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
+	}
+}

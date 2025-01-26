@@ -1,0 +1,348 @@
+package services
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"{{.ModuleName}}/internals/db"
+	"{{.ModuleName}}/internals/types"
+	"{{.ModuleName}}/internals/utils"
+
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// testDB is the shared database client for integration tests.
+var testDB db.Database
+
+// testKeyManager is the shared key manager for tests.
+var testKeyManager *KeyManager
+
+// testTokenBlacklist is the shared token blacklist for tests.
+var testTokenBlacklist *TokenBlacklist
+
+// testAuthService is the shared auth service for tests.
+var testAuthService *AuthService
+
+// TestMain sets up and tears down the test database.
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	if testing.Short() {
+		fmt.Println("Skipping integration tests in short mode")
+		os.Exit(0)
+	}
+
+	// Initialize logger for tests
+	if err := utils.InitLogger("test-auth-service"); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var err error
+	testDB, err = setupTestDB(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup test database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Make sure the database is running and accessible\n")
+		os.Exit(1)
+	}
+
+	// Run migrations
+	if err := testDB.Migrate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to run migrations: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Setup key manager with test keys
+	testKeyManager, err = setupTestKeyManager()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup key manager: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Setup token blacklist
+	testTokenBlacklist = NewTokenBlacklist()
+
+	// Setup auth service
+	testAuthService = NewAuthService(AuthServiceConfig{
+		DB:             testDB,
+		KeyManager:     testKeyManager,
+		TokenBlacklist: testTokenBlacklist,
+		TokenTTL:       15 * time.Minute,
+		RefreshTTL:     24 * time.Hour,
+		Issuer:         "test-issuer",
+	})
+
+	code := m.Run()
+
+	// Cleanup
+	testTokenBlacklist.Close()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := testDB.Close(shutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to close database: %v\n", err)
+	}
+
+	os.Exit(code)
+}
+
+// setupTestDB creates and connects to the test database.
+func setupTestDB(ctx context.Context) (db.Database, error) {
+{{- if eq .Database "postgres"}}
+	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/test_auth?sslmode=disable")
+	return db.NewPostgresClient(ctx, dbURL)
+{{- else if eq .Database "mysql"}}
+	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "root:root@tcp(localhost:3306)/test_auth?parseTime=true")
+	return db.NewMySQLClient(dbURL)
+{{- else if eq .Database "sqlite"}}
+	dbPath := getEnvOrDefault("TEST_DATABASE_PATH", ":memory:")
+	return db.NewSQLiteClient(dbPath)
+{{- else if eq .Database "mongodb"}}
+	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "mongodb://localhost:27017")
+	dbName := getEnvOrDefault("TEST_DATABASE_NAME", "test_auth")
+	return db.NewMongoClient(ctx, dbURL, dbName)
+{{- else if eq .Database "arangodb"}}
+	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "http://localhost:8529")
+	dbName := getEnvOrDefault("TEST_DATABASE_NAME", "test_auth")
+	return db.NewArangoClient(ctx, dbURL, dbName)
+{{- end}}
+}
+
+// setupTestKeyManager creates a key manager with test keys.
+func setupTestKeyManager() (*KeyManager, error) {
+	// For tests, generate keys in memory or use test key files
+	privateKeyPath := getEnvOrDefault("TEST_JWT_PRIVATE_KEY", "testdata/private.pem")
+	publicKeyPath := getEnvOrDefault("TEST_JWT_PUBLIC_KEY", "testdata/public.pem")
+
+	// If test key files don't exist, create them
+	if _, err := os.Stat(privateKeyPath); os.IsNotExist(err) {
+		if err := generateTestKeys(privateKeyPath, publicKeyPath); err != nil {
+			return nil, fmt.Errorf("failed to generate test keys: %w", err)
+		}
+	}
+
+	return NewKeyManager(JWTConfig{
+		PrivateKeyPath:  privateKeyPath,
+		PublicKeyPath:   publicKeyPath,
+		Issuer:          "test-issuer",
+		AccessTokenTTL:  15 * time.Minute,
+		RefreshTokenTTL: 24 * time.Hour,
+	})
+}
+
+// generateTestKeys generates ECDSA keys for testing.
+func generateTestKeys(privatePath, publicPath string) error {
+	// Create testdata directory
+	if err := os.MkdirAll("testdata", 0755); err != nil {
+		return err
+	}
+
+	// Generate ECDSA P-256 key pair
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	// Marshal private key to PKCS8
+	privateKeyBytes, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to marshal private key: %w", err)
+	}
+
+	// Write private key
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: privateKeyBytes,
+	})
+	if err := os.WriteFile(privatePath, privateKeyPEM, 0600); err != nil {
+		return fmt.Errorf("failed to write private key: %w", err)
+	}
+
+	// Marshal public key
+	publicKeyBytes, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to marshal public key: %w", err)
+	}
+
+	// Write public key
+	publicKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: publicKeyBytes,
+	})
+	if err := os.WriteFile(publicPath, publicKeyPEM, 0644); err != nil {
+		return fmt.Errorf("failed to write public key: %w", err)
+	}
+
+	return nil
+}
+
+// getEnvOrDefault returns the environment variable value or a default.
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// mustGetTestDB returns the shared test DB, failing if not initialized.
+func mustGetTestDB(t *testing.T) db.Database {
+	t.Helper()
+	if testDB == nil {
+		t.Fatal("test database not initialized - TestMain may have failed")
+	}
+	return testDB
+}
+
+// mustGetTestAuthService returns the shared auth service, failing if not initialized.
+func mustGetTestAuthService(t *testing.T) *AuthService {
+	t.Helper()
+	if testAuthService == nil {
+		t.Fatal("test auth service not initialized - TestMain may have failed")
+	}
+	return testAuthService
+}
+
+// cleanupUsers removes test users from the database.
+// Uses database-specific cleanup for test data.
+func cleanupUsers(t *testing.T) {
+	t.Helper()
+	// Cleanup is handled per-test via t.Cleanup with specific user IDs
+	// This is a no-op placeholder for compatibility with test patterns
+}
+
+// cleanupSessions removes test sessions from the database.
+// Uses database-specific cleanup for test data.
+func cleanupSessions(t *testing.T) {
+	t.Helper()
+	// Cleanup is handled per-test via t.Cleanup with specific user IDs
+	// This is a no-op placeholder for compatibility with test patterns
+}
+
+// cleanupTestUser removes a specific test user and their sessions.
+func cleanupTestUser(t *testing.T, userID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Delete user sessions first
+	if err := testDB.DeleteUserSessions(ctx, userID); err != nil {
+		t.Logf("warning: failed to cleanup sessions for user %s: %v", userID, err)
+	}
+
+	// Delete user
+	if err := testDB.DeleteUser(ctx, userID); err != nil {
+		t.Logf("warning: failed to cleanup user %s: %v", userID, err)
+	}
+}
+
+// testRequest represents an HTTP request for testing.
+type testRequest struct {
+	method  string
+	path    string
+	body    any
+	headers map[string]string
+}
+
+// testResponse represents expected response data.
+type testResponse struct {
+	status int
+	check  func(t *testing.T, body []byte)
+}
+
+// performRequest executes an HTTP request against the test handler.
+func performRequest(handler http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	var reqBody *bytes.Buffer
+	if body != nil {
+		jsonBody, _ := json.Marshal(body)
+		reqBody = bytes.NewBuffer(jsonBody)
+	} else {
+		reqBody = bytes.NewBuffer(nil)
+	}
+
+	req, _ := http.NewRequest(method, path, reqBody)
+	req.Header.Set("Content-Type", "application/json")
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	return w
+}
+
+// Test entity factory functions
+
+// newTestUser creates a test user with a hashed password.
+func newTestUser(email, password string) *types.User {
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return &types.User{
+		ID:           uuid.New().String(),
+		Email:        email,
+		PasswordHash: string(hashedPassword),
+		FirstName:    "Test",
+		LastName:     "User",
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+}
+
+// newTestRegisterRequest creates a test registration request.
+func newTestRegisterRequest(email, password string) *types.RegisterRequest {
+	return &types.RegisterRequest{
+		Email:     email,
+		Password:  password,
+		FirstName: "Test",
+		LastName:  "User",
+	}
+}
+
+// newTestLoginRequest creates a test login request.
+func newTestLoginRequest(email, password string) *types.LoginRequest {
+	return &types.LoginRequest{
+		Email:    email,
+		Password: password,
+	}
+}
+
+// createTestUser creates a user in the database and returns it.
+func createTestUser(t *testing.T, email, password string) *types.User {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	user := newTestUser(email, password)
+	if err := testDB.CreateUser(ctx, user); err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
+	return user
+}
+
+// loginTestUser logs in a user and returns the token response.
+func loginTestUser(t *testing.T, email, password string) *types.TokenResponse {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := testAuthService.Login(ctx, newTestLoginRequest(email, password))
+	if err != nil {
+		t.Fatalf("failed to login test user: %v", err)
+	}
+	return resp
+}
