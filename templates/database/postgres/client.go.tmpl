@@ -1,0 +1,148 @@
+package db
+
+import (
+	"context"
+	"embed"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// PostgresClient implements the Database interface for PostgreSQL
+type PostgresClient struct {
+	pool *pgxpool.Pool
+}
+
+// NewPostgresClient creates a new PostgreSQL client
+func NewPostgresClient(ctx context.Context, connString string) (*PostgresClient, error) {
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+	}
+
+	// Set connection pool settings
+	config.MaxConns = 25
+	config.MinConns = 5
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection pool: %w", err)
+	}
+
+	// Verify connection
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return &PostgresClient{pool: pool}, nil
+}
+
+// Migrate runs database migrations
+func (c *PostgresClient) Migrate(ctx context.Context) error {
+	// Create migrations table if not exists
+	_, err := c.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version VARCHAR(255) PRIMARY KEY,
+			applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create migrations table: %w", err)
+	}
+
+	// Read migration files
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("failed to read migrations directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		version := entry.Name()
+
+		// Check if migration already applied
+		var applied bool
+		err := c.pool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)",
+			version,
+		).Scan(&applied)
+		if err != nil {
+			return fmt.Errorf("failed to check migration status: %w", err)
+		}
+
+		if applied {
+			continue
+		}
+
+		// Read and execute migration
+		content, err := migrationsFS.ReadFile("migrations/" + version)
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", version, err)
+		}
+
+		tx, err := c.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+
+		_, err = tx.Exec(ctx, string(content))
+		if err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("failed to execute migration %s: %w", version, err)
+		}
+
+		_, err = tx.Exec(ctx,
+			"INSERT INTO schema_migrations (version) VALUES ($1)",
+			version,
+		)
+		if err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("failed to record migration %s: %w", version, err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("failed to commit migration %s: %w", version, err)
+		}
+	}
+
+	return nil
+}
+
+// Ping checks the database connection
+func (c *PostgresClient) Ping(ctx context.Context) error {
+	return c.pool.Ping(ctx)
+}
+
+// Close closes the database connection pool
+func (c *PostgresClient) Close(ctx context.Context) error {
+	c.pool.Close()
+	return nil
+}
+
+// GetPool returns the underlying connection pool for advanced queries
+func (c *PostgresClient) GetPool() *pgxpool.Pool {
+	return c.pool
+}
+
+// Transaction executes a function within a database transaction
+func (c *PostgresClient) Transaction(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := fn(tx); err != nil {
+		tx.Rollback(ctx)
+		return err
+	}
+
+	return tx.Commit(ctx)
+}

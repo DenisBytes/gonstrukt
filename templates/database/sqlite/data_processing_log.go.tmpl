@@ -1,0 +1,57 @@
+{{- if .HasGDPRProcessingLogs}}
+package db
+
+import (
+	"context"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateDataProcessingLog creates a new GDPR data processing log entry
+func (c *SQLiteClient) CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error {
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO data_processing_logs (
+			id, user_id, process_type, processed_data, status, request_ip,
+			processor_id, legal_basis, purpose, data_subject, error_details,
+			requested_at, completed_at, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		log.ID, log.UserID, log.ProcessType, log.ProcessedData, log.Status, log.RequestIP,
+		log.ProcessorID, log.LegalBasis, log.Purpose, log.DataSubject, log.ErrorDetails,
+		log.RequestedAt, log.CompletedAt, log.CreatedAt,
+	)
+	return err
+}
+
+// GetDataProcessingLogs retrieves all processing logs for a user
+func (c *SQLiteClient) GetDataProcessingLogs(ctx context.Context, userID string) ([]*types.DataProcessingLog, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, user_id, process_type, processed_data, status, request_ip,
+			   processor_id, legal_basis, purpose, data_subject, error_details,
+			   requested_at, completed_at, created_at
+		FROM data_processing_logs
+		WHERE user_id = ?
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []*types.DataProcessingLog
+	for rows.Next() {
+		log := &types.DataProcessingLog{}
+		err := rows.Scan(
+			&log.ID, &log.UserID, &log.ProcessType, &log.ProcessedData, &log.Status, &log.RequestIP,
+			&log.ProcessorID, &log.LegalBasis, &log.Purpose, &log.DataSubject, &log.ErrorDetails,
+			&log.RequestedAt, &log.CompletedAt, &log.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		logs = append(logs, log)
+	}
+
+	return logs, rows.Err()
+}
+{{- end}}

@@ -1,0 +1,289 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// CreateUser creates a new user
+func (c *PostgresClient) CreateUser(ctx context.Context, user *types.User) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO users (id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`,
+		user.ID,
+		user.Email,
+		user.PasswordHash,
+		user.FirstName,
+		user.LastName,
+		user.MFAEnabled,
+		user.MFASecret,
+		user.Roles,
+		user.CreatedAt,
+		user.UpdatedAt,
+	)
+	return err
+}
+
+// GetUserByID retrieves a user by ID
+func (c *PostgresClient) GetUserByID(ctx context.Context, id string) (*types.User, error) {
+	user := &types.User{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at, deleted_at
+		FROM users
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id).Scan(
+		&user.ID,
+		&user.Email,
+		&user.PasswordHash,
+		&user.FirstName,
+		&user.LastName,
+		&user.MFAEnabled,
+		&user.MFASecret,
+		&user.Roles,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// GetUserByEmail retrieves a user by email
+func (c *PostgresClient) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
+	user := &types.User{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at, deleted_at
+		FROM users
+		WHERE email = $1 AND deleted_at IS NULL
+	`, email).Scan(
+		&user.ID,
+		&user.Email,
+		&user.PasswordHash,
+		&user.FirstName,
+		&user.LastName,
+		&user.MFAEnabled,
+		&user.MFASecret,
+		&user.Roles,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// UpdateUser updates an existing user
+func (c *PostgresClient) UpdateUser(ctx context.Context, user *types.User) error {
+	user.UpdatedAt = time.Now()
+
+	result, err := c.pool.Exec(ctx, `
+		UPDATE users
+		SET email = $2, first_name = $3, last_name = $4, mfa_enabled = $5, mfa_secret = $6, roles = $7, updated_at = $8
+		WHERE id = $1 AND deleted_at IS NULL
+	`,
+		user.ID,
+		user.Email,
+		user.FirstName,
+		user.LastName,
+		user.MFAEnabled,
+		user.MFASecret,
+		user.Roles,
+		user.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+// DeleteUser soft deletes a user
+func (c *PostgresClient) DeleteUser(ctx context.Context, id string) error {
+	now := time.Now()
+	result, err := c.pool.Exec(ctx, `
+		UPDATE users
+		SET deleted_at = $2, updated_at = $2
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id, now)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+// HardDeleteUser permanently deletes a user (for GDPR right to erasure)
+func (c *PostgresClient) HardDeleteUser(ctx context.Context, id string) error {
+	result, err := c.pool.Exec(ctx, `
+		DELETE FROM users WHERE id = $1
+	`, id)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+{{- if .HasGDPRDataDeletion}}
+
+// SoftDeleteUser performs a GDPR-compliant soft delete by anonymizing PII
+func (c *PostgresClient) SoftDeleteUser(ctx context.Context, id string) error {
+	now := time.Now()
+	anonymizedEmail := "deleted_" + id + "@anonymized.local"
+
+	// Anonymize PII and mark as deleted
+	result, err := c.pool.Exec(ctx, `
+		UPDATE users
+		SET email = $2, first_name = 'DELETED', last_name = 'USER',
+		    password_hash = '', mfa_enabled = false, mfa_secret = '',
+		    deleted_at = $3, updated_at = $3
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id, anonymizedEmail, now)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("user not found")
+	}
+
+	// Delete all user sessions
+	_, _ = c.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, id)
+
+	// Delete MFA backup codes
+	_, _ = c.pool.Exec(ctx, `DELETE FROM mfa_backups WHERE user_id = $1`, id)
+
+	return nil
+}
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+
+// ExportUserData exports all user data for GDPR data portability
+func (c *PostgresClient) ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error) {
+	// Get user
+	user, err := c.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get sessions
+	sessions, err := c.GetUserSessions(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get consents
+	consents, err := c.GetUserConsents(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to export types
+	userExport := types.UserExportData{
+		ID:        user.ID,
+		Email:     user.Email,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+	}
+
+	sessionExports := make([]types.SessionExportData, len(sessions))
+	for i, s := range sessions {
+		sessionExports[i] = types.SessionExportData{
+			ID:        s.ID,
+			UserAgent: s.UserAgent,
+			IP:        s.IP,
+			CreatedAt: s.CreatedAt,
+			ExpiresAt: s.ExpiresAt,
+		}
+	}
+
+	consentExports := make([]types.ConsentExportData, len(consents))
+	for i, c := range consents {
+		consentExports[i] = types.ConsentExportData{
+			Type:      c.Type,
+			Granted:   c.Granted,
+			Version:   c.Version,
+			GrantedAt: c.GrantedAt,
+			RevokedAt: c.RevokedAt,
+		}
+	}
+
+	return &types.UserDataExport{
+		ExportedAt: time.Now(),
+		User:       userExport,
+		Sessions:   sessionExports,
+		Consents:   consentExports,
+	}, nil
+}
+{{- end}}
+
+{{- if .HasOAuth}}
+
+// GetUserByOAuthID retrieves a user by OAuth provider and ID
+func (c *PostgresClient) GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error) {
+	user := &types.User{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT u.id, u.email, u.password_hash, u.first_name, u.last_name,
+		       u.mfa_enabled, u.mfa_secret, u.roles, u.created_at, u.updated_at, u.deleted_at
+		FROM users u
+		INNER JOIN oauth_accounts oa ON u.id = oa.user_id
+		WHERE oa.provider = $1 AND oa.provider_id = $2 AND u.deleted_at IS NULL
+	`, provider, oauthID).Scan(
+		&user.ID,
+		&user.Email,
+		&user.PasswordHash,
+		&user.FirstName,
+		&user.LastName,
+		&user.MFAEnabled,
+		&user.MFASecret,
+		&user.Roles,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+{{- end}}

@@ -1,0 +1,135 @@
+package db
+
+import (
+	"context"
+	"errors"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// CreateSession creates a new session
+func (c *PostgresClient) CreateSession(ctx context.Context, session *types.Session) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`,
+		session.ID,
+		session.UserID,
+		session.RefreshToken,
+		session.UserAgent,
+		session.IP,
+		session.ExpiresAt,
+		session.CreatedAt,
+	)
+	return err
+}
+
+// GetSessionByID retrieves a session by ID
+func (c *PostgresClient) GetSessionByID(ctx context.Context, id string) (*types.Session, error) {
+	session := &types.Session{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+		FROM sessions
+		WHERE id = $1
+	`, id).Scan(
+		&session.ID,
+		&session.UserID,
+		&session.RefreshToken,
+		&session.UserAgent,
+		&session.IP,
+		&session.ExpiresAt,
+		&session.CreatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("session not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return session, nil
+}
+
+// GetSessionByRefreshToken retrieves a session by refresh token
+func (c *PostgresClient) GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
+	session := &types.Session{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+		FROM sessions
+		WHERE refresh_token = $1
+	`, token).Scan(
+		&session.ID,
+		&session.UserID,
+		&session.RefreshToken,
+		&session.UserAgent,
+		&session.IP,
+		&session.ExpiresAt,
+		&session.CreatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("session not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return session, nil
+}
+
+// GetUserSessions retrieves all sessions for a user
+func (c *PostgresClient) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+		FROM sessions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*types.Session
+	for rows.Next() {
+		session := &types.Session{}
+		if err := rows.Scan(
+			&session.ID,
+			&session.UserID,
+			&session.RefreshToken,
+			&session.UserAgent,
+			&session.IP,
+			&session.ExpiresAt,
+			&session.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+
+	return sessions, rows.Err()
+}
+
+// DeleteSession deletes a session
+func (c *PostgresClient) DeleteSession(ctx context.Context, id string) error {
+	_, err := c.pool.Exec(ctx, `DELETE FROM sessions WHERE id = $1`, id)
+	return err
+}
+
+// DeleteUserSessions deletes all sessions for a user
+func (c *PostgresClient) DeleteUserSessions(ctx context.Context, userID string) error {
+	_, err := c.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+	return err
+}
+
+// DeleteExpiredSessions deletes all expired sessions
+func (c *PostgresClient) DeleteExpiredSessions(ctx context.Context) (int64, error) {
+	result, err := c.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < NOW()`)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

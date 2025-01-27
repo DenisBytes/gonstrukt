@@ -1,0 +1,68 @@
+package db
+
+import (
+	"context"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// Database defines the interface for database operations
+type Database interface {
+	// User operations
+	CreateUser(ctx context.Context, user *types.User) error
+	GetUserByID(ctx context.Context, id string) (*types.User, error)
+	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
+	UpdateUser(ctx context.Context, user *types.User) error
+	DeleteUser(ctx context.Context, id string) error
+{{- if .HasOAuth}}
+	GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error)
+{{- end}}
+{{- if .HasGDPRDataDeletion}}
+	SoftDeleteUser(ctx context.Context, id string) error
+{{- end}}
+
+	// Session operations
+	CreateSession(ctx context.Context, session *types.Session) error
+	GetSessionByID(ctx context.Context, id string) (*types.Session, error)
+	GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error)
+	GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error)
+	DeleteSession(ctx context.Context, id string) error
+	DeleteUserSessions(ctx context.Context, userID string) error
+
+	// Consent operations (GDPR)
+	CreateConsent(ctx context.Context, consent *types.Consent) error
+	GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error)
+	UpdateConsent(ctx context.Context, consent *types.Consent) error
+{{- if .HasGDPRConsent}}
+	GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error)
+	GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error)
+{{- end}}
+
+	// MFA operations
+	CreateMFABackup(ctx context.Context, backup *types.MFABackup) error
+	GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error)
+	UseMFABackup(ctx context.Context, id string) error
+	DeleteMFABackups(ctx context.Context, userID string) error
+{{- if .EnableMFA}}
+	CreateBackupCode(ctx context.Context, backup *types.MFABackup) error
+	GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error)
+	UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error
+	DeleteBackupCodes(ctx context.Context, userID string) error
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+	// GDPR data export
+	ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error)
+{{- end}}
+
+{{- if .HasGDPRProcessingLogs}}
+	// GDPR processing logs
+	CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error
+	GetDataProcessingLogs(ctx context.Context, userID string) ([]*types.DataProcessingLog, error)
+{{- end}}
+
+	// Utility
+	Migrate(ctx context.Context) error
+	Ping(ctx context.Context) error
+	Close(ctx context.Context) error
+}

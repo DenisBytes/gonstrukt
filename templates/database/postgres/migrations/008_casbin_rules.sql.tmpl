@@ -1,0 +1,43 @@
+{{- if .EnableRBAC}}
+-- Create Casbin rules table for RBAC
+CREATE TABLE IF NOT EXISTS casbin_rules (
+    id SERIAL PRIMARY KEY,
+    ptype VARCHAR(100) NOT NULL,
+    v0 VARCHAR(255),
+    v1 VARCHAR(255),
+    v2 VARCHAR(255),
+    v3 VARCHAR(255),
+    v4 VARCHAR(255),
+    v5 VARCHAR(255)
+);
+
+-- Create index for efficient policy lookups
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_ptype ON casbin_rules(ptype);
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_v0 ON casbin_rules(v0);
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_v1 ON casbin_rules(v1);
+
+-- Insert default roles and policies
+-- Admin role has full access
+INSERT INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', '*', '*'),
+    ('p', 'admin', 'users', 'read'),
+    ('p', 'admin', 'users', 'write'),
+    ('p', 'admin', 'users', 'delete'),
+    ('p', 'admin', 'roles', 'read'),
+    ('p', 'admin', 'roles', 'write')
+ON CONFLICT DO NOTHING;
+
+-- User role has limited access
+INSERT INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'profile', 'read'),
+    ('p', 'user', 'profile', 'write'),
+    ('p', 'user', 'consents', 'read'),
+    ('p', 'user', 'consents', 'write')
+ON CONFLICT DO NOTHING;
+
+-- Default role inheritance (user inherits from authenticated)
+INSERT INTO casbin_rules (ptype, v0, v1) VALUES
+    ('g', 'user', 'authenticated'),
+    ('g', 'admin', 'user')
+ON CONFLICT DO NOTHING;
+{{- end}}

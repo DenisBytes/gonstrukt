@@ -1,0 +1,156 @@
+package db
+
+import (
+	"context"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateConsent creates a new consent record
+func (c *PostgresClient) CreateConsent(ctx context.Context, consent *types.Consent) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO consents (id, user_id, type, granted, granted_at, expires_at, version, description)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`,
+		consent.ID,
+		consent.UserID,
+		consent.Type,
+		consent.Granted,
+		consent.GrantedAt,
+		consent.ExpiresAt,
+		consent.Version,
+		consent.Description,
+	)
+	return err
+}
+
+// GetUserConsents retrieves all consents for a user
+func (c *PostgresClient) GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents
+		WHERE user_id = $1
+		ORDER BY granted_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var consents []*types.Consent
+	for rows.Next() {
+		consent := &types.Consent{}
+		if err := rows.Scan(
+			&consent.ID,
+			&consent.UserID,
+			&consent.Type,
+			&consent.Granted,
+			&consent.GrantedAt,
+			&consent.ExpiresAt,
+			&consent.RevokedAt,
+			&consent.Version,
+			&consent.Description,
+		); err != nil {
+			return nil, err
+		}
+		consents = append(consents, consent)
+	}
+
+	return consents, rows.Err()
+}
+
+// UpdateConsent updates an existing consent record
+func (c *PostgresClient) UpdateConsent(ctx context.Context, consent *types.Consent) error {
+	if consent.Granted {
+		consent.GrantedAt = time.Now()
+		consent.RevokedAt = nil
+	} else {
+		now := time.Now()
+		consent.RevokedAt = &now
+	}
+
+	_, err := c.pool.Exec(ctx, `
+		UPDATE consents
+		SET granted = $2, granted_at = $3, revoked_at = $4, version = $5
+		WHERE id = $1
+	`,
+		consent.ID,
+		consent.Granted,
+		consent.GrantedAt,
+		consent.RevokedAt,
+		consent.Version,
+	)
+	return err
+}
+
+// GetActiveConsent retrieves the active consent of a specific type for a user
+func (c *PostgresClient) GetActiveConsent(ctx context.Context, userID, consentType string) (*types.Consent, error) {
+	consent := &types.Consent{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents
+		WHERE user_id = $1 AND type = $2 AND granted = true AND revoked_at IS NULL
+		ORDER BY granted_at DESC
+		LIMIT 1
+	`, userID, consentType).Scan(
+		&consent.ID,
+		&consent.UserID,
+		&consent.Type,
+		&consent.Granted,
+		&consent.GrantedAt,
+		&consent.ExpiresAt,
+		&consent.RevokedAt,
+		&consent.Version,
+		&consent.Description,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return consent, nil
+}
+
+{{- if .HasGDPRConsent}}
+
+// GetActiveConsentsByUserID retrieves all active (not expired, not revoked) consents for a user
+func (c *PostgresClient) GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents
+		WHERE user_id = $1 AND granted = true AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
+		ORDER BY granted_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var consents []*types.Consent
+	for rows.Next() {
+		consent := &types.Consent{}
+		if err := rows.Scan(
+			&consent.ID,
+			&consent.UserID,
+			&consent.Type,
+			&consent.Granted,
+			&consent.GrantedAt,
+			&consent.ExpiresAt,
+			&consent.RevokedAt,
+			&consent.Version,
+			&consent.Description,
+		); err != nil {
+			return nil, err
+		}
+		consents = append(consents, consent)
+	}
+
+	return consents, rows.Err()
+}
+
+// GetConsentHistory retrieves the full consent history for a user (for GDPR audit trail)
+func (c *PostgresClient) GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error) {
+	return c.GetUserConsents(ctx, userID)
+}
+{{- end}}

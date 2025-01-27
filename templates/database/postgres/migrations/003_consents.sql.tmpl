@@ -1,0 +1,18 @@
+-- Create consents table for GDPR compliance
+CREATE TABLE IF NOT EXISTS consents (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    granted BOOLEAN NOT NULL DEFAULT FALSE,
+    granted_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    version VARCHAR(20) NOT NULL,
+    description TEXT,
+    UNIQUE(user_id, type, version)
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_consents_user_id ON consents(user_id);
+CREATE INDEX IF NOT EXISTS idx_consents_type ON consents(type);
+CREATE INDEX IF NOT EXISTS idx_consents_granted ON consents(granted);

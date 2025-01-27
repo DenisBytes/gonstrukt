@@ -1,0 +1,52 @@
+{{- if .HasGDPRProcessingLogs}}
+package db
+
+import (
+	"context"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/arangodb/go-driver/v2/arangodb"
+)
+
+// CreateDataProcessingLog creates a new GDPR data processing log entry
+func (c *ArangoClient) CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error {
+	col, err := c.db.Collection(ctx, "data_processing_logs")
+	if err != nil {
+		return err
+	}
+	_, err = col.CreateDocument(ctx, log)
+	return err
+}
+
+// GetDataProcessingLogs retrieves all processing logs for a user
+func (c *ArangoClient) GetDataProcessingLogs(ctx context.Context, userID string) ([]*types.DataProcessingLog, error) {
+	query := `
+		FOR log IN data_processing_logs
+		FILTER log.user_id == @userID
+		SORT log.created_at DESC
+		RETURN log
+	`
+	bindVars := map[string]interface{}{
+		"userID": userID,
+	}
+
+	cursor, err := c.db.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	var logs []*types.DataProcessingLog
+	for cursor.HasMore() {
+		var log types.DataProcessingLog
+		_, err := cursor.ReadDocument(ctx, &log)
+		if err != nil {
+			return nil, err
+		}
+		logs = append(logs, &log)
+	}
+
+	return logs, nil
+}
+{{- end}}

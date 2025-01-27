@@ -1,0 +1,622 @@
+package db
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+)
+
+// testDB is the shared database client for integration tests.
+var testDB *PostgresClient
+
+// TestMain sets up and tears down test infrastructure.
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	if testing.Short() {
+		fmt.Println("Skipping database integration tests in short mode")
+		os.Exit(0)
+	}
+
+	var err error
+	testDB, err = setupTestDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to setup test database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Make sure PostgreSQL is running and TEST_POSTGRES_DSN is set\n")
+		os.Exit(1)
+	}
+
+	// Run migrations
+	ctx := context.Background()
+	if err := testDB.Migrate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to run migrations: %v\n", err)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	// Cleanup
+	if testDB != nil {
+		testDB.Close(ctx)
+	}
+
+	os.Exit(code)
+}
+
+func setupTestDB() (*PostgresClient, error) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = "postgres://postgres:postgres@localhost:5432/test_db?sslmode=disable"
+	}
+	return NewPostgresClient(context.Background(), dsn)
+}
+
+func mustGetTestDB(t *testing.T) *PostgresClient {
+	t.Helper()
+	if testDB == nil {
+		t.Fatal("test database not initialized")
+	}
+	return testDB
+}
+
+func cleanupUsers(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := testDB.pool.Exec(ctx, "DELETE FROM users WHERE email LIKE '%@test.com'")
+	if err != nil {
+		t.Logf("Warning: failed to cleanup users: %v", err)
+	}
+}
+
+func cleanupSessions(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := testDB.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email LIKE '%@test.com')")
+	if err != nil {
+		t.Logf("Warning: failed to cleanup sessions: %v", err)
+	}
+}
+
+func newTestUser(email string) *types.User {
+	now := time.Now()
+	return &types.User{
+		ID:           uuid.New().String(),
+		Email:        email,
+		PasswordHash: "$2a$10$fakehashfortest123456789012345678901234567890",
+		FirstName:    "Test",
+		LastName:     "User",
+		MFAEnabled:   false,
+		MFASecret:    "",
+		Roles:        []string{"user"},
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+}
+
+func TestPostgresClient_UserCRUD(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	tests := []struct {
+		name  string
+		email string
+	}{
+		{"simple email", "user1@test.com"},
+		{"email with dots", "user.name@test.com"},
+		{"email with plus", "user+tag@test.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user := newTestUser(tt.email)
+
+			// Create
+			if err := db.CreateUser(ctx, user); err != nil {
+				t.Fatalf("CreateUser() error = %v", err)
+			}
+
+			// Read by ID
+			got, err := db.GetUserByID(ctx, user.ID)
+			if err != nil {
+				t.Fatalf("GetUserByID() error = %v", err)
+			}
+			if got.Email != tt.email {
+				t.Errorf("GetUserByID() email = %v, want %v", got.Email, tt.email)
+			}
+
+			// Read by email
+			got, err = db.GetUserByEmail(ctx, tt.email)
+			if err != nil {
+				t.Fatalf("GetUserByEmail() error = %v", err)
+			}
+			if got.ID != user.ID {
+				t.Errorf("GetUserByEmail() id = %v, want %v", got.ID, user.ID)
+			}
+
+			// Update
+			user.FirstName = "Updated"
+			if err := db.UpdateUser(ctx, user); err != nil {
+				t.Fatalf("UpdateUser() error = %v", err)
+			}
+
+			got, _ = db.GetUserByID(ctx, user.ID)
+			if got.FirstName != "Updated" {
+				t.Errorf("UpdateUser() first_name = %v, want Updated", got.FirstName)
+			}
+
+			// Delete
+			if err := db.DeleteUser(ctx, user.ID); err != nil {
+				t.Fatalf("DeleteUser() error = %v", err)
+			}
+
+			// Should not find after delete
+			_, err = db.GetUserByID(ctx, user.ID)
+			if err == nil {
+				t.Error("GetUserByID() should return error for deleted user")
+			}
+		})
+	}
+}
+
+func TestPostgresClient_UserNotFound(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		testFn func() error
+	}{
+		{
+			name: "GetUserByID not found",
+			testFn: func() error {
+				_, err := db.GetUserByID(ctx, "non-existent-id")
+				return err
+			},
+		},
+		{
+			name: "GetUserByEmail not found",
+			testFn: func() error {
+				_, err := db.GetUserByEmail(ctx, "nonexistent@test.com")
+				return err
+			},
+		},
+		{
+			name: "UpdateUser not found",
+			testFn: func() error {
+				user := newTestUser("ghost@test.com")
+				user.ID = "non-existent-id"
+				return db.UpdateUser(ctx, user)
+			},
+		},
+		{
+			name: "DeleteUser not found",
+			testFn: func() error {
+				return db.DeleteUser(ctx, "non-existent-id")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.testFn()
+			if err == nil {
+				t.Error("expected error for non-existent user")
+			}
+		})
+	}
+}
+
+func TestPostgresClient_SessionCRUD(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupSessions(t)
+		cleanupUsers(t)
+	})
+
+	// Create test user first
+	user := newTestUser("session-test@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	now := time.Now()
+	session := &types.Session{
+		ID:           uuid.New().String(),
+		UserID:       user.ID,
+		RefreshToken: "test-refresh-token-" + uuid.New().String(),
+		UserAgent:    "Test Browser",
+		IP:           "127.0.0.1",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(24 * time.Hour),
+	}
+
+	// Create session
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+
+	// Get by ID
+	got, err := db.GetSessionByID(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetSessionByID() error = %v", err)
+	}
+	if got.UserID != user.ID {
+		t.Errorf("GetSessionByID() userID = %v, want %v", got.UserID, user.ID)
+	}
+
+	// Get by refresh token
+	got, err = db.GetSessionByRefreshToken(ctx, session.RefreshToken)
+	if err != nil {
+		t.Fatalf("GetSessionByRefreshToken() error = %v", err)
+	}
+	if got.ID != session.ID {
+		t.Errorf("GetSessionByRefreshToken() id = %v, want %v", got.ID, session.ID)
+	}
+
+	// Get user sessions
+	sessions, err := db.GetUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSessions() error = %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Errorf("GetUserSessions() count = %d, want 1", len(sessions))
+	}
+
+	// Delete session
+	if err := db.DeleteSession(ctx, session.ID); err != nil {
+		t.Fatalf("DeleteSession() error = %v", err)
+	}
+
+	sessions, _ = db.GetUserSessions(ctx, user.ID)
+	if len(sessions) != 0 {
+		t.Errorf("GetUserSessions() after delete count = %d, want 0", len(sessions))
+	}
+}
+
+func TestPostgresClient_MultipleSessions(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupSessions(t)
+		cleanupUsers(t)
+	})
+
+	// Create test user
+	user := newTestUser("multi-session@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	// Create multiple sessions
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		session := &types.Session{
+			ID:           uuid.New().String(),
+			UserID:       user.ID,
+			RefreshToken: fmt.Sprintf("refresh-token-%d-%s", i, uuid.New().String()),
+			UserAgent:    fmt.Sprintf("Browser %d", i),
+			IP:           "127.0.0.1",
+			CreatedAt:    now,
+			ExpiresAt:    now.Add(24 * time.Hour),
+		}
+		if err := db.CreateSession(ctx, session); err != nil {
+			t.Fatalf("CreateSession() %d error = %v", i, err)
+		}
+	}
+
+	// Verify all sessions
+	sessions, err := db.GetUserSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserSessions() error = %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Errorf("GetUserSessions() count = %d, want 3", len(sessions))
+	}
+
+	// Delete all user sessions
+	if err := db.DeleteUserSessions(ctx, user.ID); err != nil {
+		t.Fatalf("DeleteUserSessions() error = %v", err)
+	}
+
+	sessions, _ = db.GetUserSessions(ctx, user.ID)
+	if len(sessions) != 0 {
+		t.Errorf("GetUserSessions() after delete count = %d, want 0", len(sessions))
+	}
+}
+
+func TestPostgresClient_Consent(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupUsers(t)
+	})
+
+	// Create test user
+	user := newTestUser("consent-test@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	now := time.Now()
+	consent := &types.Consent{
+		ID:        uuid.New().String(),
+		UserID:    user.ID,
+		Type:      "marketing",
+		Granted:   true,
+		Version:   "1.0",
+		GrantedAt: now,
+	}
+
+	// Create consent
+	if err := db.CreateConsent(ctx, consent); err != nil {
+		t.Fatalf("CreateConsent() error = %v", err)
+	}
+
+	// Get user consents
+	consents, err := db.GetUserConsents(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserConsents() error = %v", err)
+	}
+	if len(consents) != 1 {
+		t.Errorf("GetUserConsents() count = %d, want 1", len(consents))
+	}
+	if consents[0].Type != "marketing" {
+		t.Errorf("GetUserConsents()[0].Type = %v, want marketing", consents[0].Type)
+	}
+
+	// Update consent (revoke)
+	revokedAt := time.Now()
+	consent.Granted = false
+	consent.RevokedAt = &revokedAt
+	if err := db.UpdateConsent(ctx, consent); err != nil {
+		t.Fatalf("UpdateConsent() error = %v", err)
+	}
+
+	consents, _ = db.GetUserConsents(ctx, user.ID)
+	if consents[0].Granted != false {
+		t.Errorf("UpdateConsent() granted = %v, want false", consents[0].Granted)
+	}
+}
+
+func TestPostgresClient_MFABackup(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupUsers(t)
+	})
+
+	// Create test user
+	user := newTestUser("mfa-test@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	now := time.Now()
+	backup := &types.MFABackup{
+		ID:        uuid.New().String(),
+		UserID:    user.ID,
+		Code:      "ABC123DEF456",
+		Used:      false,
+		CreatedAt: now,
+	}
+
+	// Create backup
+	if err := db.CreateMFABackup(ctx, backup); err != nil {
+		t.Fatalf("CreateMFABackup() error = %v", err)
+	}
+
+	// Get backups
+	backups, err := db.GetMFABackups(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetMFABackups() error = %v", err)
+	}
+	if len(backups) != 1 {
+		t.Errorf("GetMFABackups() count = %d, want 1", len(backups))
+	}
+
+	// Use backup
+	if err := db.UseMFABackup(ctx, backup.ID); err != nil {
+		t.Fatalf("UseMFABackup() error = %v", err)
+	}
+
+	backups, _ = db.GetMFABackups(ctx, user.ID)
+	if !backups[0].Used {
+		t.Error("UseMFABackup() did not mark backup as used")
+	}
+
+	// Delete backups
+	if err := db.DeleteMFABackups(ctx, user.ID); err != nil {
+		t.Fatalf("DeleteMFABackups() error = %v", err)
+	}
+
+	backups, _ = db.GetMFABackups(ctx, user.ID)
+	if len(backups) != 0 {
+		t.Errorf("DeleteMFABackups() count = %d, want 0", len(backups))
+	}
+}
+
+func TestPostgresClient_Ping(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	if err := db.Ping(ctx); err != nil {
+		t.Errorf("Ping() error = %v", err)
+	}
+}
+
+{{- if .HasGDPRDataDeletion}}
+
+func TestPostgresClient_SoftDeleteUser(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupUsers(t)
+	})
+
+	// Create user with session
+	user := newTestUser("softdelete@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	now := time.Now()
+	session := &types.Session{
+		ID:           uuid.New().String(),
+		UserID:       user.ID,
+		RefreshToken: "test-refresh-token-" + uuid.New().String(),
+		UserAgent:    "Test Browser",
+		IP:           "127.0.0.1",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(24 * time.Hour),
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("Failed to create test session: %v", err)
+	}
+
+	// Soft delete
+	if err := db.SoftDeleteUser(ctx, user.ID); err != nil {
+		t.Fatalf("SoftDeleteUser() error = %v", err)
+	}
+
+	// User should not be findable
+	_, err := db.GetUserByID(ctx, user.ID)
+	if err == nil {
+		t.Error("GetUserByID() should return error for soft-deleted user")
+	}
+
+	// Sessions should be deleted
+	sessions, _ := db.GetUserSessions(ctx, user.ID)
+	if len(sessions) != 0 {
+		t.Errorf("SoftDeleteUser() sessions count = %d, want 0", len(sessions))
+	}
+}
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+
+func TestPostgresClient_ExportUserData(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupSessions(t)
+		cleanupUsers(t)
+	})
+
+	// Create user with session and consent
+	user := newTestUser("export@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	now := time.Now()
+	session := &types.Session{
+		ID:           uuid.New().String(),
+		UserID:       user.ID,
+		RefreshToken: "test-refresh-token-" + uuid.New().String(),
+		UserAgent:    "Test Browser",
+		IP:           "127.0.0.1",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(24 * time.Hour),
+	}
+	if err := db.CreateSession(ctx, session); err != nil {
+		t.Fatalf("Failed to create test session: %v", err)
+	}
+
+	consent := &types.Consent{
+		ID:        uuid.New().String(),
+		UserID:    user.ID,
+		Type:      "marketing",
+		Granted:   true,
+		Version:   "1.0",
+		GrantedAt: now,
+	}
+	if err := db.CreateConsent(ctx, consent); err != nil {
+		t.Fatalf("Failed to create test consent: %v", err)
+	}
+
+	// Export
+	export, err := db.ExportUserData(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ExportUserData() error = %v", err)
+	}
+
+	if export.User.Email != user.Email {
+		t.Errorf("ExportUserData() user email = %v, want %v", export.User.Email, user.Email)
+	}
+	if len(export.Sessions) != 1 {
+		t.Errorf("ExportUserData() sessions count = %d, want 1", len(export.Sessions))
+	}
+	if len(export.Consents) != 1 {
+		t.Errorf("ExportUserData() consents count = %d, want 1", len(export.Consents))
+	}
+}
+{{- end}}
+
+{{- if .HasGDPRProcessingLogs}}
+
+func TestPostgresClient_DataProcessingLog(t *testing.T) {
+	db := mustGetTestDB(t)
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		cleanupUsers(t)
+	})
+
+	// Create test user
+	user := newTestUser("processing-log@test.com")
+	if err := db.CreateUser(ctx, user); err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	log := &types.DataProcessingLog{
+		ID:            uuid.New().String(),
+		UserID:        user.ID,
+		ProcessType:   "data_export",
+		ProcessedData: "user data export",
+		Status:        "completed",
+		RequestIP:     "127.0.0.1",
+		ProcessorID:   "auth-service",
+		LegalBasis:    "GDPR_Article_20",
+		Purpose:       "data portability request",
+		RequestedAt:   time.Now(),
+		CompletedAt:   time.Now(),
+		CreatedAt:     time.Now(),
+	}
+
+	// Create log
+	if err := db.CreateDataProcessingLog(ctx, log); err != nil {
+		t.Fatalf("CreateDataProcessingLog() error = %v", err)
+	}
+
+	// Get logs
+	logs, err := db.GetDataProcessingLogs(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("GetDataProcessingLogs() error = %v", err)
+	}
+	if len(logs) != 1 {
+		t.Errorf("GetDataProcessingLogs() count = %d, want 1", len(logs))
+	}
+	if logs[0].ProcessType != "data_export" {
+		t.Errorf("GetDataProcessingLogs()[0].ProcessType = %v, want data_export", logs[0].ProcessType)
+	}
+}
+{{- end}}

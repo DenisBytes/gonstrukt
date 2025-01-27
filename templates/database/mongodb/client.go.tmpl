@@ -1,0 +1,405 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"{{.ModuleName}}/internals/types"
+)
+
+// MongoClient implements the Database interface for MongoDB
+type MongoClient struct {
+	client   *mongo.Client
+	database *mongo.Database
+}
+
+// NewMongoClient creates a new MongoDB client
+func NewMongoClient(ctx context.Context, uri, dbName string) (*MongoClient, error) {
+	clientOptions := options.Client().ApplyURI(uri)
+	clientOptions.SetMaxPoolSize(100)
+	clientOptions.SetMinPoolSize(5)
+
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
+	}
+
+	if err := client.Ping(ctx, nil); err != nil {
+		client.Disconnect(ctx)
+		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+	}
+
+	return &MongoClient{
+		client:   client,
+		database: client.Database(dbName),
+	}, nil
+}
+
+// Migrate sets up indexes
+func (c *MongoClient) Migrate(ctx context.Context) error {
+	// Users collection indexes
+	usersCol := c.database.Collection("users")
+	_, err := usersCol.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{bson.E{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{bson.E{Key: "deleted_at", Value: 1}}},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Sessions collection indexes
+	sessionsCol := c.database.Collection("sessions")
+	_, err = sessionsCol.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{bson.E{Key: "user_id", Value: 1}}},
+		{Keys: bson.D{bson.E{Key: "refresh_token", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{bson.E{Key: "expires_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Consents collection indexes
+	consentsCol := c.database.Collection("consents")
+	_, err = consentsCol.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{bson.E{Key: "user_id", Value: 1}}},
+		{Keys: bson.D{bson.E{Key: "user_id", Value: 1}, bson.E{Key: "type", Value: 1}, bson.E{Key: "version", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	// MFA backups collection indexes
+	mfaCol := c.database.Collection("mfa_backups")
+	_, err = mfaCol.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{bson.E{Key: "user_id", Value: 1}},
+	})
+
+	return err
+}
+
+// Ping checks the database connection
+func (c *MongoClient) Ping(ctx context.Context) error {
+	return c.client.Ping(ctx, nil)
+}
+
+// Close closes the database connection
+func (c *MongoClient) Close(ctx context.Context) error {
+	return c.client.Disconnect(ctx)
+}
+
+// User operations
+func (c *MongoClient) CreateUser(ctx context.Context, user *types.User) error {
+	_, err := c.database.Collection("users").InsertOne(ctx, user)
+	return err
+}
+
+func (c *MongoClient) GetUserByID(ctx context.Context, id string) (*types.User, error) {
+	user := &types.User{}
+	err := c.database.Collection("users").FindOne(ctx, bson.M{"_id": id, "deleted_at": nil}).Decode(user)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("user not found")
+	}
+	return user, err
+}
+
+func (c *MongoClient) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
+	user := &types.User{}
+	err := c.database.Collection("users").FindOne(ctx, bson.M{"email": email, "deleted_at": nil}).Decode(user)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("user not found")
+	}
+	return user, err
+}
+
+func (c *MongoClient) UpdateUser(ctx context.Context, user *types.User) error {
+	user.UpdatedAt = time.Now()
+	_, err := c.database.Collection("users").UpdateOne(ctx, bson.M{"_id": user.ID}, bson.M{"$set": user})
+	return err
+}
+
+func (c *MongoClient) DeleteUser(ctx context.Context, id string) error {
+	now := time.Now()
+	_, err := c.database.Collection("users").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"deleted_at": now}})
+	return err
+}
+
+// Session operations
+func (c *MongoClient) CreateSession(ctx context.Context, session *types.Session) error {
+	_, err := c.database.Collection("sessions").InsertOne(ctx, session)
+	return err
+}
+
+func (c *MongoClient) GetSessionByID(ctx context.Context, id string) (*types.Session, error) {
+	session := &types.Session{}
+	err := c.database.Collection("sessions").FindOne(ctx, bson.M{"_id": id}).Decode(session)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("session not found")
+	}
+	return session, err
+}
+
+func (c *MongoClient) GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
+	session := &types.Session{}
+	err := c.database.Collection("sessions").FindOne(ctx, bson.M{"refresh_token": token}).Decode(session)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("session not found")
+	}
+	return session, err
+}
+
+func (c *MongoClient) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
+	cursor, err := c.database.Collection("sessions").Find(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var sessions []*types.Session
+	if err := cursor.All(ctx, &sessions); err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+func (c *MongoClient) DeleteSession(ctx context.Context, id string) error {
+	_, err := c.database.Collection("sessions").DeleteOne(ctx, bson.M{"_id": id})
+	return err
+}
+
+func (c *MongoClient) DeleteUserSessions(ctx context.Context, userID string) error {
+	_, err := c.database.Collection("sessions").DeleteMany(ctx, bson.M{"user_id": userID})
+	return err
+}
+
+// Consent operations
+func (c *MongoClient) CreateConsent(ctx context.Context, consent *types.Consent) error {
+	_, err := c.database.Collection("consents").InsertOne(ctx, consent)
+	return err
+}
+
+func (c *MongoClient) GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error) {
+	cursor, err := c.database.Collection("consents").Find(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var consents []*types.Consent
+	if err := cursor.All(ctx, &consents); err != nil {
+		return nil, err
+	}
+	return consents, nil
+}
+
+func (c *MongoClient) UpdateConsent(ctx context.Context, consent *types.Consent) error {
+	_, err := c.database.Collection("consents").UpdateOne(ctx, bson.M{"_id": consent.ID}, bson.M{"$set": consent})
+	return err
+}
+
+// MFA operations
+func (c *MongoClient) CreateMFABackup(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.database.Collection("mfa_backups").InsertOne(ctx, backup)
+	return err
+}
+
+func (c *MongoClient) GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error) {
+	cursor, err := c.database.Collection("mfa_backups").Find(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var backups []*types.MFABackup
+	if err := cursor.All(ctx, &backups); err != nil {
+		return nil, err
+	}
+	return backups, nil
+}
+
+func (c *MongoClient) UseMFABackup(ctx context.Context, id string) error {
+	now := time.Now()
+	_, err := c.database.Collection("mfa_backups").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"used": true, "used_at": now}})
+	return err
+}
+
+func (c *MongoClient) DeleteMFABackups(ctx context.Context, userID string) error {
+	_, err := c.database.Collection("mfa_backups").DeleteMany(ctx, bson.M{"user_id": userID})
+	return err
+}
+
+{{- if .EnableMFA}}
+
+// CreateBackupCode creates a new MFA backup code
+func (c *MongoClient) CreateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	return c.CreateMFABackup(ctx, backup)
+}
+
+// GetBackupCode retrieves a backup code by user ID and hashed code
+func (c *MongoClient) GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error) {
+	backup := &types.MFABackup{}
+	err := c.database.Collection("mfa_backups").FindOne(ctx, bson.M{"user_id": userID, "code": hashedCode}).Decode(backup)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("backup code not found")
+	}
+	return backup, err
+}
+
+// UpdateBackupCode updates an MFA backup code
+func (c *MongoClient) UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.database.Collection("mfa_backups").UpdateOne(ctx, bson.M{"_id": backup.ID},
+		bson.M{"$set": bson.M{"used": backup.Used, "used_at": backup.UsedAt}})
+	return err
+}
+
+// DeleteBackupCodes deletes all MFA backup codes for a user
+func (c *MongoClient) DeleteBackupCodes(ctx context.Context, userID string) error {
+	return c.DeleteMFABackups(ctx, userID)
+}
+{{- end}}
+
+{{- if .HasGDPRConsent}}
+
+// GetActiveConsentsByUserID retrieves all active consents for a user
+func (c *MongoClient) GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error) {
+	filter := bson.M{
+		"user_id":    userID,
+		"granted":    true,
+		"revoked_at": nil,
+		"$or": []bson.M{
+			{"expires_at": nil},
+			{"expires_at": bson.M{"$gt": time.Now()}},
+		},
+	}
+	cursor, err := c.database.Collection("consents").Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var consents []*types.Consent
+	if err := cursor.All(ctx, &consents); err != nil {
+		return nil, err
+	}
+	return consents, nil
+}
+
+// GetConsentHistory retrieves the full consent history for a user
+func (c *MongoClient) GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error) {
+	return c.GetUserConsents(ctx, userID)
+}
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+
+// SoftDeleteUser performs a GDPR-compliant soft delete by anonymizing PII
+func (c *MongoClient) SoftDeleteUser(ctx context.Context, id string) error {
+	now := time.Now()
+	anonymizedEmail := fmt.Sprintf("deleted_%s@anonymized.local", id)
+
+	_, err := c.database.Collection("users").UpdateOne(ctx, bson.M{"_id": id, "deleted_at": nil},
+		bson.M{"$set": bson.M{
+			"email":         anonymizedEmail,
+			"first_name":    "DELETED",
+			"last_name":     "USER",
+			"password_hash": "",
+			"mfa_enabled":   false,
+			"mfa_secret":    "",
+			"deleted_at":    now,
+			"updated_at":    now,
+		}})
+	if err != nil {
+		return err
+	}
+
+	c.database.Collection("sessions").DeleteMany(ctx, bson.M{"user_id": id})
+	c.database.Collection("mfa_backups").DeleteMany(ctx, bson.M{"user_id": id})
+	return nil
+}
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+
+// ExportUserData exports all user data for GDPR data portability
+func (c *MongoClient) ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error) {
+	user, err := c.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	sessions, err := c.GetUserSessions(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	consents, err := c.GetUserConsents(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	userExport := types.UserExportData{
+		ID:        user.ID,
+		Email:     user.Email,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+	}
+
+	sessionExports := make([]types.SessionExportData, len(sessions))
+	for i, s := range sessions {
+		sessionExports[i] = types.SessionExportData{
+			ID:        s.ID,
+			UserAgent: s.UserAgent,
+			IP:        s.IP,
+			CreatedAt: s.CreatedAt,
+			ExpiresAt: s.ExpiresAt,
+		}
+	}
+
+	consentExports := make([]types.ConsentExportData, len(consents))
+	for i, consent := range consents {
+		consentExports[i] = types.ConsentExportData{
+			Type:      consent.Type,
+			Granted:   consent.Granted,
+			Version:   consent.Version,
+			GrantedAt: consent.GrantedAt,
+			RevokedAt: consent.RevokedAt,
+		}
+	}
+
+	return &types.UserDataExport{
+		ExportedAt: time.Now(),
+		User:       userExport,
+		Sessions:   sessionExports,
+		Consents:   consentExports,
+	}, nil
+}
+{{- end}}
+
+{{- if .HasOAuth}}
+
+// GetUserByOAuthID retrieves a user by OAuth provider and ID
+func (c *MongoClient) GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error) {
+	// First find the OAuth account
+	var oauthAccount struct {
+		UserID string `bson:"user_id"`
+	}
+	err := c.database.Collection("oauth_accounts").FindOne(ctx, bson.M{
+		"provider":    provider,
+		"provider_id": oauthID,
+	}).Decode(&oauthAccount)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return c.GetUserByID(ctx, oauthAccount.UserID)
+}
+{{- end}}

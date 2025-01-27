@@ -1,0 +1,141 @@
+package db
+
+import (
+	"context"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateMFABackup creates a new MFA backup code
+func (c *PostgresClient) CreateMFABackup(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO mfa_backups (id, user_id, code, used, created_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`,
+		backup.ID,
+		backup.UserID,
+		backup.Code,
+		backup.Used,
+		backup.CreatedAt,
+	)
+	return err
+}
+
+// GetMFABackups retrieves all MFA backup codes for a user
+func (c *PostgresClient) GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups
+		WHERE user_id = $1
+		ORDER BY created_at ASC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var backups []*types.MFABackup
+	for rows.Next() {
+		backup := &types.MFABackup{}
+		if err := rows.Scan(
+			&backup.ID,
+			&backup.UserID,
+			&backup.Code,
+			&backup.Used,
+			&backup.UsedAt,
+			&backup.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		backups = append(backups, backup)
+	}
+
+	return backups, rows.Err()
+}
+
+// UseMFABackup marks a backup code as used
+func (c *PostgresClient) UseMFABackup(ctx context.Context, id string) error {
+	now := time.Now()
+	_, err := c.pool.Exec(ctx, `
+		UPDATE mfa_backups
+		SET used = true, used_at = $2
+		WHERE id = $1
+	`, id, now)
+	return err
+}
+
+// DeleteMFABackups deletes all MFA backup codes for a user
+func (c *PostgresClient) DeleteMFABackups(ctx context.Context, userID string) error {
+	_, err := c.pool.Exec(ctx, `DELETE FROM mfa_backups WHERE user_id = $1`, userID)
+	return err
+}
+
+// GetUnusedMFABackup retrieves an unused backup code by code value
+func (c *PostgresClient) GetUnusedMFABackup(ctx context.Context, userID, code string) (*types.MFABackup, error) {
+	backup := &types.MFABackup{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups
+		WHERE user_id = $1 AND code = $2 AND used = false
+	`, userID, code).Scan(
+		&backup.ID,
+		&backup.UserID,
+		&backup.Code,
+		&backup.Used,
+		&backup.UsedAt,
+		&backup.CreatedAt,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return backup, nil
+}
+
+{{- if .EnableMFA}}
+
+// CreateBackupCode creates a new MFA backup code (alias for CreateMFABackup)
+func (c *PostgresClient) CreateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	return c.CreateMFABackup(ctx, backup)
+}
+
+// GetBackupCode retrieves a backup code by user ID and hashed code
+func (c *PostgresClient) GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error) {
+	backup := &types.MFABackup{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups
+		WHERE user_id = $1 AND code = $2
+	`, userID, hashedCode).Scan(
+		&backup.ID,
+		&backup.UserID,
+		&backup.Code,
+		&backup.Used,
+		&backup.UsedAt,
+		&backup.CreatedAt,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return backup, nil
+}
+
+// UpdateBackupCode updates an MFA backup code
+func (c *PostgresClient) UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE mfa_backups
+		SET used = $2, used_at = $3
+		WHERE id = $1
+	`, backup.ID, backup.Used, backup.UsedAt)
+	return err
+}
+
+// DeleteBackupCodes deletes all MFA backup codes for a user (alias for DeleteMFABackups)
+func (c *PostgresClient) DeleteBackupCodes(ctx context.Context, userID string) error {
+	return c.DeleteMFABackups(ctx, userID)
+}
+{{- end}}
