@@ -1,0 +1,557 @@
+# {{.ProjectName}}
+
+Generated with [Gonstrukt](https://github.com/DenisBytes/gonstrukt) - A Go microservice generator with GDPR compliance built-in.
+
+## Overview
+
+{{- if eq .ServiceType "gateway"}}
+This is an API Gateway service providing request routing, rate limiting, caching, and security middleware.
+{{- else if eq .ServiceType "auth"}}
+This is an Authentication service providing secure user authentication, session management, and GDPR compliance.
+{{- else}}
+This is a microservice architecture with both an API Gateway and an Authentication service.
+{{- end}}
+
+## Features
+
+{{- if or (eq .ServiceType "auth") (eq .ServiceType "both")}}
+
+### Authentication
+- Secure password hashing with bcrypt
+- JWT-based access tokens with RS256 signing
+- Refresh token rotation
+- Session management with automatic cleanup
+{{- if .EnableMFA}}
+- **MFA/TOTP Support**: Time-based one-time passwords with backup codes
+{{- end}}
+{{- if .EnableRBAC}}
+- **Role-Based Access Control**: Casbin-powered fine-grained permissions
+{{- end}}
+
+{{- if .HasOAuth}}
+### OAuth Providers
+{{- if .HasGoogleOAuth}}
+- Google Sign-In
+{{- end}}
+{{- if .HasMicrosoftOAuth}}
+- Microsoft/Azure AD
+{{- end}}
+{{- if .HasAppleOAuth}}
+- Apple Sign-In
+{{- end}}
+{{- end}}
+
+{{- if .HasGDPR}}
+### GDPR Compliance
+This service implements GDPR compliance features:
+
+{{- if .HasGDPRConsent}}
+- **Consent Management** (Article 7): Versioned consent records with full audit history
+{{- end}}
+{{- if .HasGDPRDataExport}}
+- **Data Portability** (Article 20): Export all user data in JSON format
+{{- end}}
+{{- if .HasGDPRDataDeletion}}
+- **Right to Erasure** (Article 17): Soft-delete with PII anonymization
+{{- end}}
+{{- if .HasGDPRProcessingLogs}}
+- **Processing Records** (Article 30): Audit trail of all data processing with legal basis
+{{- end}}
+
+#### Why Roll Your Own Auth?
+
+The common advice "never roll your own auth" applies to cryptographic primitives, not to building authentication systems using proven libraries. This service:
+
+1. **Uses battle-tested libraries**: bcrypt for password hashing, JWT for tokens, established OAuth libraries
+2. **Implements security best practices**: CSRF protection, secure cookies, rate limiting
+3. **Provides full control**: You own your data, no vendor lock-in, customizable to your needs
+4. **Ensures compliance**: GDPR features are built-in, not bolted on
+
+Third-party auth services may seem easier, but they:
+- Create vendor lock-in
+- Charge per user (costs scale with success)
+- May not meet your data residency requirements
+- Limit customization of the auth flow
+- Make GDPR compliance your responsibility anyway
+{{- end}}
+{{- end}}
+
+{{- if or (eq .ServiceType "gateway") (eq .ServiceType "both")}}
+
+### API Gateway
+- Request routing and proxying
+{{- if .HasRateLimiter}}
+- **Rate Limiting**: {{.RateLimiterType}} algorithm
+{{- end}}
+{{- if .HasCache}}
+- **Caching**: {{.CacheType}} backend
+{{- end}}
+{{- if .AuthCache}}
+- **Auth Response Caching**: Reduced latency for session validation
+{{- end}}
+- **Security Middleware**:
+  - Host header validation (DNS rebinding protection)
+  - Path traversal protection
+  - Request size limits
+  - Malicious payload detection (XSS, SQLi, command injection)
+  - CORS and CSRF protection
+{{- end}}
+
+### Infrastructure
+- **Configuration**: {{.Config}} backend
+{{- if .HasObservability}}
+- **Observability**: OpenTelemetry traces and metrics via OTLP
+{{- end}}
+- **Logging**: Structured logging with zap
+- **Database**: {{.Database}}
+{{- if eq .ServiceType "both"}}
+- **Monorepo**: Go workspace with shared dependencies
+{{- end}}
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.24+
+- Docker and Docker Compose (for local development)
+{{- if eq .Database "postgres"}}
+- PostgreSQL 15+
+{{- else if eq .Database "mysql"}}
+- MySQL 8+
+{{- else if eq .Database "mongodb"}}
+- MongoDB 6+
+{{- end}}
+{{- if or (eq .CacheType "redis") (eq .CacheType "valkey")}}
+- Redis/Valkey
+{{- end}}
+{{- if .HasFrontend}}
+- Node.js 18+ and npm
+{{- if .IsMobileFrontend}}
+- Expo CLI (`npm install -g expo-cli`)
+- iOS Simulator (macOS) or Android Emulator
+{{- end}}
+{{- end}}
+
+### Development Setup
+
+1. **Clone and install dependencies**:
+```bash
+cd {{.ProjectName}}
+{{- if eq .ServiceType "both"}}
+go work sync
+{{- else}}
+go mod tidy
+{{- end}}
+```
+
+2. **Start infrastructure**:
+```bash
+docker-compose up -d
+```
+
+3. **Run migrations** (if applicable):
+```bash
+{{- if eq .ServiceType "both"}}
+cd services/auth_service
+{{- end}}
+go run cmd/*/main.go migrate
+```
+
+4. **Start the service**:
+```bash
+{{- if eq .ServiceType "both"}}
+# Terminal 1 - Gateway
+cd services/gateway && go run cmd/gateway/main.go
+
+# Terminal 2 - Auth Service
+cd services/auth_service && go run cmd/auth_service/main.go
+{{- else if eq .ServiceType "gateway"}}
+go run cmd/gateway/main.go
+{{- else}}
+go run cmd/auth_service/main.go
+{{- end}}
+```
+{{- if .HasFrontend}}
+
+5. **Start the frontend** (in a new terminal):
+```bash
+cd frontend
+cp .env.example .env  # Configure your environment variables
+npm install
+npm run dev
+```
+{{- if .IsWebFrontend}}
+The frontend will be available at `http://localhost:5173`
+{{- else}}
+Expo will open developer tools. Press `i` for iOS simulator or `a` for Android.
+{{- end}}
+{{- end}}
+
+### Configuration
+
+{{- if eq .Config "yaml"}}
+Configuration is loaded from `config.yaml`. See `config.example.yaml` for available options.
+{{- else if eq .Config "env"}}
+Configuration is loaded from environment variables. See `.env.example` for available options.
+{{- else if eq .Config "vault"}}
+Configuration is loaded from HashiCorp Vault. Set `VAULT_ADDR` and `VAULT_TOKEN` environment variables.
+{{- end}}
+
+## API Endpoints
+
+{{- if or (eq .ServiceType "auth") (eq .ServiceType "both")}}
+
+### Authentication
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/auth/register` | Register new user |
+| POST | `/api/v1/auth/login` | Login and get tokens |
+| POST | `/api/v1/auth/refresh` | Refresh access token |
+| POST | `/api/v1/auth/logout` | Logout and invalidate session |
+| GET | `/api/v1/auth/user` | Get current user |
+| PUT | `/api/v1/auth/user` | Update user profile |
+| POST | `/api/v1/auth/user/password` | Change password |
+
+{{- if .EnableMFA}}
+
+### MFA
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/auth/mfa/setup` | Initialize MFA setup |
+| POST | `/api/v1/auth/mfa/verify` | Verify and enable MFA |
+| POST | `/api/v1/auth/mfa/disable` | Disable MFA |
+{{- end}}
+
+{{- if .HasGDPR}}
+
+### GDPR
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+{{- if .HasGDPRConsent}}
+| GET | `/api/v1/auth/gdpr/consent` | Get active consents |
+| PUT | `/api/v1/auth/gdpr/consent` | Update consent |
+| GET | `/api/v1/auth/gdpr/consent/history` | Get consent history |
+{{- end}}
+{{- if .HasGDPRDataExport}}
+| GET | `/api/v1/auth/gdpr/export` | Export all user data |
+{{- end}}
+{{- if .HasGDPRDataDeletion}}
+| DELETE | `/api/v1/auth/gdpr/delete` | Delete account (right to erasure) |
+{{- end}}
+{{- end}}
+{{- end}}
+
+### Health
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Liveness probe |
+| GET | `/ready` | Readiness probe |
+
+## Security Considerations
+
+### Production Checklist
+
+- [ ] Enable HTTPS/TLS termination
+- [ ] Set secure cookie flags (`Secure`, `HttpOnly`, `SameSite=Strict`)
+- [ ] Configure CORS for your domains only
+- [ ] Set up rate limiting thresholds
+- [ ] Enable request size limits
+- [ ] Configure allowed hosts
+- [ ] Set up proper logging and monitoring
+- [ ] Regular security updates
+{{- if .HasGDPR}}
+- [ ] Review GDPR data retention policies
+- [ ] Set up data processing agreements with sub-processors
+{{- end}}
+{{- if .HasFrontend}}
+- [ ] Update `VITE_API_URL` to production backend URL
+{{- if .HasPostHog}}
+- [ ] Configure PostHog for production (check data residency requirements)
+{{- end}}
+{{- if .HasSentry}}
+- [ ] Configure Sentry DSN for production environment
+- [ ] Set up release tracking and source maps
+{{- end}}
+{{- end}}
+
+### Environment Variables
+
+Never commit secrets to version control. Use environment variables or a secrets manager.
+
+Copy the example below and fill in your values:
+
+```bash
+# ============================================
+# REQUIRED CONFIGURATION
+# ============================================
+
+{{- if or (eq .ServiceType "auth") (eq .ServiceType "both")}}
+# Database
+# TODO: Replace with your database connection string
+{{- if eq .Database "postgres"}}
+DATABASE_URL=postgres://user:password@localhost:5432/{{.ProjectName}}?sslmode=disable
+{{- else if eq .Database "mysql"}}
+DATABASE_URL=user:password@tcp(localhost:3306)/{{.ProjectName}}?parseTime=true
+{{- else if eq .Database "sqlite"}}
+DATABASE_URL=./{{.ProjectName}}.db
+{{- end}}
+
+# JWT Keys
+# TODO: Generate keys with: openssl ecparam -genkey -name prime256v1 -out private.pem
+# TODO: Then extract public key: openssl ec -in private.pem -pubout -out public.pem
+JWT_PRIVATE_KEY_PATH=/path/to/private.pem
+JWT_PUBLIC_KEY_PATH=/path/to/public.pem
+{{- end}}
+
+{{- if or (eq .CacheType "redis") (eq .CacheType "valkey")}}
+
+# ============================================
+# CACHE ({{.CacheType}})
+# ============================================
+# TODO: Update with your {{.CacheType}} connection
+REDIS_URL=redis://localhost:6379
+{{- end}}
+
+{{- if eq .Config "vault"}}
+
+# ============================================
+# HASHICORP VAULT
+# ============================================
+# TODO: Configure your Vault connection
+VAULT_ADDR=https://vault.example.com
+VAULT_TOKEN=s.xxxxx
+{{- end}}
+
+{{- if .HasSESEmail}}
+
+# ============================================
+# AWS SES (Email)
+# ============================================
+# TODO: Configure your AWS credentials
+# Get credentials from: https://console.aws.amazon.com/iam/
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
+AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+{{- end}}
+
+{{- if .HasSMTPEmail}}
+
+# ============================================
+# SMTP (Email)
+# ============================================
+# TODO: Configure your SMTP server
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-username
+SMTP_PASSWORD=your-password
+SMTP_FROM_EMAIL=noreply@example.com
+{{- end}}
+
+{{- if .HasGoogleOAuth}}
+
+# ============================================
+# GOOGLE OAUTH
+# ============================================
+# Get credentials from: https://console.cloud.google.com/apis/credentials
+# TODO: Create OAuth 2.0 Client ID and configure authorized redirect URIs
+GOOGLE_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxxxxxxxxx
+{{- end}}
+
+{{- if .HasMicrosoftOAuth}}
+
+# ============================================
+# MICROSOFT OAUTH
+# ============================================
+# Get credentials from: https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps
+# TODO: Register an app and get the client ID/secret
+MICROSOFT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+MICROSOFT_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Use "common" for multi-tenant, or your tenant ID for single-tenant
+MICROSOFT_TENANT_ID=common
+{{- end}}
+
+{{- if .HasAppleOAuth}}
+
+# ============================================
+# APPLE SIGN-IN
+# ============================================
+# Configure at: https://developer.apple.com/account/resources/identifiers
+# TODO: Create a Services ID and download the private key
+APPLE_CLIENT_ID=com.example.your-app
+APPLE_TEAM_ID=XXXXXXXXXX
+APPLE_KEY_ID=YYYYYYYYYY
+APPLE_PRIVATE_KEY_PATH=/path/to/AuthKey_YYYYYYYYYY.p8
+{{- end}}
+{{- if .HasFrontend}}
+
+# ============================================
+# FRONTEND
+# ============================================
+# CORS origin for frontend
+CORS_ALLOWED_ORIGINS={{if .IsWebFrontend}}http://localhost:5173{{else}}*{{end}}
+{{- if .HasPostHog}}
+
+# PostHog Analytics
+# Get your key from: https://app.posthog.com/project/settings
+# TODO: Replace with your PostHog project API key
+VITE_POSTHOG_KEY=phc_XXXXXXXXXX
+VITE_POSTHOG_HOST=https://us.i.posthog.com
+{{- end}}
+{{- if .HasSentry}}
+
+# Sentry Error Tracking
+# Get your DSN from: https://sentry.io/settings/projects/YOUR_PROJECT/keys/
+# TODO: Replace with your Sentry DSN
+VITE_SENTRY_DSN=https://xxxxxxxx@sentry.io/xxxxxxxx
+{{- end}}
+{{- end}}
+```
+
+## Project Structure
+
+```
+{{.ProjectName}}/
+{{- if eq .ServiceType "both"}}
+├── services/
+│   ├── gateway/
+│   │   ├── cmd/gateway/
+│   │   ├── internals/
+│   │   └── go.mod
+│   └── auth_service/
+│       ├── cmd/auth_service/
+│       ├── internals/
+│       └── go.mod
+├── go.work
+{{- else}}
+├── cmd/
+│   └── {{if eq .ServiceType "gateway"}}gateway{{else}}auth_service{{end}}/
+│       └── main.go
+├── internals/
+│   ├── config/
+│   ├── services/
+│   ├── middleware/
+{{- if eq .ServiceType "auth"}}
+│   ├── db/
+│   └── types/
+{{- else}}
+│   ├── cache/
+│   └── ratelimiter/
+{{- end}}
+├── go.mod
+{{- end}}
+{{- if .HasFrontend}}
+├── frontend/                 # {{if .IsWebFrontend}}{{.WebFramework}} web app{{else}}React Native Expo app{{end}}
+│   ├── src/
+│   │   ├── {{if .IsReactVite}}routes{{else if .IsNextJS}}app{{else}}app/routes{{end}}/
+│   │   ├── components/
+│   │   └── lib/
+│   ├── package.json
+{{- if .IsWebFrontend}}
+{{- if .IsReactVite}}
+│   └── vite.config.ts
+{{- else if .IsNextJS}}
+│   └── next.config.js
+{{- else}}
+│   └── app.config.ts
+{{- end}}
+{{- else}}
+│   └── app.json
+{{- end}}
+{{- end}}
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+└── README.md
+```
+
+## Development
+
+### Running Tests
+
+```bash
+# Backend tests
+go test ./...
+
+# Run with race detection
+go test -race ./...
+{{- if .HasFrontend}}
+
+# Frontend tests
+cd frontend && npm test
+{{- end}}
+```
+
+### Building
+
+```bash
+# Backend
+make build
+# or
+go build -o bin/{{if eq .ServiceType "gateway"}}gateway{{else}}auth_service{{end}} ./cmd/*/
+{{- if .HasFrontend}}
+
+# Frontend
+cd frontend && npm run build
+{{- end}}
+```
+{{- if .HasFrontend}}
+
+### Running the Frontend
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+{{- if .IsWebFrontend}}
+# Opens at http://localhost:5173
+{{- else}}
+# Opens Expo dev tools
+{{- end}}
+```
+{{- if .HasPostHog}}
+
+#### PostHog Analytics
+
+PostHog is configured to track:
+- Page views and navigation
+- User identification on login
+- Custom events via `captureEvent()`
+
+To test analytics locally, create a `.env` file with your PostHog key.
+{{- end}}
+{{- if .HasSentry}}
+
+#### Sentry Error Tracking
+
+Sentry captures:
+- Uncaught exceptions
+- Performance metrics
+- User context on errors
+
+Test error reporting with: `throw new Error('Test Sentry')`
+{{- end}}
+{{- end}}
+
+### Docker
+
+```bash
+docker build -t {{.ProjectName}} .
+docker run -p 8080:8080 {{.ProjectName}}
+```
+
+## License
+
+[Add your license here]
+
+---
+
+Generated with [Gonstrukt](https://github.com/DenisBytes/gonstrukt) v1.0.0

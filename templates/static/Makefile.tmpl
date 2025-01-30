@@ -1,0 +1,98 @@
+.PHONY: build run test test-coverage test-int test-all clean lint fmt help{{if .HasFrontend}} test-e2e{{end}}
+
+# Variables
+BINARY_NAME={{.ProjectName}}
+GO=go
+GOFLAGS=-ldflags="-s -w"
+
+# Build
+build:
+	$(GO) build $(GOFLAGS) -o bin/$(BINARY_NAME) ./cmd/{{.ServiceName}}
+
+# Run
+run:
+	$(GO) run ./cmd/{{.ServiceName}}
+
+# Test
+test:
+	$(GO) test -v -race ./...
+
+test-coverage:
+	$(GO) test -v -race -coverprofile=coverage.out ./...
+	$(GO) tool cover -html=coverage.out -o coverage.html
+
+# Integration tests (requires test infrastructure)
+test-int:
+	./scripts/run-tests.sh
+
+# All tests (unit + integration)
+test-all:
+	./scripts/run-tests.sh
+{{- if .HasFrontend}}
+
+# Frontend E2E tests
+test-e2e:
+	cd frontend && npm run test:e2e
+{{- end}}
+
+# Lint
+lint:
+	golangci-lint run
+
+# Format
+fmt:
+	$(GO) fmt ./...
+	goimports -w .
+
+# Clean
+clean:
+	rm -rf bin/
+	rm -f coverage.out coverage.html
+
+# Dependencies
+deps:
+	$(GO) mod download
+	$(GO) mod tidy
+
+# Docker
+docker-build:
+	docker build -t {{.ProjectName}}:latest .
+
+docker-run:
+	docker run -p 8080:8080 {{.ProjectName}}:latest
+
+# Database migrations (if using SQL database)
+{{- if .IsSQL}}
+migrate-up:
+	migrate -path ./migrations -database "$(DATABASE_URL)" up
+
+migrate-down:
+	migrate -path ./migrations -database "$(DATABASE_URL)" down
+
+migrate-create:
+	migrate create -ext sql -dir ./migrations -seq $(name)
+{{- end}}
+
+# Help
+help:
+	@echo "Available commands:"
+	@echo "  make build          - Build the binary"
+	@echo "  make run            - Run the application"
+	@echo "  make test           - Run unit tests"
+	@echo "  make test-coverage  - Run tests with coverage"
+	@echo "  make test-int       - Run integration tests (requires Docker)"
+	@echo "  make test-all       - Run all tests"
+{{- if .HasFrontend}}
+	@echo "  make test-e2e       - Run frontend E2E tests"
+{{- end}}
+	@echo "  make lint           - Run linter"
+	@echo "  make fmt            - Format code"
+	@echo "  make clean          - Clean build artifacts"
+	@echo "  make deps           - Download and tidy dependencies"
+	@echo "  make docker-build   - Build Docker image"
+	@echo "  make docker-run     - Run Docker container"
+{{- if .IsSQL}}
+	@echo "  make migrate-up     - Run database migrations"
+	@echo "  make migrate-down   - Rollback database migrations"
+	@echo "  make migrate-create - Create new migration"
+{{- end}}

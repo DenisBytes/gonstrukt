@@ -1,0 +1,81 @@
+# Docker Compose for running {{.ProjectName}} tests
+# Uses random ports to avoid conflicts with existing containers
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   ./scripts/run-tests.sh
+#   docker compose -f docker-compose.test.yml down -v
+
+services:
+{{- if or (eq .Database "postgres") (eq .ServiceType "both")}}
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: test_db
+    ports:
+      - "5432"  # Random port on host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+{{- end}}
+
+{{- if eq .Database "mysql"}}
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test_db
+    ports:
+      - "3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/mysql
+{{- end}}
+
+{{- if eq .CacheType "redis"}}
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .CacheType "valkey"}}
+  valkey:
+    image: valkey/valkey:7-alpine
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .Database "mongodb"}}
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /data/db
+{{- end}}

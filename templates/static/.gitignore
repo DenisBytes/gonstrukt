@@ -1,0 +1,60 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Config (local)
+config.local.yaml
+
+# Logs
+*.log
+logs/
+
+# Build
+/build/
+/dist/
+
+# Keys (never commit)
+*.pem
+*.key
+private_key*
+public_key*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage
+coverage.html
+coverage.txt

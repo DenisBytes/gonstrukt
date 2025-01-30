@@ -1,0 +1,239 @@
+version: '3.8'
+
+services:
+{{- if eq .ServiceType "gateway"}}
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=info
+{{- if eq .CacheType "redis"}}
+      - REDIS_ADDR=redis:6379
+{{- else if eq .CacheType "valkey"}}
+      - VALKEY_ADDR=valkey:6379
+{{- end}}
+{{- if eq .Config "vault"}}
+      - VAULT_ADDR=http://vault:8200
+{{- end}}
+    depends_on:
+{{- if eq .CacheType "redis"}}
+      - redis
+{{- else if eq .CacheType "valkey"}}
+      - valkey
+{{- end}}
+    networks:
+      - app-network
+{{- end}}
+
+{{- if eq .ServiceType "auth"}}
+  auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - LOG_LEVEL=info
+{{- if eq .Database "postgres"}}
+      - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
+{{- else if eq .Database "mysql"}}
+      - DATABASE_URL=user:password@tcp(mysql:3306)/auth
+{{- else if eq .Database "mongodb"}}
+      - MONGODB_URL=mongodb://mongo:27017
+      - MONGODB_DATABASE=auth
+{{- end}}
+{{- if eq .Config "vault"}}
+      - VAULT_ADDR=http://vault:8200
+{{- end}}
+    depends_on:
+{{- if eq .Database "postgres"}}
+      - postgres
+{{- else if eq .Database "mysql"}}
+      - mysql
+{{- else if eq .Database "mongodb"}}
+      - mongo
+{{- end}}
+    networks:
+      - app-network
+{{- end}}
+
+{{- if eq .ServiceType "both"}}
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=info
+{{- if eq .CacheType "redis"}}
+      - REDIS_ADDR=redis:6379
+{{- else if eq .CacheType "valkey"}}
+      - VALKEY_ADDR=valkey:6379
+{{- end}}
+    depends_on:
+      - auth
+{{- if eq .CacheType "redis"}}
+      - redis
+{{- else if eq .CacheType "valkey"}}
+      - valkey
+{{- end}}
+    networks:
+      - app-network
+
+  auth:
+    build:
+      context: ./services/auth_service
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - LOG_LEVEL=info
+{{- if eq .Database "postgres"}}
+      - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
+{{- else if eq .Database "mysql"}}
+      - DATABASE_URL=user:password@tcp(mysql:3306)/auth
+{{- else if eq .Database "mongodb"}}
+      - MONGODB_URL=mongodb://mongo:27017
+      - MONGODB_DATABASE=auth
+{{- end}}
+    depends_on:
+{{- if eq .Database "postgres"}}
+      - postgres
+{{- else if eq .Database "mysql"}}
+      - mysql
+{{- else if eq .Database "mongodb"}}
+      - mongo
+{{- end}}
+    networks:
+      - app-network
+{{- end}}
+
+  # Database services
+{{- if eq .Database "postgres"}}
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=auth
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d auth"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .Database "mysql"}}
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpassword
+      - MYSQL_USER=user
+      - MYSQL_PASSWORD=password
+      - MYSQL_DATABASE=auth
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .Database "mongodb"}}
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - app-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+  # Cache services
+{{- if eq .CacheType "redis"}}
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .CacheType "valkey"}}
+  valkey:
+    image: valkey/valkey:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+{{- end}}
+
+{{- if eq .Config "vault"}}
+  vault:
+    image: hashicorp/vault:1.15
+    ports:
+      - "8200:8200"
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=dev-token
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - app-network
+{{- end}}
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+{{- if eq .Database "postgres"}}
+  postgres-data:
+{{- end}}
+{{- if eq .Database "mysql"}}
+  mysql-data:
+{{- end}}
+{{- if eq .Database "mongodb"}}
+  mongo-data:
+{{- end}}
+{{- if eq .CacheType "redis"}}
+  redis-data:
+{{- end}}
+{{- if eq .CacheType "valkey"}}
+  valkey-data:
+{{- end}}
