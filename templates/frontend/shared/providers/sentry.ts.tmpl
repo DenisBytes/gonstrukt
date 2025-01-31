@@ -1,0 +1,138 @@
+{{- if .HasSentry}}
+{{- if .IsWebFrontend}}
+import * as Sentry from '@sentry/react'
+
+// Sentry configuration
+const SENTRY_DSN = import.meta.env.VITE_SENTRY_DSN
+
+// Initialize Sentry (call once at app startup)
+export function initSentry() {
+  if (SENTRY_DSN) {
+    Sentry.init({
+      dsn: SENTRY_DSN,
+      integrations: [
+        Sentry.browserTracingIntegration(),
+        Sentry.replayIntegration({
+          maskAllText: false,
+          blockAllMedia: false,
+        }),
+      ],
+      // Performance monitoring
+      tracesSampleRate: import.meta.env.PROD ? 0.1 : 1.0,
+      // Session Replay
+      replaysSessionSampleRate: 0.1, // 10% of sessions
+      replaysOnErrorSampleRate: 1.0, // 100% of sessions with errors
+      // Environment
+      environment: import.meta.env.MODE,
+    })
+  }
+}
+
+// Set user context (call after login)
+export function setUser(user: { id: string; email?: string; username?: string }) {
+  Sentry.setUser(user)
+}
+
+// Clear user context (call after logout)
+export function clearUser() {
+  Sentry.setUser(null)
+}
+
+// Capture exception manually
+export function captureException(error: Error, context?: Record<string, unknown>) {
+  Sentry.captureException(error, { extra: context })
+}
+
+// Capture message
+export function captureMessage(message: string, level: Sentry.SeverityLevel = 'info') {
+  Sentry.captureMessage(message, level)
+}
+
+// Add breadcrumb
+export function addBreadcrumb(breadcrumb: Sentry.Breadcrumb) {
+  Sentry.addBreadcrumb(breadcrumb)
+}
+
+// Set tag
+export function setTag(key: string, value: string) {
+  Sentry.setTag(key, value)
+}
+
+// Set extra context
+export function setExtra(key: string, value: unknown) {
+  Sentry.setExtra(key, value)
+}
+
+// Create error boundary component
+export const ErrorBoundary = Sentry.ErrorBoundary
+
+// Profiler for component performance
+export const Profiler = Sentry.Profiler
+
+// withProfiler HOC
+export const withProfiler = Sentry.withProfiler
+
+export { Sentry }
+{{- else}}
+import * as Sentry from '@sentry/react-native'
+
+// Sentry configuration
+const SENTRY_DSN = process.env.EXPO_PUBLIC_SENTRY_DSN
+
+// Initialize Sentry (call once at app startup)
+export function initSentry() {
+  if (SENTRY_DSN) {
+    Sentry.init({
+      dsn: SENTRY_DSN,
+      // Performance monitoring
+      tracesSampleRate: __DEV__ ? 1.0 : 0.1,
+      // Enable automatic instrumentation
+      enableAutoSessionTracking: true,
+      sessionTrackingIntervalMillis: 30000,
+      // Enable native crash handling
+      enableNativeCrashHandling: true,
+    })
+  }
+}
+
+// Set user context (call after login)
+export function setUser(user: { id: string; email?: string; username?: string }) {
+  Sentry.setUser(user)
+}
+
+// Clear user context (call after logout)
+export function clearUser() {
+  Sentry.setUser(null)
+}
+
+// Capture exception manually
+export function captureException(error: Error, context?: Record<string, unknown>) {
+  Sentry.captureException(error, { extra: context })
+}
+
+// Capture message
+export function captureMessage(message: string, level: Sentry.SeverityLevel = 'info') {
+  Sentry.captureMessage(message, level)
+}
+
+// Add breadcrumb
+export function addBreadcrumb(breadcrumb: Sentry.Breadcrumb) {
+  Sentry.addBreadcrumb(breadcrumb)
+}
+
+// Set tag
+export function setTag(key: string, value: string) {
+  Sentry.setTag(key, value)
+}
+
+// Wrap root component
+export function wrapWithSentry<P extends object>(Component: React.ComponentType<P>): React.ComponentType<P> {
+  return Sentry.wrap(Component)
+}
+
+// Navigation container wrapper for automatic screen tracking
+export const NavigationContainer = Sentry.NavigationContainer
+
+export { Sentry }
+{{- end}}
+{{- end}}
