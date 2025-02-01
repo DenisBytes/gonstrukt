@@ -1,0 +1,39 @@
+import { Outlet } from 'react-router-dom'
+import { Navbar } from './Navbar'
+{{- if .HasShadcn}}
+
+export function DashboardLayout() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <Navbar />
+      <main className="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        <Outlet />
+      </main>
+    </div>
+  )
+}
+{{- else}}
+import { styled } from 'baseui'
+
+const Container = styled('div', {
+  minHeight: '100vh',
+  backgroundColor: '#f7f7f7',
+})
+
+const Main = styled('main', {
+  maxWidth: '1280px',
+  margin: '0 auto',
+  padding: '24px 16px',
+})
+
+export function DashboardLayout() {
+  return (
+    <Container>
+      <Navbar />
+      <Main>
+        <Outlet />
+      </Main>
+    </Container>
+  )
+}
+{{- end}}

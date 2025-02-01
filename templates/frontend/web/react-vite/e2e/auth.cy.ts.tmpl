@@ -1,0 +1,118 @@
+describe('Authentication', () => {
+  const testEmail = `test-${Date.now()}@example.com`
+  const testPassword = 'SecurePassword123!'
+
+  describe('Registration', () => {
+    it('registers a new user successfully', () => {
+      cy.visit('/register')
+
+      cy.getByTestId('register-email').type(testEmail)
+      cy.getByTestId('register-password').type(testPassword)
+      cy.getByTestId('register-first-name').type('Test')
+      cy.getByTestId('register-last-name').type('User')
+      cy.getByTestId('register-submit').click()
+
+      // Should redirect to dashboard or login
+      cy.url().should('not.include', '/register')
+    })
+
+    it('shows validation errors for invalid input', () => {
+      cy.visit('/register')
+
+      // Submit empty form
+      cy.getByTestId('register-submit').click()
+
+      // Should show validation errors
+      cy.contains('Email is required').should('be.visible')
+    })
+
+    it('prevents duplicate email registration', () => {
+      // First register
+      cy.register(testEmail + '.dup', testPassword)
+      cy.logout()
+
+      // Try to register again with same email
+      cy.visit('/register')
+      cy.getByTestId('register-email').type(testEmail + '.dup')
+      cy.getByTestId('register-password').type(testPassword)
+      cy.getByTestId('register-first-name').type('Test')
+      cy.getByTestId('register-last-name').type('User')
+      cy.getByTestId('register-submit').click()
+
+      // Should show error
+      cy.contains(/already exists|already registered/i).should('be.visible')
+    })
+  })
+
+  describe('Login', () => {
+    before(() => {
+      // Create a user for login tests
+      cy.register(`login-${Date.now()}@example.com`, testPassword)
+      cy.logout()
+    })
+
+    it('logs in with valid credentials', () => {
+      cy.login(`login-${Date.now()}@example.com`, testPassword)
+
+      // Should be on dashboard
+      cy.url().should('include', '/dashboard')
+    })
+
+    it('shows error for invalid credentials', () => {
+      cy.visit('/login')
+      cy.getByTestId('login-email').type('wrong@example.com')
+      cy.getByTestId('login-password').type('wrongpassword')
+      cy.getByTestId('login-submit').click()
+
+      // Should show error
+      cy.contains(/invalid|incorrect/i).should('be.visible')
+      cy.url().should('include', '/login')
+    })
+
+    it('shows validation errors for empty fields', () => {
+      cy.visit('/login')
+      cy.getByTestId('login-submit').click()
+
+      cy.contains('Email is required').should('be.visible')
+    })
+  })
+
+  describe('Logout', () => {
+    beforeEach(() => {
+      const email = `logout-${Date.now()}@example.com`
+      cy.register(email, testPassword)
+    })
+
+    it('logs out successfully', () => {
+      cy.getByTestId('logout-button').click()
+
+      // Should redirect to login
+      cy.url().should('include', '/login')
+    })
+
+    it('clears session on logout', () => {
+      cy.logout()
+
+      // Try to access protected route
+      cy.visit('/dashboard')
+
+      // Should redirect to login
+      cy.url().should('include', '/login')
+    })
+  })
+
+  describe('Protected Routes', () => {
+    it('redirects unauthenticated users to login', () => {
+      cy.visit('/dashboard')
+      cy.url().should('include', '/login')
+    })
+
+    it('allows authenticated users to access protected routes', () => {
+      const email = `protected-${Date.now()}@example.com`
+      cy.register(email, testPassword)
+
+      cy.visit('/dashboard')
+      cy.url().should('include', '/dashboard')
+    })
+  })
+})

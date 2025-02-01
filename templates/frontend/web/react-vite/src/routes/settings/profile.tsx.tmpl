@@ -1,0 +1,114 @@
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { toast } from 'sonner'
+import { useAuth } from '../../lib/hooks/use-auth'
+import { authApi } from '../../lib/api/auth'
+{{- if .HasShadcn}}
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card'
+import { Button } from '../../components/ui/button'
+import { Input } from '../../components/ui/input'
+import { Label } from '../../components/ui/label'
+{{- else}}
+import { Card, StyledBody } from 'baseui/card'
+import { Button } from 'baseui/button'
+import { Input } from 'baseui/input'
+import { FormControl } from 'baseui/form-control'
+import { HeadingSmall } from 'baseui/typography'
+{{- end}}
+
+const profileSchema = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters'),
+  email: z.string().email('Invalid email address'),
+})
+
+type ProfileFormData = z.infer<typeof profileSchema>
+
+export function ProfilePage() {
+  const { user, refetchUser } = useAuth()
+  const [isLoading, setIsLoading] = useState(false)
+
+  const form = useForm<ProfileFormData>({
+    resolver: zodResolver(profileSchema),
+    defaultValues: {
+      name: user?.name || '',
+      email: user?.email || '',
+    },
+  })
+
+  const onSubmit = async (data: ProfileFormData) => {
+    setIsLoading(true)
+    try {
+      await authApi.updateProfile(data)
+      await refetchUser()
+      toast.success('Profile updated successfully')
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to update profile')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+{{- if .HasShadcn}}
+    <Card>
+      <CardHeader>
+        <CardTitle>Profile</CardTitle>
+        <CardDescription>Update your personal information</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="name">Name</Label>
+            <Input
+              id="name"
+              {...form.register('name')}
+            />
+            {form.formState.errors.name && (
+              <p className="text-sm text-red-500">{form.formState.errors.name.message}</p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="email">Email</Label>
+            <Input
+              id="email"
+              type="email"
+              {...form.register('email')}
+            />
+            {form.formState.errors.email && (
+              <p className="text-sm text-red-500">{form.formState.errors.email.message}</p>
+            )}
+          </div>
+          <Button type="submit" disabled={isLoading}>
+            {isLoading ? 'Saving...' : 'Save changes'}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+{{- else}}
+    <Card>
+      <StyledBody>
+        <HeadingSmall marginTop="0" marginBottom="16px">Profile</HeadingSmall>
+        <form onSubmit={form.handleSubmit(onSubmit)}>
+          <FormControl
+            label="Name"
+            error={form.formState.errors.name?.message}
+          >
+            <Input {...form.register('name')} />
+          </FormControl>
+          <FormControl
+            label="Email"
+            error={form.formState.errors.email?.message}
+          >
+            <Input type="email" {...form.register('email')} />
+          </FormControl>
+          <Button type="submit" isLoading={isLoading}>
+            Save changes
+          </Button>
+        </form>
+      </StyledBody>
+    </Card>
+{{- end}}
+  )
+}

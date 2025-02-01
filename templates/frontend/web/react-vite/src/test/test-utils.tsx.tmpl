@@ -1,0 +1,77 @@
+import { ReactElement, ReactNode } from 'react'
+import { render, RenderOptions } from '@testing-library/react'
+import { BrowserRouter } from 'react-router-dom'
+{{- if .HasTanStackQuery}}
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+{{- end}}
+{{- if .HasRedux}}
+import { Provider } from 'react-redux'
+import { store } from '@/lib/store'
+{{- end}}
+{{- if .HasBaseUI}}
+import { Client as Styletron } from 'styletron-engine-monolithic'
+import { Provider as StyletronProvider } from 'styletron-react'
+import { LightTheme, BaseProvider } from 'baseui'
+{{- end}}
+
+{{- if .HasTanStackQuery}}
+const createTestQueryClient = () =>
+  new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+    },
+  })
+{{- end}}
+
+{{- if .HasBaseUI}}
+const engine = new Styletron()
+{{- end}}
+
+interface AllProvidersProps {
+  children: ReactNode
+}
+
+const AllProviders = ({ children }: AllProvidersProps) => {
+{{- if .HasTanStackQuery}}
+  const queryClient = createTestQueryClient()
+{{- end}}
+
+  return (
+{{- if .HasBaseUI}}
+    <StyletronProvider value={engine}>
+      <BaseProvider theme={LightTheme}>
+{{- end}}
+{{- if .HasRedux}}
+        <Provider store={store}>
+{{- end}}
+{{- if .HasTanStackQuery}}
+          <QueryClientProvider client={queryClient}>
+{{- end}}
+            <BrowserRouter>
+              {children}
+            </BrowserRouter>
+{{- if .HasTanStackQuery}}
+          </QueryClientProvider>
+{{- end}}
+{{- if .HasRedux}}
+        </Provider>
+{{- end}}
+{{- if .HasBaseUI}}
+      </BaseProvider>
+    </StyletronProvider>
+{{- end}}
+  )
+}
+
+const customRender = (
+  ui: ReactElement,
+  options?: Omit<RenderOptions, 'wrapper'>
+) => render(ui, { wrapper: AllProviders, ...options })
+
+// Re-export everything from testing-library
+export * from '@testing-library/react'
+
+// Override render method
+export { customRender as render }

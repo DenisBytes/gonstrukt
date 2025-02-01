@@ -1,0 +1,83 @@
+{{- if .HasGDPR}}
+describe('GDPR Compliance', () => {
+  const testEmail = `gdpr-${Date.now()}@example.com`
+  const testPassword = 'SecurePassword123!'
+
+  beforeEach(() => {
+    cy.register(testEmail, testPassword)
+  })
+
+{{- if .HasGDPRConsent}}
+  describe('Consent Management', () => {
+    it('displays consent toggles in privacy settings', () => {
+      cy.visit('/settings/privacy')
+
+      cy.getByTestId('consent-analytics').should('exist')
+      cy.getByTestId('consent-marketing').should('exist')
+    })
+
+    it('updates consent preferences', () => {
+      cy.visit('/settings/privacy')
+
+      // Toggle analytics consent
+      cy.getByTestId('consent-analytics').click()
+      cy.getByTestId('save-consent').click()
+
+      // Should show success message
+      cy.contains(/saved|updated/i).should('be.visible')
+    })
+
+    it('shows consent history', () => {
+      cy.visit('/settings/privacy')
+      cy.getByTestId('consent-history-button').click()
+
+      // Should show history table
+      cy.getByTestId('consent-history').should('be.visible')
+    })
+  })
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+  describe('Data Export', () => {
+    it('allows requesting data export', () => {
+      cy.visit('/settings/privacy')
+      cy.getByTestId('export-data-button').click()
+
+      // Should trigger download or show confirmation
+      cy.contains(/export|download/i).should('be.visible')
+    })
+  })
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+  describe('Account Deletion', () => {
+    it('shows deletion confirmation dialog', () => {
+      cy.visit('/settings/privacy')
+      cy.getByTestId('delete-account-button').click()
+
+      // Should show confirmation dialog
+      cy.getByTestId('delete-confirm-dialog').should('be.visible')
+      cy.contains(/permanent|cannot be undone/i).should('be.visible')
+    })
+
+    it('requires password confirmation for deletion', () => {
+      cy.visit('/settings/privacy')
+      cy.getByTestId('delete-account-button').click()
+
+      // Password field should be required
+      cy.getByTestId('delete-confirm-password').should('exist')
+    })
+
+    it('deletes account when confirmed', () => {
+      cy.visit('/settings/privacy')
+      cy.getByTestId('delete-account-button').click()
+      cy.getByTestId('delete-confirm-password').type(testPassword)
+      cy.getByTestId('delete-confirm-button').click()
+
+      // Should redirect to login or home
+      cy.url().should('match', /\/(login|home)?$/)
+    })
+  })
+{{- end}}
+})
+{{- end}}

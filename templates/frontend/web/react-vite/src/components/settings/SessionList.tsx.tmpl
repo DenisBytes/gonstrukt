@@ -1,0 +1,145 @@
+import type { Session } from '../../lib/types/auth'
+{{- if .HasShadcn}}
+import { Button } from '../ui/button'
+import { Laptop, Smartphone, Monitor } from 'lucide-react'
+
+interface SessionListProps {
+  sessions: Session[]
+  isLoading: boolean
+  onRevoke: (sessionId: string) => void
+}
+
+function getDeviceIcon(userAgent: string) {
+  const ua = userAgent.toLowerCase()
+  if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
+    return <Smartphone className="h-5 w-5" />
+  }
+  if (ua.includes('tablet') || ua.includes('ipad')) {
+    return <Laptop className="h-5 w-5" />
+  }
+  return <Monitor className="h-5 w-5" />
+}
+
+export function SessionList({ sessions, isLoading, onRevoke }: SessionListProps) {
+  if (isLoading) {
+    return <div className="text-center py-4">Loading sessions...</div>
+  }
+
+  if (sessions.length === 0) {
+    return <div className="text-center py-4 text-muted-foreground">No active sessions</div>
+  }
+
+  return (
+    <div className="space-y-3">
+      {sessions.map((session) => (
+        <div
+          key={session.id}
+          className="flex items-center justify-between p-3 border rounded-lg"
+        >
+          <div className="flex items-center gap-3">
+            <div className="text-muted-foreground">
+              {getDeviceIcon(session.user_agent)}
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium">
+                  {session.user_agent.split(' ')[0] || 'Unknown Device'}
+                </p>
+                {session.is_current && (
+                  <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded">
+                    Current
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {session.ip_address} • Last active {new Date(session.last_active_at).toLocaleDateString()}
+              </p>
+            </div>
+          </div>
+          {!session.is_current && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onRevoke(session.id)}
+            >
+              Revoke
+            </Button>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+{{- else}}
+import { Button } from 'baseui/button'
+import { styled } from 'baseui'
+import { ParagraphSmall, LabelSmall } from 'baseui/typography'
+
+const Container = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '12px',
+})
+
+const SessionItem = styled('div', {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  padding: '12px',
+  border: '1px solid #e0e0e0',
+  borderRadius: '8px',
+})
+
+const SessionInfo = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+})
+
+const CurrentBadge = styled('span', {
+  fontSize: '10px',
+  backgroundColor: '#d4edda',
+  color: '#155724',
+  padding: '2px 8px',
+  borderRadius: '4px',
+  marginLeft: '8px',
+})
+
+interface SessionListProps {
+  sessions: Session[]
+  isLoading: boolean
+  onRevoke: (sessionId: string) => void
+}
+
+export function SessionList({ sessions, isLoading, onRevoke }: SessionListProps) {
+  if (isLoading) {
+    return <ParagraphSmall>Loading sessions...</ParagraphSmall>
+  }
+
+  if (sessions.length === 0) {
+    return <ParagraphSmall color="contentSecondary">No active sessions</ParagraphSmall>
+  }
+
+  return (
+    <Container>
+      {sessions.map((session) => (
+        <SessionItem key={session.id}>
+          <SessionInfo>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <LabelSmall>{session.user_agent.split(' ')[0] || 'Unknown Device'}</LabelSmall>
+              {session.is_current && <CurrentBadge>Current</CurrentBadge>}
+            </div>
+            <ParagraphSmall marginTop="4px" marginBottom="0" color="contentSecondary">
+              {session.ip_address} • Last active {new Date(session.last_active_at).toLocaleDateString()}
+            </ParagraphSmall>
+          </SessionInfo>
+          {!session.is_current && (
+            <Button kind="tertiary" size="compact" onClick={() => onRevoke(session.id)}>
+              Revoke
+            </Button>
+          )}
+        </SessionItem>
+      ))}
+    </Container>
+  )
+}
+{{- end}}

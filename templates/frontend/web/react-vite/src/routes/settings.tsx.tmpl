@@ -1,0 +1,134 @@
+import { NavLink, Outlet } from 'react-router-dom'
+{{- if .HasShadcn}}
+import { cn } from '../lib/utils'
+
+const navItems = [
+  { to: 'profile', label: 'Profile' },
+  { to: 'security', label: 'Security' },
+{{- if .HasGDPR}}
+  { to: 'privacy', label: 'Privacy' },
+{{- end}}
+]
+
+export function SettingsPage() {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
+        <p className="text-gray-600">Manage your account settings</p>
+      </div>
+
+      <div className="flex flex-col md:flex-row gap-8">
+        <nav className="flex flex-row md:flex-col gap-2 md:w-48 flex-shrink-0">
+          {navItems.map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              className={({ isActive }) =>
+                cn(
+                  'px-3 py-2 rounded-md text-sm font-medium transition-colors',
+                  isActive
+                    ? 'bg-gray-100 text-gray-900'
+                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                )
+              }
+            >
+              {item.label}
+            </NavLink>
+          ))}
+        </nav>
+
+        <div className="flex-1">
+          <Outlet />
+        </div>
+      </div>
+    </div>
+  )
+}
+{{- else}}
+import { styled } from 'baseui'
+import { HeadingMedium, ParagraphSmall } from 'baseui/typography'
+
+const Container = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '24px',
+})
+
+const Layout = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '32px',
+  '@media (min-width: 768px)': {
+    flexDirection: 'row',
+  },
+})
+
+const Nav = styled('nav', {
+  display: 'flex',
+  flexDirection: 'row',
+  gap: '8px',
+  '@media (min-width: 768px)': {
+    flexDirection: 'column',
+    width: '200px',
+    flexShrink: 0,
+  },
+})
+
+const NavItem = styled(NavLink, ({ $isActive }: { $isActive?: boolean }) => ({
+  padding: '8px 12px',
+  borderRadius: '4px',
+  fontSize: '14px',
+  fontWeight: '500',
+  textDecoration: 'none',
+  transition: 'all 0.15s',
+  backgroundColor: $isActive ? '#f0f0f0' : 'transparent',
+  color: $isActive ? '#000' : '#666',
+  ':hover': {
+    backgroundColor: $isActive ? '#f0f0f0' : '#f7f7f7',
+    color: '#000',
+  },
+}))
+
+const Content = styled('div', {
+  flex: 1,
+})
+
+const navItems = [
+  { to: 'profile', label: 'Profile' },
+  { to: 'security', label: 'Security' },
+{{- if .HasGDPR}}
+  { to: 'privacy', label: 'Privacy' },
+{{- end}}
+]
+
+export function SettingsPage() {
+  return (
+    <Container>
+      <div>
+        <HeadingMedium marginTop="0" marginBottom="8px">Settings</HeadingMedium>
+        <ParagraphSmall color="contentSecondary">
+          Manage your account settings
+        </ParagraphSmall>
+      </div>
+
+      <Layout>
+        <Nav>
+          {navItems.map((item) => (
+            <NavItem
+              key={item.to}
+              to={item.to}
+            >
+              {item.label}
+            </NavItem>
+          ))}
+        </Nav>
+
+        <Content>
+          <Outlet />
+        </Content>
+      </Layout>
+    </Container>
+  )
+}
+{{- end}}

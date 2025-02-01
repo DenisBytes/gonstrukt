@@ -1,0 +1,176 @@
+{{- if .HasOAuth}}
+import { useState } from 'react'
+import { toast } from 'sonner'
+import { oauthApi } from '../../lib/api/auth'
+{{- if .HasShadcn}}
+import { Button } from '../ui/button'
+
+export function OAuthButtons() {
+  const [loading, setLoading] = useState<string | null>(null)
+
+{{- if .HasGoogleOAuth}}
+  const handleGoogle = async () => {
+    setLoading('google')
+    try {
+      const { url } = await oauthApi.getGoogleAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Google login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+{{- if .HasMicrosoftOAuth}}
+  const handleMicrosoft = async () => {
+    setLoading('microsoft')
+    try {
+      const { url } = await oauthApi.getMicrosoftAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Microsoft login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+{{- if .HasAppleOAuth}}
+  const handleApple = async () => {
+    setLoading('apple')
+    try {
+      const { url } = await oauthApi.getAppleAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Apple login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+  return (
+    <div className="flex flex-col gap-2">
+{{- if .HasGoogleOAuth}}
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={handleGoogle}
+        disabled={loading !== null}
+      >
+        {loading === 'google' ? 'Redirecting...' : 'Continue with Google'}
+      </Button>
+{{- end}}
+{{- if .HasMicrosoftOAuth}}
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={handleMicrosoft}
+        disabled={loading !== null}
+      >
+        {loading === 'microsoft' ? 'Redirecting...' : 'Continue with Microsoft'}
+      </Button>
+{{- end}}
+{{- if .HasAppleOAuth}}
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={handleApple}
+        disabled={loading !== null}
+      >
+        {loading === 'apple' ? 'Redirecting...' : 'Continue with Apple'}
+      </Button>
+{{- end}}
+    </div>
+  )
+}
+{{- else}}
+import { Button } from 'baseui/button'
+import { styled } from 'baseui'
+
+const Container = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '8px',
+})
+
+export function OAuthButtons() {
+  const [loading, setLoading] = useState<string | null>(null)
+
+{{- if .HasGoogleOAuth}}
+  const handleGoogle = async () => {
+    setLoading('google')
+    try {
+      const { url } = await oauthApi.getGoogleAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Google login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+{{- if .HasMicrosoftOAuth}}
+  const handleMicrosoft = async () => {
+    setLoading('microsoft')
+    try {
+      const { url } = await oauthApi.getMicrosoftAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Microsoft login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+{{- if .HasAppleOAuth}}
+  const handleApple = async () => {
+    setLoading('apple')
+    try {
+      const { url } = await oauthApi.getAppleAuthUrl()
+      window.location.href = url
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to start Apple login')
+      setLoading(null)
+    }
+  }
+{{- end}}
+
+  return (
+    <Container>
+{{- if .HasGoogleOAuth}}
+      <Button
+        kind="secondary"
+        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        onClick={handleGoogle}
+        isLoading={loading === 'google'}
+        disabled={loading !== null}
+      >
+        Continue with Google
+      </Button>
+{{- end}}
+{{- if .HasMicrosoftOAuth}}
+      <Button
+        kind="secondary"
+        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        onClick={handleMicrosoft}
+        isLoading={loading === 'microsoft'}
+        disabled={loading !== null}
+      >
+        Continue with Microsoft
+      </Button>
+{{- end}}
+{{- if .HasAppleOAuth}}
+      <Button
+        kind="secondary"
+        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        onClick={handleApple}
+        isLoading={loading === 'apple'}
+        disabled={loading !== null}
+      >
+        Continue with Apple
+      </Button>
+{{- end}}
+    </Container>
+  )
+}
+{{- end}}
+{{- end}}

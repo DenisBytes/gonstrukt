@@ -1,0 +1,177 @@
+import { http, HttpResponse } from 'msw'
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080'
+
+export const handlers = [
+  // Login endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/login`, async ({ request }) => {
+    const body = await request.json() as { email: string; password: string }
+
+    if (body.email === 'test@example.com' && body.password === 'password123') {
+      return HttpResponse.json({
+        user: {
+          id: '1',
+          email: 'test@example.com',
+          name: 'Test User',
+        },
+        access_token: 'mock-access-token',
+        refresh_token: 'mock-refresh-token',
+      })
+    }
+
+    return HttpResponse.json(
+      { error: 'Invalid credentials' },
+      { status: 401 }
+    )
+  }),
+
+  // Register endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/register`, async ({ request }) => {
+    const body = await request.json() as { email: string; password: string; name: string }
+
+    if (body.email === 'existing@example.com') {
+      return HttpResponse.json(
+        { error: 'Email already exists' },
+        { status: 409 }
+      )
+    }
+
+    return HttpResponse.json({
+      user: {
+        id: '2',
+        email: body.email,
+        name: body.name,
+      },
+      access_token: 'mock-access-token',
+      refresh_token: 'mock-refresh-token',
+    })
+  }),
+
+  // Current user endpoint
+  http.get(`${API_BASE_URL}/api/v1/auth/me`, ({ request }) => {
+    const authHeader = request.headers.get('Authorization')
+
+    if (authHeader === 'Bearer mock-access-token') {
+      return HttpResponse.json({
+        id: '1',
+        email: 'test@example.com',
+        name: 'Test User',
+      })
+    }
+
+    return HttpResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401 }
+    )
+  }),
+
+  // Logout endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/logout`, () => {
+    return HttpResponse.json({ message: 'Logged out successfully' })
+  }),
+
+  // Refresh token endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/refresh`, async ({ request }) => {
+    const body = await request.json() as { refresh_token: string }
+
+    if (body.refresh_token === 'mock-refresh-token') {
+      return HttpResponse.json({
+        access_token: 'new-mock-access-token',
+        refresh_token: 'new-mock-refresh-token',
+      })
+    }
+
+    return HttpResponse.json(
+      { error: 'Invalid refresh token' },
+      { status: 401 }
+    )
+  }),
+
+  // Sessions endpoint
+  http.get(`${API_BASE_URL}/api/v1/auth/sessions`, () => {
+    return HttpResponse.json({
+      sessions: [
+        {
+          id: 'session-1',
+          device: 'Chrome on Windows',
+          ip_address: '192.168.1.1',
+          created_at: new Date().toISOString(),
+          is_current: true,
+        },
+        {
+          id: 'session-2',
+          device: 'Safari on macOS',
+          ip_address: '192.168.1.2',
+          created_at: new Date(Date.now() - 86400000).toISOString(),
+          is_current: false,
+        },
+      ],
+    })
+  }),
+
+  // Revoke session endpoint
+  http.delete(`${API_BASE_URL}/api/v1/auth/sessions/:sessionId`, () => {
+    return HttpResponse.json({ message: 'Session revoked' })
+  }),
+
+{{- if .EnableMFA}}
+  // MFA setup endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/mfa/setup`, () => {
+    return HttpResponse.json({
+      secret: 'MOCK-MFA-SECRET',
+      qr_code: 'data:image/png;base64,mockQRCode',
+      backup_codes: ['code1', 'code2', 'code3', 'code4', 'code5'],
+    })
+  }),
+
+  // MFA verify endpoint
+  http.post(`${API_BASE_URL}/api/v1/auth/mfa/verify`, async ({ request }) => {
+    const body = await request.json() as { code: string }
+
+    if (body.code === '123456') {
+      return HttpResponse.json({ verified: true })
+    }
+
+    return HttpResponse.json(
+      { error: 'Invalid code' },
+      { status: 400 }
+    )
+  }),
+{{- end}}
+
+{{- if .HasGDPR}}
+  // GDPR consents endpoint
+  http.get(`${API_BASE_URL}/api/v1/gdpr/consents`, () => {
+    return HttpResponse.json({
+      consents: [
+        { type: 'marketing', granted: false, updated_at: new Date().toISOString() },
+        { type: 'analytics', granted: true, updated_at: new Date().toISOString() },
+      ],
+    })
+  }),
+
+  // Update consent endpoint
+  http.put(`${API_BASE_URL}/api/v1/gdpr/consents/:type`, async ({ params, request }) => {
+    const body = await request.json() as { granted: boolean }
+    return HttpResponse.json({
+      type: params.type,
+      granted: body.granted,
+      updated_at: new Date().toISOString(),
+    })
+  }),
+
+  // Export data endpoint
+  http.post(`${API_BASE_URL}/api/v1/gdpr/export`, () => {
+    return HttpResponse.json({
+      message: 'Export request submitted. You will receive an email with your data.',
+    })
+  }),
+
+  // Delete account endpoint
+  http.post(`${API_BASE_URL}/api/v1/gdpr/delete`, () => {
+    return HttpResponse.json({
+      message: 'Account deletion request submitted.',
+    })
+  }),
+{{- end}}
+]

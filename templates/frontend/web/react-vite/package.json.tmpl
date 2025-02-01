@@ -1,0 +1,92 @@
+{
+  "name": "{{.ProjectName}}-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage"{{if or .HasCypress .HasPlaywright}},
+{{- if .HasCypress}}
+    "test:e2e": "cypress run",
+    "test:e2e:open": "cypress open"
+{{- end}}
+{{- if .HasPlaywright}}
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
+{{- end}}
+{{- end}}
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "react-hook-form": "^7.53.0",
+    "@hookform/resolvers": "^3.9.0",
+    "zod": "^3.23.8",
+{{- if .HasTanStackQuery}}
+    "@tanstack/react-query": "^5.59.0",
+    "@tanstack/react-query-devtools": "^5.59.0",
+    "zustand": "^5.0.0",
+{{- end}}
+{{- if .HasRedux}}
+    "@reduxjs/toolkit": "^2.3.0",
+    "react-redux": "^9.1.2",
+{{- end}}
+{{- if .HasShadcn}}
+    "tailwindcss": "^3.4.14",
+    "tailwind-merge": "^2.5.4",
+    "clsx": "^2.1.1",
+    "class-variance-authority": "^0.7.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-dialog": "^1.1.2",
+    "@radix-ui/react-dropdown-menu": "^2.1.2",
+    "@radix-ui/react-label": "^2.1.0",
+    "@radix-ui/react-toast": "^1.2.2",
+    "@radix-ui/react-switch": "^1.1.1",
+    "lucide-react": "^0.454.0",
+{{- end}}
+{{- if .HasBaseUI}}
+    "baseui": "^14.0.0",
+    "styletron-engine-monolithic": "^1.0.0",
+    "styletron-react": "^6.1.1",
+{{- end}}
+{{- if .EnableMFA}}
+    "qrcode.react": "^4.1.0",
+{{- end}}
+{{- if .HasPostHog}}
+    "posthog-js": "^1.187.0",
+{{- end}}
+{{- if .HasSentry}}
+    "@sentry/react": "^8.40.0",
+{{- end}}
+    "sonner": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10",
+    "eslint": "^9.13.0",
+    "@eslint/js": "^9.13.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.14",
+    "globals": "^15.11.0",
+    "typescript-eslint": "^8.10.0",
+    "vitest": "^2.1.0",
+    "@testing-library/react": "^16.0.0",
+    "@testing-library/jest-dom": "^6.6.0",
+    "@testing-library/user-event": "^14.5.0",
+    "jsdom": "^25.0.0",
+    "msw": "^2.6.0"{{if .HasShadcn}},
+    "postcss": "^8.4.47",
+    "autoprefixer": "^10.4.20"{{end}}{{if .HasCypress}},
+    "cypress": "^13.15.0"{{end}}{{if .HasPlaywright}},
+    "@playwright/test": "^1.48.0"{{end}}
+  }
+}

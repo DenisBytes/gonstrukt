@@ -1,0 +1,138 @@
+{{- if .HasGDPR}}
+import { useState } from 'react'
+import { toast } from 'sonner'
+{{- if .HasGDPRConsent}}
+import { ConsentManager } from '../../components/settings/ConsentManager'
+{{- end}}
+{{- if .HasGDPRDataExport}}
+import { useDataExport } from '../../lib/hooks/use-gdpr'
+{{- end}}
+{{- if .HasGDPRDataDeletion}}
+import { DeleteAccount } from '../../components/settings/DeleteAccount'
+{{- end}}
+{{- if .HasShadcn}}
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card'
+import { Button } from '../../components/ui/button'
+{{- else}}
+import { Card, StyledBody } from 'baseui/card'
+import { Button } from 'baseui/button'
+import { HeadingSmall, ParagraphSmall } from 'baseui/typography'
+import { styled } from 'baseui'
+
+const Section = styled('div', {
+  marginBottom: '24px',
+})
+{{- end}}
+
+export function PrivacyPage() {
+{{- if .HasGDPRDataExport}}
+  const { requestExport, isLoading: exportLoading } = useDataExport()
+
+  const handleExport = async () => {
+    try {
+      const result = await requestExport({ format: 'json' })
+      if (result.download_url) {
+        window.open(result.download_url, '_blank')
+      }
+      toast.success('Data export ready for download')
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to export data')
+    }
+  }
+{{- end}}
+
+  return (
+    <div className="space-y-6">
+{{- if .HasShadcn}}
+{{- if .HasGDPRConsent}}
+      <Card>
+        <CardHeader>
+          <CardTitle>Privacy Consents</CardTitle>
+          <CardDescription>
+            Manage how we use your data
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <ConsentManager />
+        </CardContent>
+      </Card>
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+      <Card>
+        <CardHeader>
+          <CardTitle>Export Your Data</CardTitle>
+          <CardDescription>
+            Download a copy of all your data
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground mb-4">
+            Request a copy of all data we have stored about you. The export will be prepared and you'll receive a download link.
+          </p>
+          <Button onClick={handleExport} disabled={exportLoading}>
+            {exportLoading ? 'Preparing...' : 'Export Data'}
+          </Button>
+        </CardContent>
+      </Card>
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+      <Card>
+        <CardHeader>
+          <CardTitle>Delete Account</CardTitle>
+          <CardDescription>
+            Permanently delete your account and all associated data
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <DeleteAccount />
+        </CardContent>
+      </Card>
+{{- end}}
+{{- else}}
+{{- if .HasGDPRConsent}}
+      <Section>
+        <Card title="Privacy Consents">
+          <StyledBody>
+            <ParagraphSmall marginTop="0">
+              Manage how we use your data
+            </ParagraphSmall>
+            <ConsentManager />
+          </StyledBody>
+        </Card>
+      </Section>
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+      <Section>
+        <Card title="Export Your Data">
+          <StyledBody>
+            <ParagraphSmall marginTop="0" marginBottom="16px">
+              Request a copy of all data we have stored about you. The export will be prepared and you'll receive a download link.
+            </ParagraphSmall>
+            <Button onClick={handleExport} isLoading={exportLoading}>
+              Export Data
+            </Button>
+          </StyledBody>
+        </Card>
+      </Section>
+{{- end}}
+
+{{- if .HasGDPRDataDeletion}}
+      <Section>
+        <Card title="Delete Account">
+          <StyledBody>
+            <ParagraphSmall marginTop="0" marginBottom="16px">
+              Permanently delete your account and all associated data
+            </ParagraphSmall>
+            <DeleteAccount />
+          </StyledBody>
+        </Card>
+      </Section>
+{{- end}}
+{{- end}}
+    </div>
+  )
+}
+{{- end}}

@@ -1,0 +1,50 @@
+import { Outlet } from 'react-router-dom'
+{{- if .HasShadcn}}
+
+export function AuthLayout() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md w-full space-y-8">
+        <div className="text-center">
+          <h1 className="text-3xl font-bold text-gray-900">{{.ProjectName}}</h1>
+        </div>
+        <Outlet />
+      </div>
+    </div>
+  )
+}
+{{- else}}
+import { styled } from 'baseui'
+
+const Container = styled('div', {
+  minHeight: '100vh',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  backgroundColor: '#f7f7f7',
+  padding: '48px 16px',
+})
+
+const Content = styled('div', {
+  maxWidth: '400px',
+  width: '100%',
+})
+
+const Title = styled('h1', {
+  fontSize: '24px',
+  fontWeight: 'bold',
+  textAlign: 'center',
+  marginBottom: '32px',
+})
+
+export function AuthLayout() {
+  return (
+    <Container>
+      <Content>
+        <Title>{{.ProjectName}}</Title>
+        <Outlet />
+      </Content>
+    </Container>
+  )
+}
+{{- end}}

@@ -1,0 +1,13 @@
+{{- if .HasShadcn}}
+import { type ClassValue, clsx } from 'clsx'
+import { twMerge } from 'tailwind-merge'
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+{{- else}}
+// Utility functions for {{.ProjectName}}
+export function formatDate(date: string | Date): string {
+  return new Date(date).toLocaleDateString()
+}
+{{- end}}

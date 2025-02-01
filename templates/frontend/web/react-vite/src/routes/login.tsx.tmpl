@@ -1,0 +1,127 @@
+import { useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { toast } from 'sonner'
+import { useAuth } from '../lib/hooks/use-auth'
+import { LoginForm } from '../components/auth/LoginForm'
+{{- if .HasOAuth}}
+import { OAuthButtons } from '../components/auth/OAuthButtons'
+{{- end}}
+{{- if .HasShadcn}}
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../components/ui/card'
+{{- else}}
+import { Card, StyledBody } from 'baseui/card'
+import { styled } from 'baseui'
+import { ParagraphSmall } from 'baseui/typography'
+
+const StyledLink = styled(Link, {
+  color: '#276EF1',
+  textDecoration: 'none',
+  ':hover': {
+    textDecoration: 'underline',
+  },
+})
+
+const Footer = styled('div', {
+  textAlign: 'center',
+  marginTop: '16px',
+})
+{{- end}}
+
+const loginSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(1, 'Password is required'),
+})
+
+type LoginFormData = z.infer<typeof loginSchema>
+
+export function LoginPage() {
+  const navigate = useNavigate()
+  const { login } = useAuth()
+  const [isLoading, setIsLoading] = useState(false)
+
+  const form = useForm<LoginFormData>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: {
+      email: '',
+      password: '',
+    },
+  })
+
+  const onSubmit = async (data: LoginFormData) => {
+    setIsLoading(true)
+    try {
+      const response = await login(data)
+{{- if .EnableMFA}}
+      if (response.mfa_required) {
+        navigate('/mfa/verify')
+        return
+      }
+{{- end}}
+      toast.success('Welcome back!')
+      navigate('/')
+    } catch (error: any) {
+      toast.error(error.message || 'Login failed')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+{{- if .HasShadcn}}
+    <Card>
+      <CardHeader className="space-y-1">
+        <CardTitle className="text-2xl">Sign in</CardTitle>
+        <CardDescription>Enter your credentials to access your account</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+{{- if .HasOAuth}}
+        <OAuthButtons />
+        <div className="relative">
+          <div className="absolute inset-0 flex items-center">
+            <span className="w-full border-t" />
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-background px-2 text-muted-foreground">Or continue with</span>
+          </div>
+        </div>
+{{- end}}
+        <LoginForm form={form} onSubmit={onSubmit} isLoading={isLoading} />
+      </CardContent>
+      <CardFooter className="flex flex-col space-y-2">
+        <Link to="/forgot-password" className="text-sm text-muted-foreground hover:underline">
+          Forgot password?
+        </Link>
+        <div className="text-sm text-muted-foreground">
+          Don't have an account?{' '}
+          <Link to="/register" className="text-primary hover:underline">
+            Sign up
+          </Link>
+        </div>
+      </CardFooter>
+    </Card>
+{{- else}}
+    <Card>
+      <StyledBody>
+{{- if .HasOAuth}}
+        <OAuthButtons />
+        <div style={{ textAlign: 'center', margin: '16px 0', color: '#666' }}>
+          Or continue with email
+        </div>
+{{- end}}
+        <LoginForm form={form} onSubmit={onSubmit} isLoading={isLoading} />
+        <Footer>
+          <ParagraphSmall>
+            <StyledLink to="/forgot-password">Forgot password?</StyledLink>
+          </ParagraphSmall>
+          <ParagraphSmall>
+            Don't have an account? <StyledLink to="/register">Sign up</StyledLink>
+          </ParagraphSmall>
+        </Footer>
+      </StyledBody>
+    </Card>
+{{- end}}
+  )
+}

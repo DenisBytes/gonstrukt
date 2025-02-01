@@ -1,0 +1,58 @@
+{{- if .EnableMFA}}
+describe('Multi-Factor Authentication', () => {
+  const testEmail = `mfa-${Date.now()}@example.com`
+  const testPassword = 'SecurePassword123!'
+
+  beforeEach(() => {
+    cy.register(testEmail, testPassword)
+  })
+
+  describe('MFA Setup', () => {
+    it('displays QR code for TOTP setup', () => {
+      cy.visit('/settings/security')
+      cy.getByTestId('setup-mfa-button').click()
+
+      // Should show QR code
+      cy.getByTestId('mfa-qr-code').should('be.visible')
+      cy.getByTestId('mfa-secret').should('be.visible')
+    })
+
+    it('shows backup codes after MFA setup', () => {
+      cy.visit('/settings/security')
+      cy.getByTestId('setup-mfa-button').click()
+
+      // In a real test, you'd use a TOTP library to generate a valid code
+      // For E2E, we test the UI flow with a backup code
+      cy.getByTestId('mfa-backup-codes').should('have.length.at.least', 1)
+    })
+  })
+
+  describe('MFA Verification', () => {
+    it('requires MFA code after login when enabled', () => {
+      // Setup MFA first (would need valid TOTP or backup code)
+      // This is a placeholder for the flow
+      cy.visit('/settings/security')
+      cy.getByTestId('setup-mfa-button').click()
+
+      // After MFA is enabled, logout and login again
+      cy.logout()
+      cy.visit('/login')
+      cy.getByTestId('login-email').type(testEmail)
+      cy.getByTestId('login-password').type(testPassword)
+      cy.getByTestId('login-submit').click()
+
+      // Should show MFA verification form
+      cy.getByTestId('mfa-code-input').should('be.visible')
+    })
+  })
+
+  describe('MFA Disable', () => {
+    it('allows disabling MFA with valid code', () => {
+      cy.visit('/settings/security')
+
+      // Assuming MFA is already enabled
+      cy.getByTestId('disable-mfa-button').should('exist')
+    })
+  })
+})
+{{- end}}

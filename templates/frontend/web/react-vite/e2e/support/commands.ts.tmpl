@@ -1,0 +1,56 @@
+/// <reference types="cypress" />
+
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      /**
+       * Register a new user
+       */
+      register(email: string, password: string, firstName?: string, lastName?: string): Chainable<void>
+
+      /**
+       * Login with email and password
+       */
+      login(email: string, password: string): Chainable<void>
+
+      /**
+       * Logout the current user
+       */
+      logout(): Chainable<void>
+
+      /**
+       * Get an element by data-testid attribute
+       */
+      getByTestId(testId: string): Chainable<JQuery<HTMLElement>>
+    }
+  }
+}
+
+Cypress.Commands.add('register', (email: string, password: string, firstName = 'Test', lastName = 'User') => {
+  cy.visit('/register')
+  cy.getByTestId('register-email').type(email)
+  cy.getByTestId('register-password').type(password)
+  cy.getByTestId('register-first-name').type(firstName)
+  cy.getByTestId('register-last-name').type(lastName)
+  cy.getByTestId('register-submit').click()
+  cy.url().should('not.include', '/register')
+})
+
+Cypress.Commands.add('login', (email: string, password: string) => {
+  cy.visit('/login')
+  cy.getByTestId('login-email').type(email)
+  cy.getByTestId('login-password').type(password)
+  cy.getByTestId('login-submit').click()
+  cy.url().should('not.include', '/login')
+})
+
+Cypress.Commands.add('logout', () => {
+  cy.getByTestId('logout-button').click()
+  cy.url().should('include', '/login')
+})
+
+Cypress.Commands.add('getByTestId', (testId: string) => {
+  return cy.get(`[data-testid="${testId}"]`)
+})
+
+export {}

@@ -1,0 +1,103 @@
+import { useAuth } from '../lib/hooks/use-auth'
+{{- if .HasShadcn}}
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+
+export function DashboardPage() {
+  const { user } = useAuth()
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
+        <p className="text-gray-600">Welcome back, {user?.name || user?.email}!</p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <Card>
+          <CardHeader>
+            <CardTitle>Account Status</CardTitle>
+            <CardDescription>Your account information</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              <p className="text-sm">
+                <span className="font-medium">Email:</span> {user?.email}
+              </p>
+              <p className="text-sm">
+                <span className="font-medium">Member since:</span>{' '}
+                {user?.created_at ? new Date(user.created_at).toLocaleDateString() : 'N/A'}
+              </p>
+{{- if .EnableMFA}}
+              <p className="text-sm">
+                <span className="font-medium">MFA:</span>{' '}
+                {user?.mfa_enabled ? (
+                  <span className="text-green-600">Enabled</span>
+                ) : (
+                  <span className="text-yellow-600">Disabled</span>
+                )}
+              </p>
+{{- end}}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  )
+}
+{{- else}}
+import { styled } from 'baseui'
+import { Card, StyledBody } from 'baseui/card'
+import { HeadingMedium, ParagraphSmall } from 'baseui/typography'
+
+const Container = styled('div', {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '24px',
+})
+
+const Grid = styled('div', {
+  display: 'grid',
+  gap: '16px',
+  '@media (min-width: 768px)': {
+    gridTemplateColumns: 'repeat(2, 1fr)',
+  },
+  '@media (min-width: 1024px)': {
+    gridTemplateColumns: 'repeat(3, 1fr)',
+  },
+})
+
+export function DashboardPage() {
+  const { user } = useAuth()
+
+  return (
+    <Container>
+      <div>
+        <HeadingMedium marginTop="0" marginBottom="8px">Dashboard</HeadingMedium>
+        <ParagraphSmall color="contentSecondary">
+          Welcome back, {user?.name || user?.email}!
+        </ParagraphSmall>
+      </div>
+
+      <Grid>
+        <Card title="Account Status">
+          <StyledBody>
+            <ParagraphSmall>
+              <strong>Email:</strong> {user?.email}
+            </ParagraphSmall>
+            <ParagraphSmall>
+              <strong>Member since:</strong>{' '}
+              {user?.created_at ? new Date(user.created_at).toLocaleDateString() : 'N/A'}
+            </ParagraphSmall>
+{{- if .EnableMFA}}
+            <ParagraphSmall>
+              <strong>MFA:</strong>{' '}
+              {user?.mfa_enabled ? 'Enabled' : 'Disabled'}
+            </ParagraphSmall>
+{{- end}}
+          </StyledBody>
+        </Card>
+      </Grid>
+    </Container>
+  )
+}
+{{- end}}

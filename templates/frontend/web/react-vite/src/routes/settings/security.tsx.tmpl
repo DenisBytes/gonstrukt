@@ -1,0 +1,158 @@
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { toast } from 'sonner'
+{{- if .EnableMFA}}
+import { Link } from 'react-router-dom'
+{{- end}}
+import { useAuth } from '../../lib/hooks/use-auth'
+import { useSessions } from '../../lib/hooks/use-sessions'
+import { authApi } from '../../lib/api/auth'
+import { SessionList } from '../../components/settings/SessionList'
+import { PasswordChange } from '../../components/settings/PasswordChange'
+{{- if .HasShadcn}}
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card'
+import { Button } from '../../components/ui/button'
+{{- if .EnableMFA}}
+import { Switch } from '../../components/ui/switch'
+import { Label } from '../../components/ui/label'
+{{- end}}
+{{- else}}
+import { Card, StyledBody } from 'baseui/card'
+import { Button } from 'baseui/button'
+import { HeadingSmall, ParagraphSmall } from 'baseui/typography'
+{{- if .EnableMFA}}
+import { Checkbox, STYLE_TYPE } from 'baseui/checkbox'
+{{- end}}
+import { styled } from 'baseui'
+
+const Section = styled('div', {
+  marginBottom: '24px',
+})
+{{- end}}
+
+export function SecurityPage() {
+  const { user } = useAuth()
+  const { sessions, isLoading: sessionsLoading, revokeSession, revokeAllSessions } = useSessions()
+
+  return (
+    <div className="space-y-6">
+{{- if .HasShadcn}}
+{{- if .EnableMFA}}
+      <Card>
+        <CardHeader>
+          <CardTitle>Two-Factor Authentication</CardTitle>
+          <CardDescription>
+            Add an extra layer of security to your account
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label>MFA Status</Label>
+              <p className="text-sm text-muted-foreground">
+                {user?.mfa_enabled
+                  ? 'Two-factor authentication is enabled'
+                  : 'Two-factor authentication is disabled'}
+              </p>
+            </div>
+            <Link to="/mfa/setup">
+              <Button variant={user?.mfa_enabled ? 'outline' : 'default'}>
+                {user?.mfa_enabled ? 'Manage' : 'Enable'}
+              </Button>
+            </Link>
+          </div>
+        </CardContent>
+      </Card>
+{{- end}}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Change Password</CardTitle>
+          <CardDescription>Update your password regularly for security</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <PasswordChange />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Active Sessions</CardTitle>
+              <CardDescription>Manage your active sessions across devices</CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => revokeAllSessions()}
+            >
+              Revoke All
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <SessionList
+            sessions={sessions}
+            isLoading={sessionsLoading}
+            onRevoke={revokeSession}
+          />
+        </CardContent>
+      </Card>
+{{- else}}
+{{- if .EnableMFA}}
+      <Section>
+        <Card title="Two-Factor Authentication">
+          <StyledBody>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <ParagraphSmall marginTop="0" marginBottom="0">
+                  {user?.mfa_enabled
+                    ? 'Two-factor authentication is enabled'
+                    : 'Two-factor authentication is disabled'}
+                </ParagraphSmall>
+              </div>
+              <Link to="/mfa/setup">
+                <Button kind={user?.mfa_enabled ? 'secondary' : 'primary'} size="compact">
+                  {user?.mfa_enabled ? 'Manage' : 'Enable'}
+                </Button>
+              </Link>
+            </div>
+          </StyledBody>
+        </Card>
+      </Section>
+{{- end}}
+
+      <Section>
+        <Card title="Change Password">
+          <StyledBody>
+            <PasswordChange />
+          </StyledBody>
+        </Card>
+      </Section>
+
+      <Section>
+        <Card title="Active Sessions">
+          <StyledBody>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <ParagraphSmall marginTop="0" marginBottom="0">
+                Manage your active sessions across devices
+              </ParagraphSmall>
+              <Button kind="secondary" size="compact" onClick={() => revokeAllSessions()}>
+                Revoke All
+              </Button>
+            </div>
+            <SessionList
+              sessions={sessions}
+              isLoading={sessionsLoading}
+              onRevoke={revokeSession}
+            />
+          </StyledBody>
+        </Card>
+      </Section>
+{{- end}}
+    </div>
+  )
+}

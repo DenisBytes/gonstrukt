@@ -1,0 +1,125 @@
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { useAuth } from './lib/hooks/use-auth'
+
+// Layouts
+import { AuthLayout } from './components/layout/AuthLayout'
+import { DashboardLayout } from './components/layout/DashboardLayout'
+
+// Auth pages
+import { LoginPage } from './routes/login'
+import { RegisterPage } from './routes/register'
+import { ForgotPasswordPage } from './routes/forgot-password'
+{{- if .HasOAuth}}
+import { OAuthCallbackPage } from './routes/oauth-callback'
+{{- end}}
+{{- if .EnableMFA}}
+import { MFASetupPage } from './routes/mfa-setup'
+import { MFAVerifyPage } from './routes/mfa-verify'
+{{- end}}
+
+// Dashboard pages
+import { DashboardPage } from './routes/index'
+import { SettingsPage } from './routes/settings'
+import { ProfilePage } from './routes/settings/profile'
+import { SecurityPage } from './routes/settings/security'
+{{- if .HasGDPR}}
+import { PrivacyPage } from './routes/settings/privacy'
+{{- end}}
+
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+      </div>
+    )
+  }
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />
+  }
+
+  return <>{children}</>
+}
+
+function PublicRoute({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+      </div>
+    )
+  }
+
+  if (isAuthenticated) {
+    return <Navigate to="/" replace />
+  }
+
+  return <>{children}</>
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        {/* Public routes */}
+        <Route element={<AuthLayout />}>
+          <Route
+            path="/login"
+            element={
+              <PublicRoute>
+                <LoginPage />
+              </PublicRoute>
+            }
+          />
+          <Route
+            path="/register"
+            element={
+              <PublicRoute>
+                <RegisterPage />
+              </PublicRoute>
+            }
+          />
+          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+{{- if .HasOAuth}}
+          <Route path="/oauth/callback" element={<OAuthCallbackPage />} />
+{{- end}}
+{{- if .EnableMFA}}
+          <Route path="/mfa/verify" element={<MFAVerifyPage />} />
+{{- end}}
+        </Route>
+
+        {/* Protected routes */}
+        <Route
+          element={
+            <ProtectedRoute>
+              <DashboardLayout />
+            </ProtectedRoute>
+          }
+        >
+          <Route index element={<DashboardPage />} />
+{{- if .EnableMFA}}
+          <Route path="/mfa/setup" element={<MFASetupPage />} />
+{{- end}}
+          <Route path="/settings" element={<SettingsPage />}>
+            <Route index element={<Navigate to="profile" replace />} />
+            <Route path="profile" element={<ProfilePage />} />
+            <Route path="security" element={<SecurityPage />} />
+{{- if .HasGDPR}}
+            <Route path="privacy" element={<PrivacyPage />} />
+{{- end}}
+          </Route>
+        </Route>
+
+        {/* Catch all */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
+  )
+}
+
+export default App
