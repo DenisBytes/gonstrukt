@@ -1,0 +1,124 @@
+import React from 'react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react-native'
+{{- if .HasTanStackQuery}}
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+{{- end}}
+{{- if .HasRedux}}
+import { Provider } from 'react-redux'
+import { store } from '../../../lib/store'
+{{- end}}
+import { LoginForm } from '../../../components/auth/LoginForm'
+
+{{- if .HasTanStackQuery}}
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: false,
+    },
+  },
+})
+{{- end}}
+
+const renderLoginForm = () => {
+  return render(
+{{- if .HasRedux}}
+    <Provider store={store}>
+{{- end}}
+{{- if .HasTanStackQuery}}
+      <QueryClientProvider client={queryClient}>
+{{- end}}
+        <LoginForm />
+{{- if .HasTanStackQuery}}
+      </QueryClientProvider>
+{{- end}}
+{{- if .HasRedux}}
+    </Provider>
+{{- end}}
+  )
+}
+
+describe('LoginForm', () => {
+  beforeEach(() => {
+{{- if .HasTanStackQuery}}
+    queryClient.clear()
+{{- end}}
+  })
+
+  it('renders email and password fields', () => {
+    renderLoginForm()
+
+    expect(screen.getByPlaceholderText(/email/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/password/i)).toBeTruthy()
+  })
+
+  it('renders submit button', () => {
+    renderLoginForm()
+
+    expect(screen.getByRole('button', { name: /sign in|log in/i })).toBeTruthy()
+  })
+
+  it('updates email field on change', () => {
+    renderLoginForm()
+
+    const emailInput = screen.getByPlaceholderText(/email/i)
+    fireEvent.changeText(emailInput, 'test@example.com')
+
+    expect(emailInput.props.value).toBe('test@example.com')
+  })
+
+  it('updates password field on change', () => {
+    renderLoginForm()
+
+    const passwordInput = screen.getByPlaceholderText(/password/i)
+    fireEvent.changeText(passwordInput, 'password123')
+
+    expect(passwordInput.props.value).toBe('password123')
+  })
+
+  it('shows validation error for empty fields on submit', async () => {
+    renderLoginForm()
+
+    const submitButton = screen.getByRole('button', { name: /sign in|log in/i })
+    fireEvent.press(submitButton)
+
+    await waitFor(() => {
+      // Check for validation error messages
+      const errorText = screen.queryByText(/required|please enter/i)
+      expect(errorText).toBeTruthy()
+    })
+  })
+
+  it('submits form with valid credentials', async () => {
+    renderLoginForm()
+
+    const emailInput = screen.getByPlaceholderText(/email/i)
+    const passwordInput = screen.getByPlaceholderText(/password/i)
+
+    fireEvent.changeText(emailInput, 'test@example.com')
+    fireEvent.changeText(passwordInput, 'password123')
+
+    const submitButton = screen.getByRole('button', { name: /sign in|log in/i })
+    fireEvent.press(submitButton)
+
+    // Form should submit without immediate validation errors
+    await waitFor(() => {
+      // The form either navigates away or shows no validation errors
+      const validationError = screen.queryByText(/required/i)
+      expect(validationError).toBeFalsy()
+    })
+  })
+
+  it('has navigation to register', () => {
+    renderLoginForm()
+
+    const registerLink = screen.getByText(/sign up|register|create.*account/i)
+    expect(registerLink).toBeTruthy()
+  })
+
+  it('has navigation to forgot password', () => {
+    renderLoginForm()
+
+    const forgotLink = screen.getByText(/forgot.*password/i)
+    expect(forgotLink).toBeTruthy()
+  })
+})
