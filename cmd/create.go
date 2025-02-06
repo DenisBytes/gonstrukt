@@ -1,275 +1,458 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
 
-	"github.com/DenisBytes/gonstrukt/cmd/types"
+	"github.com/DenisBytes/gonstrukt/internal/config"
+	"github.com/DenisBytes/gonstrukt/internal/generator"
+	"github.com/DenisBytes/gonstrukt/internal/tui"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
 func CreateCmd() *cobra.Command {
-	var config types.ServiceConfig
-	var serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityStr string
+	var (
+		serviceTypeStr    string
+		databaseStr       string
+		cacheStr          string
+		configStr         string
+		rateLimiterStr    string
+		observabilityBool bool
+		interactive       bool
+		oauthProviders    []string
+		enableMFA         bool
+		enableRBAC        bool
+		gdprFeatures      []string
+		emailServiceStr   string
+		authCache         bool
+		frontends         []string
+		webFrameworkStr   string
+		uiLibraryStr      string
+		stateMgmtStr      string
+		enablePostHog     bool
+		enableSentry      bool
+		testInfraStr      string
+		e2eFrameworkStr   string
+	)
 
 	cmd := &cobra.Command{
-		Use:   "create <git_repo_url>",
+		Use:   "create [module]",
 		Short: "Create a new Go service with specified configuration",
-		Long: `Create a new Go service (gateway or auth) with database, caching,
-configuration, observability, and rate limiting options.`,
-		Args:          cobra.ExactArgs(1),
+		Long: `Create a new Go service (gateway, auth, or both) with database, caching,
+configuration, observability, and rate limiting options.
+
+Without flags, launches an interactive TUI wizard to configure the project.
+With flags, creates the project directly without prompts.
+
+Examples:
+  # Interactive mode (TUI wizard)
+  gonstrukt create
+
+  # Non-interactive mode with flags
+  gonstrukt create github.com/user/myproject -s gateway --cache redis -r token-bucket --config yaml
+
+  # Create auth service with PostgreSQL
+  gonstrukt create github.com/user/myauth -s auth -d postgres --config vault
+
+  # Create both services (monorepo)
+  gonstrukt create github.com/user/myapp -s both -d postgres --cache redis -r token-bucket --config vault`,
+		Args:          cobra.MaximumNArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return nil, cobra.ShellCompDirectiveNoFileComp
-		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var validationErrors []error
+			// Determine if we should use interactive mode
+			isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
 
-			if err := validateServiceName(args[0]); err != nil {
-				if errors.Is(err, ErrServiceNameRequired) || errors.Is(err, ErrInvalidServiceName) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("service name validation failed: %w", err))
-				}
-			} else {
-				config.Name = args[0]
+			// If no flags provided and it's a TTY, use interactive mode
+			useInteractive := interactive && isTTY && !hasAnyFlag(cmd)
+
+			if useInteractive {
+				return runInteractive()
 			}
 
-			if err := validateAndSetServiceType(&config, serviceTypeStr); err != nil {
-				if IsMissingRequiredFieldError(err) || IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("service type validation failed: %w", err))
-				}
-			}
-
-			if err := validateAndSetDatabase(&config, databaseStr); err != nil {
-				if IsMissingRequiredFieldError(err) || IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("database validation failed: %w", err))
-				}
-			}
-
-			if err := validateAndSetConfig(&config, configStr); err != nil {
-				if IsMissingRequiredFieldError(err) || IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("config validation failed: %w", err))
-				}
-			}
-
-			if err := validateAndSetCache(&config, cacheStr); err != nil {
-				if IsMissingRequiredFieldError(err) || IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("cache validation failed: %w", err))
-				}
-			}
-
-			if err := validateAndSetRateLimiter(&config, rateLimiterStr); err != nil {
-				if IsMissingRequiredFieldError(err) || IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("rate limiter validation failed: %w", err))
-				}
-			}
-
-			if err := validateAndSetObservability(&config, observabilityStr); err != nil {
-				if IsInvalidOptionError(err) {
-					validationErrors = append(validationErrors, err)
-				} else {
-					validationErrors = append(validationErrors, fmt.Errorf("observability validation failed: %w", err))
-				}
-			}
-
-			if len(validationErrors) > 0 {
-				joinedErr := errors.Join(validationErrors...)
-				usage := cmd.UsageString()
-				return NewCliError(joinedErr, usage)
-			}
-
-			// printServiceConfig(config)
-
-			return nil
+			// Non-interactive mode - validate and run
+			return runNonInteractive(cmd, args, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityBool, oauthProviders, enableMFA, enableRBAC, gdprFeatures, emailServiceStr, authCache, frontends, webFrameworkStr, uiLibraryStr, stateMgmtStr, enablePostHog, enableSentry, testInfraStr, e2eFrameworkStr)
 		},
 	}
 
-	cmd.Flags().StringVarP(&serviceTypeStr, "service-type", "s", "", "Service type (gateway, auth) [required]")
-	cmd.Flags().StringVarP(&databaseStr, "database", "d", "", "Database type (psql) [required]")
-	cmd.Flags().StringVar(&cacheStr, "cache", "", "Cache type (memory, redis, valkey) [required for gateway, optional for auth]")
-	cmd.Flags().StringVarP(&configStr, "config", "", "", "Configuration source (yaml, vault) [required]")
-	cmd.Flags().StringVarP(&rateLimiterStr, "rate-limiter", "r", "", "Rate limiting algorithm (token-bucket, approximated-sliding-window) [required for gateway, optional for auth]")
-	cmd.Flags().StringVarP(&observabilityStr, "observability", "o", "otlp", "Observability type (otlp, none) [optional, defaults to otlp]")
+	cmd.Flags().StringVarP(&serviceTypeStr, "service", "s", "", "Service type (gateway, auth, both)")
+	cmd.Flags().StringVarP(&databaseStr, "database", "d", "", "Database type (postgres, mysql, sqlite, mongodb, arangodb)")
+	cmd.Flags().StringVar(&cacheStr, "cache", "", "Cache type (redis, valkey, memory)")
+	cmd.Flags().StringVarP(&configStr, "config", "c", "", "Configuration source (yaml, env, vault)")
+	cmd.Flags().StringVarP(&rateLimiterStr, "rate-limiter", "r", "", "Rate limiting algorithm (token-bucket, sliding-window, leaky-bucket, fixed-window)")
+	cmd.Flags().BoolVarP(&observabilityBool, "observability", "o", true, "Enable OTLP observability")
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", true, "Use interactive TUI wizard")
+	cmd.Flags().StringSliceVar(&oauthProviders, "oauth", nil, "OAuth providers (google, microsoft, apple)")
+	cmd.Flags().BoolVar(&enableMFA, "mfa", false, "Enable MFA/TOTP support")
+	cmd.Flags().BoolVar(&enableRBAC, "rbac", false, "Enable Casbin RBAC")
+	cmd.Flags().StringSliceVar(&gdprFeatures, "gdpr", nil, "GDPR features (consent, data-export, data-deletion, processing-logs)")
+	cmd.Flags().StringVar(&emailServiceStr, "email", "", "Email service (ses, smtp)")
+	cmd.Flags().BoolVar(&authCache, "auth-cache", false, "Enable auth response caching (gateway)")
+	cmd.Flags().StringSliceVar(&frontends, "frontend", nil, "Frontend types (web, mobile) - can specify both")
+	cmd.Flags().StringVar(&webFrameworkStr, "web-framework", "", "Web framework (react, next, tanstack) - required for web frontend")
+	cmd.Flags().StringVar(&uiLibraryStr, "ui-lib", "", "UI library (shadcn, baseui)")
+	cmd.Flags().StringVar(&stateMgmtStr, "state-mgmt", "", "State management (tanstack, redux)")
+	cmd.Flags().BoolVar(&enablePostHog, "posthog", false, "Enable PostHog analytics (requires --frontend)")
+	cmd.Flags().BoolVar(&enableSentry, "sentry", false, "Enable Sentry error tracking (requires --frontend)")
+	cmd.Flags().StringVar(&testInfraStr, "test-infra", "docker", "Test infrastructure (docker, testcontainers)")
+	cmd.Flags().StringVar(&e2eFrameworkStr, "e2e-framework", "cypress", "E2E test framework (cypress, playwright) - only with --frontend")
 
-	cmd.MarkFlagRequired("service-type")
-	cmd.MarkFlagRequired("database")
-	cmd.MarkFlagRequired("config")
-
-	cmd.RegisterFlagCompletionFunc("service-type", serviceTypeCompletion)
-	cmd.RegisterFlagCompletionFunc("database", databaseCompletion)
-	cmd.RegisterFlagCompletionFunc("cache", cacheCompletion)
-	cmd.RegisterFlagCompletionFunc("config", configCompletion)
-	cmd.RegisterFlagCompletionFunc("rate-limiter", rateLimiterCompletion)
-	cmd.RegisterFlagCompletionFunc("observability", observabilityCompletion)
+	cmd.RegisterFlagCompletionFunc("service", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidServiceTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("database", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidDatabaseTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("cache", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidCacheTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("config", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidConfigSources(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("rate-limiter", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidRateLimiterTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("frontend", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidFrontendTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("web-framework", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidWebFrameworks(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("ui-lib", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidUILibraries(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("state-mgmt", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidStateManagements(), cobra.ShellCompDirectiveNoFileComp
+	})
 
 	return cmd
 }
 
-func validateServiceName(name string) error {
-	if name == "" {
-		return ErrServiceNameRequired
+// hasAnyFlag checks if any relevant flags were set
+func hasAnyFlag(cmd *cobra.Command) bool {
+	flags := []string{"service", "database", "cache", "config", "rate-limiter", "frontend", "web-framework", "ui-lib", "state-mgmt"}
+	for _, name := range flags {
+		if cmd.Flags().Changed(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// runInteractive runs the TUI wizard
+func runInteractive() error {
+	wizard := tui.NewWizard()
+
+	p := tea.NewProgram(wizard, tea.WithAltScreen())
+
+	finalModel, err := p.Run()
+	if err != nil {
+		return fmt.Errorf("TUI error: %w", err)
 	}
 
-	pattern := `^github\.com/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$`
-	matched, err := regexp.MatchString(pattern, name)
-	if err != nil {
-		return NewValidationError("service-name", name, "failed to validate format", err)
+	// Get the final wizard state
+	w, ok := finalModel.(*tui.Wizard)
+	if !ok {
+		return fmt.Errorf("unexpected model type")
 	}
-	if !matched {
-		return NewInvalidFormatError("service-name", name, "github.com/<username/org>/<project_name>")
+
+	cfg := w.Config()
+
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("configuration error: %w", err)
 	}
+
+	// Generate the project
+	fmt.Println("\nGenerating project...")
+
+	gen := generator.NewGenerator(cfg)
+	if err := gen.Generate(context.Background()); err != nil {
+		return fmt.Errorf("generation failed: %w", err)
+	}
+
+	fmt.Printf("\n✓ Project generated successfully at: %s\n", cfg.ProjectName)
+	fmt.Println("\nNext steps:")
+	fmt.Printf("  cd %s\n", cfg.ProjectName)
+	fmt.Println("  go build ./...")
+
 	return nil
 }
 
-func validateAndSetServiceType(config *types.ServiceConfig, serviceTypeStr string) error {
+// runNonInteractive runs with command-line flags
+func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr string, observability bool, oauthProviders []string, enableMFA, enableRBAC bool, gdprFeatures []string, emailServiceStr string, authCache bool, frontends []string, webFrameworkStr, uiLibraryStr, stateMgmtStr string, enablePostHog, enableSentry bool, testInfraStr, e2eFrameworkStr string) error {
+	var validationErrors []error
+
+	// Module name is required in non-interactive mode
+	if len(args) == 0 {
+		validationErrors = append(validationErrors, errors.New("module name is required"))
+	}
+
+	var moduleName string
+	if len(args) > 0 {
+		moduleName = args[0]
+		if err := validateModuleName(moduleName); err != nil {
+			validationErrors = append(validationErrors, err)
+		}
+	}
+
+	// Service type is required
 	if serviceTypeStr == "" {
-		return NewMissingRequiredFieldError("service-type", "", "")
+		validationErrors = append(validationErrors, errors.New("--service flag is required"))
+	} else if !slices.Contains(config.ValidServiceTypes(), serviceTypeStr) {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid service type '%s', valid options: %v", serviceTypeStr, config.ValidServiceTypes()))
 	}
 
-	validTypes := types.ValidServiceTypes()
-	if slices.Contains(validTypes, serviceTypeStr) {
-		config.ServiceType = types.ServiceType(serviceTypeStr)
-		return nil
+	// Config source is required
+	if configStr == "" {
+		validationErrors = append(validationErrors, errors.New("--config flag is required"))
+	} else if !slices.Contains(config.ValidConfigSources(), configStr) {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid config source '%s', valid options: %v", configStr, config.ValidConfigSources()))
 	}
 
-	return NewInvalidOptionError("service-type", serviceTypeStr, validTypes)
-}
+	// Validate based on service type
+	serviceType := config.ServiceType(serviceTypeStr)
 
-func validateAndSetDatabase(config *types.ServiceConfig, databaseStr string) error {
-	if databaseStr == "" {
-		return NewMissingRequiredFieldError("database", "", "")
+	// Gateway or both requires cache and rate limiter
+	if serviceType == config.ServiceGateway || serviceType == config.ServiceBoth {
+		if cacheStr == "" {
+			validationErrors = append(validationErrors, errors.New("--cache is required for gateway service"))
+		}
+		if rateLimiterStr == "" {
+			validationErrors = append(validationErrors, errors.New("--rate-limiter is required for gateway service"))
+		}
 	}
 
-	validDatabases := types.ValidDatabaseTypes()
-	if slices.Contains(validDatabases, databaseStr) {
-		config.Database = types.DatabaseType(databaseStr)
-		return nil
+	// Validate cache type if provided (required for gateway, optional for auth)
+	if cacheStr != "" && !slices.Contains(config.ValidCacheTypes(), cacheStr) {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid cache type '%s', valid options: %v", cacheStr, config.ValidCacheTypes()))
 	}
 
-	return NewInvalidOptionError("database", databaseStr, validDatabases)
-}
+	// Validate rate limiter if provided (required for gateway, optional for auth)
+	if rateLimiterStr != "" && !slices.Contains(config.ValidRateLimiterTypes(), rateLimiterStr) {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid rate limiter '%s', valid options: %v", rateLimiterStr, config.ValidRateLimiterTypes()))
+	}
 
-func validateAndSetCache(config *types.ServiceConfig, cacheStr string) error {
-	if config.ServiceType == types.ServiceTypeGateway && cacheStr == "" {
-		return NewMissingRequiredFieldError("cache", string(config.ServiceType), "caching is mandatory for performance")
+	// Auth or both requires database
+	if serviceType == config.ServiceAuth || serviceType == config.ServiceBoth {
+		if databaseStr == "" {
+			validationErrors = append(validationErrors, errors.New("--database is required for auth service"))
+		} else if !slices.Contains(config.ValidDatabaseTypes(), databaseStr) {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid database type '%s', valid options: %v", databaseStr, config.ValidDatabaseTypes()))
+		}
+	}
+
+	// Validate OAuth providers
+	for _, p := range oauthProviders {
+		if !slices.Contains(config.ValidOAuthProviders(), p) {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid OAuth provider '%s', valid options: %v", p, config.ValidOAuthProviders()))
+		}
+	}
+
+	// Validate GDPR features
+	for _, f := range gdprFeatures {
+		if !slices.Contains(config.ValidGDPRFeatures(), f) {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid GDPR feature '%s', valid options: %v", f, config.ValidGDPRFeatures()))
+		}
+	}
+
+	// Validate email service
+	if emailServiceStr != "" && !slices.Contains(config.ValidEmailServices(), emailServiceStr) {
+		validationErrors = append(validationErrors, fmt.Errorf("invalid email service '%s', valid options: %v", emailServiceStr, config.ValidEmailServices()))
+	}
+
+	// Email service is required if GDPR features are selected
+	if len(gdprFeatures) > 0 && emailServiceStr == "" {
+		validationErrors = append(validationErrors, errors.New("--email is required when GDPR features are selected"))
+	}
+
+	// Validate frontend options
+	if len(frontends) > 0 {
+		hasWeb := false
+		for _, f := range frontends {
+			if !slices.Contains(config.ValidFrontendTypes(), f) {
+				validationErrors = append(validationErrors, fmt.Errorf("invalid frontend type '%s', valid options: %v", f, config.ValidFrontendTypes()))
+			}
+			if f == string(config.FrontendWeb) {
+				hasWeb = true
+			}
+		}
+
+		// Frontend is only available for auth or both services
+		if serviceType == config.ServiceGateway {
+			validationErrors = append(validationErrors, errors.New("--frontend is only available for auth or both service types"))
+		}
+
+		// Web frontend requires web framework
+		if hasWeb {
+			if webFrameworkStr == "" {
+				validationErrors = append(validationErrors, errors.New("--web-framework is required for web frontend"))
+			} else if !slices.Contains(config.ValidWebFrameworks(), webFrameworkStr) {
+				validationErrors = append(validationErrors, fmt.Errorf("invalid web framework '%s', valid options: %v", webFrameworkStr, config.ValidWebFrameworks()))
+			}
+		}
+
+		// UI library is required
+		if uiLibraryStr == "" {
+			validationErrors = append(validationErrors, errors.New("--ui-lib is required when --frontend is specified"))
+		} else if !slices.Contains(config.ValidUILibraries(), uiLibraryStr) {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid UI library '%s', valid options: %v", uiLibraryStr, config.ValidUILibraries()))
+		}
+
+		// State management is required
+		if stateMgmtStr == "" {
+			validationErrors = append(validationErrors, errors.New("--state-mgmt is required when --frontend is specified"))
+		} else if !slices.Contains(config.ValidStateManagements(), stateMgmtStr) {
+			validationErrors = append(validationErrors, fmt.Errorf("invalid state management '%s', valid options: %v", stateMgmtStr, config.ValidStateManagements()))
+		}
+	} else {
+		// If frontend is not specified, warn if related flags are provided
+		if webFrameworkStr != "" {
+			validationErrors = append(validationErrors, errors.New("--web-framework requires --frontend to be specified"))
+		}
+		if uiLibraryStr != "" {
+			validationErrors = append(validationErrors, errors.New("--ui-lib requires --frontend to be specified"))
+		}
+		if stateMgmtStr != "" {
+			validationErrors = append(validationErrors, errors.New("--state-mgmt requires --frontend to be specified"))
+		}
+		if enablePostHog {
+			validationErrors = append(validationErrors, errors.New("--posthog requires --frontend to be specified"))
+		}
+		if enableSentry {
+			validationErrors = append(validationErrors, errors.New("--sentry requires --frontend to be specified"))
+		}
+	}
+
+	if len(validationErrors) > 0 {
+		joinedErr := errors.Join(validationErrors...)
+		usage := cmd.UsageString()
+		return NewCliError(joinedErr, usage)
+	}
+
+	// Build configuration
+	cfg := &config.ProjectConfig{
+		ModuleName:    moduleName,
+		ProjectName:   config.ExtractProjectName(moduleName),
+		ServiceType:   serviceType,
+		ConfigSource:  config.ConfigSource(configStr),
+		Observability: observability,
+		EnableMFA:     enableMFA,
+		EnableRBAC:    enableRBAC,
+		AuthCache:     authCache,
+	}
+
+	if databaseStr != "" {
+		db := config.DatabaseType(databaseStr)
+		cfg.Database = &db
 	}
 
 	if cacheStr != "" {
-		validCaches := types.ValidCacheTypes()
-		if slices.Contains(validCaches, cacheStr) {
-			cacheType := types.CacheType(cacheStr)
-			config.Cache = &cacheType
-			return nil
-		}
-		return NewInvalidOptionError("cache", cacheStr, validCaches)
-	}
-
-	return nil
-}
-
-func validateAndSetConfig(config *types.ServiceConfig, configStr string) error {
-	if configStr == "" {
-		return NewMissingRequiredFieldError("config", "", "configuration source must be specified")
-	}
-
-	validConfigs := types.ValidConfigTypes()
-	if slices.Contains(validConfigs, configStr) {
-		config.Config = types.ConfigType(configStr)
-		return nil
-	}
-
-	return NewInvalidOptionError("config", configStr, validConfigs)
-}
-
-func validateAndSetRateLimiter(config *types.ServiceConfig, rateLimiterStr string) error {
-	if config.ServiceType == types.ServiceTypeGateway && rateLimiterStr == "" {
-		return NewMissingRequiredFieldError("rate-limiter", string(config.ServiceType), "rate limiting is essential for gateway traffic control")
+		cache := config.CacheType(cacheStr)
+		cfg.Cache = &cache
 	}
 
 	if rateLimiterStr != "" {
-		validRateLimiters := types.ValidRateLimiterTypes()
-		if slices.Contains(validRateLimiters, rateLimiterStr) {
-			rateLimiter := types.RateLimiterType(rateLimiterStr)
-			config.RateLimiter = &rateLimiter
-			return nil
-		}
-		return NewInvalidOptionError("rate-limiter", rateLimiterStr, validRateLimiters)
+		rl := config.RateLimiterType(rateLimiterStr)
+		cfg.RateLimiter = &rl
 	}
+
+	// OAuth providers
+	for _, p := range oauthProviders {
+		cfg.OAuthProviders = append(cfg.OAuthProviders, config.OAuthProvider(p))
+	}
+
+	// GDPR features
+	for _, f := range gdprFeatures {
+		cfg.GDPRFeatures = append(cfg.GDPRFeatures, config.GDPRFeature(f))
+	}
+
+	// Email service
+	if emailServiceStr != "" {
+		email := config.EmailService(emailServiceStr)
+		cfg.EmailService = &email
+	}
+
+	// Frontend
+	if len(frontends) > 0 {
+		for _, f := range frontends {
+			cfg.Frontends = append(cfg.Frontends, config.FrontendType(f))
+		}
+
+		if webFrameworkStr != "" {
+			framework := config.WebFramework(webFrameworkStr)
+			cfg.WebFramework = &framework
+		}
+
+		if uiLibraryStr != "" {
+			uiLib := config.UILibrary(uiLibraryStr)
+			cfg.UILibrary = &uiLib
+		}
+
+		if stateMgmtStr != "" {
+			stateMgmt := config.StateManagement(stateMgmtStr)
+			cfg.StateManagement = &stateMgmt
+		}
+
+		// Analytics/monitoring options
+		cfg.EnablePostHog = enablePostHog
+		cfg.EnableSentry = enableSentry
+	}
+
+	// Test infrastructure
+	if testInfraStr != "" {
+		if !slices.Contains(config.ValidTestInfraTypes(), testInfraStr) {
+			return fmt.Errorf("invalid test infrastructure: %s (valid: %v)", testInfraStr, config.ValidTestInfraTypes())
+		}
+		testInfra := config.TestInfraType(testInfraStr)
+		cfg.TestInfra = &testInfra
+	}
+
+	// E2E framework (only valid when frontend is set)
+	if e2eFrameworkStr != "" && len(frontends) > 0 {
+		if !slices.Contains(config.ValidE2EFrameworkTypes(), e2eFrameworkStr) {
+			return fmt.Errorf("invalid E2E framework: %s (valid: %v)", e2eFrameworkStr, config.ValidE2EFrameworkTypes())
+		}
+		e2eFramework := config.E2EFrameworkType(e2eFrameworkStr)
+		cfg.E2EFramework = &e2eFramework
+	}
+
+	// Generate the project
+	fmt.Println("Generating project...")
+
+	gen := generator.NewGenerator(cfg)
+	if err := gen.Generate(context.Background()); err != nil {
+		return fmt.Errorf("generation failed: %w", err)
+	}
+
+	fmt.Printf("\n✓ Project generated successfully at: %s\n", cfg.ProjectName)
+	fmt.Println("\nNext steps:")
+	fmt.Printf("  cd %s\n", cfg.ProjectName)
+	fmt.Println("  go build ./...")
 
 	return nil
 }
 
-func validateAndSetObservability(config *types.ServiceConfig, observabilityStr string) error {
-	if observabilityStr == "" {
-		observabilityStr = "otlp"
+// validateModuleName validates the Go module name format
+func validateModuleName(name string) error {
+	if name == "" {
+		return errors.New("module name is required")
 	}
 
-	validObservability := types.ValidObservabilityTypes()
-	if slices.Contains(validObservability, observabilityStr) {
-		config.Observability = types.ObservabilityType(observabilityStr)
-		return nil
+	pattern := `^[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*$`
+	matched, err := regexp.MatchString(pattern, name)
+	if err != nil {
+		return fmt.Errorf("failed to validate module name: %w", err)
+	}
+	if !matched {
+		return fmt.Errorf("invalid module name format: %s (expected format: domain.com/user/project)", name)
 	}
 
-	return NewInvalidOptionError("observability", observabilityStr, validObservability)
-}
-
-// func printServiceConfig(config types.ServiceConfig) {
-// 	fmt.Printf("Service Configuration:\n")
-// 	fmt.Printf("  Name: %s\n", config.Name)
-// 	fmt.Printf("  Service Type: %s\n", config.ServiceType)
-// 	fmt.Printf("  Database: %s\n", config.Database)
-
-// 	if config.Cache != nil {
-// 		fmt.Printf("  Cache: %s\n", *config.Cache)
-// 	} else {
-// 		fmt.Printf("  Cache: none\n")
-// 	}
-
-// 	fmt.Printf("  Config Source: %s\n", config.Config)
-
-// 	if config.RateLimiter != nil {
-// 		fmt.Printf("  Rate Limiter: %s\n", *config.RateLimiter)
-// 	} else {
-// 		fmt.Printf("  Rate Limiter: none\n")
-// 	}
-
-// 	fmt.Printf("  Observability: %s\n", config.Observability)
-// }
-
-func serviceTypeCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidServiceTypes(), cobra.ShellCompDirectiveNoFileComp
-}
-
-func databaseCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidDatabaseTypes(), cobra.ShellCompDirectiveNoFileComp
-}
-
-func cacheCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidCacheTypes(), cobra.ShellCompDirectiveNoFileComp
-}
-
-func configCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidConfigTypes(), cobra.ShellCompDirectiveNoFileComp
-}
-
-func rateLimiterCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidRateLimiterTypes(), cobra.ShellCompDirectiveNoFileComp
-}
-
-func observabilityCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	return types.ValidObservabilityTypes(), cobra.ShellCompDirectiveNoFileComp
+	return nil
 }

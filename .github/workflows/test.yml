@@ -1,0 +1,67 @@
+name: Test Matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Build gonstrukt first
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build gonstrukt
+        run: go build -o gonstrukt
+      - name: Upload gonstrukt binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gonstrukt
+          path: gonstrukt
+
+  # Run unit tests for gonstrukt itself
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Run unit tests
+        run: go test -v ./...
+
+  # Test matrix for generated project configurations
+  test-matrix:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download gonstrukt binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gonstrukt
+
+      - name: Make gonstrukt executable
+        run: chmod +x ./gonstrukt
+
+      - name: Run test config
+        env:
+          CONFIG_NUM: ${{ matrix.config }}
+        run: ./scripts/ci-test.sh "$CONFIG_NUM"

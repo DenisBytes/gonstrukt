@@ -50,5 +50,20 @@ bin/
 tmp/
 temp/
 
-# Claude Code configuration
+# Generated test output directories
+myauth/
+mygateway/
+fullcheck/
+test-*/
+verify*/
+
+# Test docker compose in root (generated projects have their own)
+/docker-compose.test.yml
+
+# Build scripts (personal)
+scripts/create-commits.sh
+
+# AI/Claude Code artifacts
 CLAUDE.md
+docs/plans/
+.claude/

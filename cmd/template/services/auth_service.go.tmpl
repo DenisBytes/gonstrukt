@@ -1,0 +1,3657 @@
+// /services/auth-service
+package services
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+	"unicode"
+
+	"{{.Name}}/auth-service/internals/db"
+	"{{.Name}}/auth-service/internals/types"
+	"{{.Name}}/auth-service/internals/vault"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ses"
+	awstypes "github.com/aws/aws-sdk-go-v2/service/ses/types"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/argon2"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+)
+
+const (
+	MaxLoginAttempts = 5
+	LockoutDuration  = 30 * time.Minute
+	// TODO: to keep track of dupliocate in db/session.go
+	SessionTimeout                 = 24 * time.Hour
+	MaxConcurrentLogins            = 5
+	OTPValidityDuration            = 10 * time.Minute
+	OTPLength                      = 6
+	EmailConfirmationTokenValidity = 24 * time.Hour
+)
+
+// Removed EmailVerificationData - now using database storage with EmailVerificationToken
+
+// SafeUserResponse represents user data safe for client consumption (excludes sensitive fields)
+type SafeUserResponse struct {
+	ID              uuid.UUID      `json:"id"`
+	Email           string         `json:"email"`
+	Roles           pq.StringArray `json:"roles"`
+	IsEmailVerified bool           `json:"is_email_verified"`
+	MFAEnabled      bool           `json:"mfa_enabled"`
+	LastLoginAt     time.Time      `json:"last_login_at"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	// Conditional fields (only included if user has appropriate consents)
+	PFP    *string `json:"pfp,omitempty"`
+	Gender *string `json:"gender,omitempty"`
+}
+
+// type LoginAttempt struct {
+// 	Email     string    `json:"email"`
+// 	IP        string    `json:"ip"`
+// 	Timestamp time.Time `json:"timestamp"`
+// 	Success   bool      `json:"success"`
+// }
+
+type OAuthService struct {
+	DB          *db.Client
+	VaultConfig *vault.VaultConfig
+	SESClient   *ses.Client
+	GoogleOAuth *oauth2.Config
+
+	Logger *zap.SugaredLogger
+	Tracer trace.Tracer
+	Meter  metric.Meter
+
+	// Metrics
+	RequestCounter       metric.Int64Counter
+	RequestDuration      metric.Float64Histogram
+	ErrorCounter         metric.Int64Counter
+	SignupCounter        metric.Int64Counter
+	LoginCounter         metric.Int64Counter
+	LogoutCounter        metric.Int64Counter
+	EmailVerifications   metric.Int64Counter
+	PasswordResetCounter metric.Int64Counter
+	OTPVerificationCounter metric.Int64Counter
+	PasswordChangeCounter metric.Int64Counter
+	CleanupCounter       metric.Int64Counter
+	ActiveSessions       metric.Int64UpDownCounter
+}
+
+// // Add these structs to your existing types
+// type PasswordResetData struct {
+// 	Token     string    `json:"token"`
+// 	Email     string    `json:"email"`
+// 	UserKey   string    `json:"user_key"`
+// 	OTP       string    `json:"otp"`
+// 	ExpiresAt time.Time `json:"expires_at"`
+// 	Used      bool      `json:"used"`
+// 	CreatedAt time.Time `json:"created_at"`
+// }
+
+// ResponseWriter wrapper to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func NewOAuthService(db *db.Client, logger *zap.SugaredLogger, vaultConfig *vault.VaultConfig, tracer trace.Tracer, meter metric.Meter) (*OAuthService, error) {
+	// Create AWS config with credentials from Vault
+	awsConfig, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion(vaultConfig.AWSRegion),
+		awsconfig.WithCredentialsProvider(aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     vaultConfig.AWSAccessKeyID,
+				SecretAccessKey: vaultConfig.AWSSecretAccessKey,
+			}, nil
+		}))),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	sesClient := ses.NewFromConfig(awsConfig)
+
+	// Initialize Google OAuth config
+	googleOAuth := &oauth2.Config{
+		ClientID:     vaultConfig.GoogleClientID,
+		ClientSecret: vaultConfig.GoogleClientSecret,
+		RedirectURL:  vaultConfig.GoogleRedirectURL,
+		Scopes: []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		},
+		Endpoint: google.Endpoint,
+	}
+
+	// Initialize metrics
+	requestCounter, err := meter.Int64Counter("auth_requests_total", metric.WithDescription("Total number of auth requests"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request counter: %w", err)
+	}
+
+	requestDuration, err := meter.Float64Histogram("auth_request_duration_seconds", metric.WithDescription("Auth request duration in seconds"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request duration histogram: %w", err)
+	}
+
+	errorCounter, err := meter.Int64Counter("auth_errors_total", metric.WithDescription("Total number of auth errors"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create error counter: %w", err)
+	}
+
+	signupCounter, err := meter.Int64Counter("auth_signups_total", metric.WithDescription("Total number of signups"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signup counter: %w", err)
+	}
+
+	loginCounter, err := meter.Int64Counter("auth_logins_total", metric.WithDescription("Total number of logins"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create login counter: %w", err)
+	}
+
+	logoutCounter, err := meter.Int64Counter("auth_logouts_total", metric.WithDescription("Total number of logouts"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create logouts counter: %w", err)
+	}
+
+	emailVerifications, err := meter.Int64Counter("auth_email_verifications_total", metric.WithDescription("Total number of email verifications"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create email verification counter: %w", err)
+	}
+
+	passwordResetCounter, err := meter.Int64Counter("auth_password_resets_total", metric.WithDescription("Total number of password resets"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create password reset counter: %w", err)
+	}
+
+	activeSessions, err := meter.Int64UpDownCounter("auth_active_sessions", metric.WithDescription("Number of active sessions"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create active sessions counter: %w", err)
+	}
+
+	otpVerificationCounter, err := meter.Int64Counter("auth_otp_verifications_total", metric.WithDescription("Total number of OTP verifications"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTP verification counter: %w", err)
+	}
+
+	passwordChangeCounter, err := meter.Int64Counter("auth_password_changes_total", metric.WithDescription("Total number of password changes"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create password change counter: %w", err)
+	}
+
+	cleanupCounter, err := meter.Int64Counter("auth_cleanup_operations_total", metric.WithDescription("Total number of cleanup operations"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cleanup counter: %w", err)
+	}
+
+	service := &OAuthService{
+		DB:          db,
+		Logger:      logger,
+		GoogleOAuth: googleOAuth,
+		SESClient:   sesClient,
+		VaultConfig: vaultConfig,
+
+		Tracer: tracer,
+		Meter:  meter,
+
+		RequestCounter:         requestCounter,
+		RequestDuration:        requestDuration,
+		ErrorCounter:           errorCounter,
+		SignupCounter:          signupCounter,
+		LoginCounter:           loginCounter,
+		LogoutCounter:          logoutCounter,
+		EmailVerifications:     emailVerifications,
+		PasswordResetCounter:   passwordResetCounter,
+		OTPVerificationCounter: otpVerificationCounter,
+		PasswordChangeCounter:  passwordChangeCounter,
+		CleanupCounter:         cleanupCounter,
+		ActiveSessions:         activeSessions,
+	}
+
+	return service, nil
+}
+
+// ObservabilityMiddleware adds comprehensive observability
+func (s *OAuthService) ObservabilityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Extract trace context from request headers
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
+		// Create trace span
+		ctx, span := s.Tracer.Start(ctx, fmt.Sprintf("auth_%s_%s", r.Method, r.URL.Path))
+		defer span.End()
+
+		// Add span attributes
+		span.SetAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.url", r.URL.String()),
+			attribute.String("http.remote_addr", r.RemoteAddr),
+			attribute.String("http.user_agent", r.UserAgent()),
+			attribute.String("service.name", "auth-service"),
+		)
+
+		// Wrap the ResponseWriter to capture status code
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Update request context with span context
+		r = r.WithContext(ctx)
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+
+		// Record metrics
+		labels := []attribute.KeyValue{
+			attribute.String("method", r.Method),
+			attribute.String("endpoint", r.URL.Path),
+			attribute.Int("status_code", wrapped.statusCode),
+			attribute.String("service", "auth-service"),
+		}
+
+		s.RequestCounter.Add(ctx, 1, metric.WithAttributes(labels...))
+		s.RequestDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(labels...))
+
+		if wrapped.statusCode >= 400 {
+			s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(labels...))
+		}
+
+		// Add status to span
+		span.SetAttributes(attribute.Int("http.status_code", wrapped.statusCode))
+
+		if wrapped.statusCode >= 400 {
+			span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", wrapped.statusCode))
+		} else {
+			span.SetStatus(codes.Ok, "Request completed successfully")
+		}
+
+		// Log request
+		s.Logger.Infow("auth request processed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.statusCode,
+			"duration", duration.String(),
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+			"trace_id", span.SpanContext().TraceID().String(),
+			"span_id", span.SpanContext().SpanID().String(),
+		)
+	})
+}
+
+func (s *OAuthService) RegisterHandlers(router *http.ServeMux) {
+	// Health endpoints
+	router.HandleFunc("GET /health", s.HealthCheck)
+	router.HandleFunc("GET /ready", s.ReadinessCheck)
+	
+	// API endpoints
+	router.HandleFunc("POST /api/"+s.VaultConfig.Version+"/signup", s.Signup)
+	router.HandleFunc("POST /api/"+s.VaultConfig.Version+"/login", s.Login)
+	// router.HandleFunc("GET /api/"+s.config.Server.Version+"/google-auth", s.GoogleAuth)
+	// router.HandleFunc("POST /api/"+s.config.Server.Version+"/google-auth/callback", s.GoogleAuthCallback)
+	router.HandleFunc("POST /api/"+s.VaultConfig.Version+"/logout", s.Logout)
+	router.HandleFunc("GET /api/"+s.VaultConfig.Version+"/auth/me", s.AuthMe)
+	// router.HandleFunc("GET /api/"+s.config.Server.Version+"/email/verify", s.VerifyEmail)
+	// router.HandleFunc("POST /api/"+s.config.Server.Version+"/email/resend", s.ResendVerificationEmail)
+	router.HandleFunc("POST /api/"+s.VaultConfig.Version+"/request-password-reset", s.RequestPasswordReset)
+	router.HandleFunc("POST /api/"+s.VaultConfig.Version+"/verify-otp", s.VerifyOTP)
+	// router.HandleFunc("POST /api/"+s.config.Server.Version+"/reset-password", s.ResetPassword)
+	// router.HandleFunc("POST /api/"+s.config.Server.Version+"/change-password", s.ChangePassword)
+}
+
+// HealthCheck performs basic health check
+func (s *OAuthService) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"service": "auth-service",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// ReadinessCheck performs readiness check including database connectivity
+func (s *OAuthService) ReadinessCheck(w http.ResponseWriter, r *http.Request) {
+	// Check database connectivity
+	if err := db.Ping(s.Logger, s.VaultConfig); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "not ready",
+			"service": "auth-service",
+			"error": "database connection failed",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ready",
+		"service": "auth-service",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *OAuthService) Signup(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	var body struct {
+		Role     string `json:"role"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	fingerprintHeader := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "signup"),
+		attribute.String("device.fingerprint", fingerprintHeader),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	// GDPR Data Processing Log: Initial request processing
+	requestProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "signup_request_processing",
+		ProcessedData: "signup request data, IP address, device fingerprint",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		Purpose:       "process user registration request",
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to decode request body")
+		s.Logger.Errorw("could not read body",
+			"error", err,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+			"device_fingerprint", fingerprintHeader,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "request body decode failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "decode_error"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activity even on failure
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Validate Role
+	if body.Role != types.WORKER_ROLE && body.Role != types.EMPLOYER_ROLE {
+		span.RecordError(fmt.Errorf("invalid role: %s", body.Role))
+		span.SetStatus(codes.Error, "Invalid role specified")
+		s.Logger.Errorw("invalid role specified",
+			"role", body.Role,
+			"valid_roles", []string{types.WORKER_ROLE, types.EMPLOYER_ROLE},
+			"body_email", body.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = fmt.Sprintf("invalid role: %s", body.Role)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "invalid_role"),
+			attribute.String("endpoint", "signup"),
+			attribute.String("role", body.Role),
+		))
+
+		// Log data processing activity even on failure
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "invalid role specified", http.StatusBadRequest)
+		return
+	}
+
+	// Add more span attributes after successful decode
+	span.SetAttributes(
+		attribute.String("user.email", body.Email),
+		attribute.String("user.role", body.Role),
+		attribute.String("device.fingerprint", fingerprintHeader),
+	)
+
+	// Update data processing log with user email
+	requestProcessingLog.DataSubject = body.Email
+
+	s.Logger.Infow("processing signup request",
+		"body_email", body.Email,
+		"body_role", body.Role,
+		"device_fingerprint", fingerprintHeader,
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// GDPR Data Processing Log: User existence check
+	existenceCheckLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "user_existence_check",
+		ProcessedData: "email address for duplicate check",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   body.Email,
+		Purpose:       "prevent duplicate account creation",
+	}
+
+	// Check if user exists
+	existing, err := s.DB.GetUserByEmail(r.Context(), body.Email)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Database query failed")
+		s.Logger.Errorw("database error during user lookup",
+			"error", err,
+			"body_email", body.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing logs with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "database query failed"
+
+		existenceCheckLog.Status = "failed"
+		existenceCheckLog.CompletedAt = &now
+		existenceCheckLog.ErrorDetails = "database query failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "database_error"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activities
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, existenceCheckLog); logErr != nil {
+			s.Logger.Errorw("failed to log existence check activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if existing != nil {
+		span.SetStatus(codes.Error, "Email already registered")
+		s.Logger.Errorw("email already registered",
+			"existing_user_id", existing.ID,
+			"body_email", body.Email,
+			"body_role", body.Role,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing logs with conflict
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "email already registered"
+
+		existenceCheckLog.Status = "completed"
+		existenceCheckLog.CompletedAt = &now
+		existenceCheckLog.UserID = &existing.ID
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "email_exists"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activities
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, existenceCheckLog); logErr != nil {
+			s.Logger.Errorw("failed to log existence check activity", "error", logErr)
+		}
+
+		http.Error(w, "email already registered", http.StatusConflict)
+		return
+	}
+
+	// Complete existence check log
+	now := time.Now()
+	existenceCheckLog.Status = "completed"
+	existenceCheckLog.CompletedAt = &now
+
+	// Log existence check activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, existenceCheckLog); logErr != nil {
+		s.Logger.Errorw("failed to log existence check activity", "error", logErr)
+	}
+
+	// Validate password strength
+	if err := s.validatePassword(body.Password); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Password validation failed")
+		s.Logger.Errorw("validate password failed",
+			"error", err,
+			"body_email", body.Email,
+			"body_role", body.Role,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update request processing log with validation failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "password validation failed"
+
+		// Record validation error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "password_validation"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// GDPR Data Processing Log: Password hashing
+	passwordHashingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "password_hashing",
+		ProcessedData: "user password for secure storage",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   body.Email,
+		Purpose:       "secure password storage for authentication",
+	}
+
+	// Hash password
+	hashedPassword, err := s.hashPassword(body.Password)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to hash password")
+		s.Logger.Errorw("failed to hash password",
+			"error", err,
+			"body_email", body.Email,
+			"body_role", body.Role,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing logs with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "password hashing failed"
+
+		passwordHashingLog.Status = "failed"
+		passwordHashingLog.CompletedAt = &now
+		passwordHashingLog.ErrorDetails = "password hashing failed"
+
+		// Record hashing error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "password_hashing"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activities
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, passwordHashingLog); logErr != nil {
+			s.Logger.Errorw("failed to log password hashing activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Complete password hashing log
+	now = time.Now()
+	passwordHashingLog.Status = "completed"
+	passwordHashingLog.CompletedAt = &now
+
+	// Log password hashing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, passwordHashingLog); logErr != nil {
+		s.Logger.Errorw("failed to log password hashing activity", "error", logErr)
+	}
+
+	// Create user
+	newUser := &types.User{
+		ID:          uuid.New(),
+		Email:       body.Email,
+		Password:    hashedPassword,
+		Roles:       pq.StringArray{body.Role},
+		IsBanned:    false,
+		IsLocked:    false,
+		LastLoginAt: time.Now(),
+	}
+
+	// GDPR Data Processing Log: Device fingerprint processing
+	fingerprint := extractFingerprintFromRequest(w, r)
+	fingerprintProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "device_fingerprint_processing",
+		ProcessedData: "device fingerprint, IP address, user agent",
+		RequestedAt:   time.Now(),
+		Status:        "completed",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &newUser.ID,
+		LegalBasis:    "legitimate_interest", // GDPR Article 6(1)(f)
+		DataSubject:   body.Email,
+		Purpose:       "device recognition for security and fraud prevention",
+		CompletedAt:   &now,
+	}
+
+	// GDPR Data Processing Log: Consent processing
+	consentProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "consent_processing",
+		ProcessedData: "cookie consent preferences",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &newUser.ID,
+		LegalBasis:    "consent", // GDPR Article 6(1)(a)
+		DataSubject:   body.Email,
+		Purpose:       "manage user consent preferences for cookies and tracking",
+	}
+
+	cookieConsents := make([]types.Consent, 0)
+
+	essentialCookie, err := r.Cookie("essential_consent")
+	if err == nil && essentialCookie.Value == "true" {
+		cookieConsents = append(cookieConsents, types.Consent{
+			Type:      "essential",
+			Agreed:    true,
+			Version:   "v1",
+			ExpiresAt: time.Now().Add(365 * 24 * time.Hour),
+		})
+	}
+
+	analyticsCookie, err := r.Cookie("analytics_consent")
+	if err == nil && analyticsCookie.Value == "true" {
+		cookieConsents = append(cookieConsents, types.Consent{
+			Type:      "analytics",
+			Agreed:    true,
+			Version:   "v1",
+			ExpiresAt: time.Now().Add(365 * 24 * time.Hour),
+		})
+	} else {
+		cookieConsents = append(cookieConsents, types.Consent{
+			Type:    "analytics",
+			Agreed:  false,
+			Version: "v1",
+		})
+	}
+
+	marketingCookie, err := r.Cookie("marketing_consent")
+	if err == nil && marketingCookie.Value == "true" {
+		cookieConsents = append(cookieConsents, types.Consent{
+			Type:      "marketing",
+			Agreed:    true,
+			Version:   "v1",
+			ExpiresAt: time.Now().Add(365 * 24 * time.Hour),
+		})
+	} else {
+		cookieConsents = append(cookieConsents, types.Consent{
+			Type:    "marketing",
+			Agreed:  false,
+			Version: "v1",
+		})
+	}
+
+	// Complete consent processing log
+	now = time.Now()
+	consentProcessingLog.Status = "completed"
+	consentProcessingLog.CompletedAt = &now
+
+	// GDPR Data Processing Log: User account creation
+	userCreationLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "user_account_creation",
+		ProcessedData: "user account data, email, role, consent preferences",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &newUser.ID,
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   body.Email,
+		Purpose:       "create user account for service access",
+	}
+
+	user, err := s.DB.InsertUser(r.Context(), newUser, cookieConsents, fingerprint, userCreationLog)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to create user in database")
+		s.Logger.Errorw("failed to create user",
+			"error", err,
+			"new_user_id", newUser.ID,
+			"body_email", body.Email,
+			"body_role", body.Role,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing logs with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "user creation failed"
+
+		userCreationLog.Status = "failed"
+		userCreationLog.CompletedAt = &now
+		userCreationLog.ErrorDetails = "database insertion failed"
+
+		// Record database error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "database_error"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activities
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, consentProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log consent processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, fingerprintProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log fingerprint processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, userCreationLog); logErr != nil {
+			s.Logger.Errorw("failed to log user creation activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Complete user creation log
+	now = time.Now()
+	userCreationLog.Status = "completed"
+	userCreationLog.CompletedAt = &now
+
+	// Add user ID to span
+	span.SetAttributes(
+		attribute.String("user.id", user.ID.String()),
+		attribute.Bool("user.is_email_verified", user.IsEmailVerified),
+	)
+
+	// GDPR Data Processing Log: Email verification processing
+	emailVerificationLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "email_verification_processing",
+		ProcessedData: "email address for verification token generation and sending",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "email-service",
+		UserID:        &user.ID,
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   user.Email,
+		Purpose:       "verify email address for account security",
+	}
+
+	// Send verification email
+	if err := s.SendEmailVerification(user.Email, user.ID.String()); err != nil {
+		// Log error but don't fail the signup
+		span.AddEvent("email_verification_failed", trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+		s.Logger.Errorw("Failed to send verification email",
+			"error", err,
+			"user_id", user.ID,
+			"email", user.Email,
+			"user_role", body.Role,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update email verification log with failure
+		now := time.Now()
+		emailVerificationLog.Status = "failed"
+		emailVerificationLog.CompletedAt = &now
+		emailVerificationLog.ErrorDetails = "email sending failed"
+
+		// Record email error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "email_sending"),
+			attribute.String("endpoint", "signup"),
+		))
+	} else {
+		span.AddEvent("email_verification_sent")
+		s.Logger.Infow("verification email sent successfully",
+			"user_id", user.ID,
+			"email", user.Email,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Complete email verification log
+		now = time.Now()
+		emailVerificationLog.Status = "completed"
+		emailVerificationLog.CompletedAt = &now
+	}
+
+	// Log email verification activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, emailVerificationLog); logErr != nil {
+		s.Logger.Errorw("failed to log email verification activity", "error", logErr)
+	}
+
+	// GDPR Data Processing Log: Session creation
+	deviceInfo := map[string]string{
+		"ip":         r.RemoteAddr,
+		"userAgent":  r.UserAgent(),
+		"deviceInfo": r.Header.Get("X-Device-Info"),
+		"isMobile":   r.Header.Get("X-Is-Mobile"),
+	}
+
+	sessionCreationLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "session_creation",
+		ProcessedData: "session token, device information, IP address",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &user.ID,
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   user.Email,
+		Purpose:       "maintain user session for authenticated access",
+	}
+
+	session, err := s.DB.CreateSession(user.ID, deviceInfo)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to create session")
+		s.Logger.Errorw("failed to create session",
+			"error", err,
+			"user_id", user.ID,
+			"user_email", user.Email,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing logs with failure
+		now := time.Now()
+		requestProcessingLog.Status = "failed"
+		requestProcessingLog.CompletedAt = &now
+		requestProcessingLog.ErrorDetails = "session creation failed"
+
+		sessionCreationLog.Status = "failed"
+		sessionCreationLog.CompletedAt = &now
+		sessionCreationLog.ErrorDetails = "session creation failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "session_creation"),
+			attribute.String("endpoint", "signup"),
+		))
+
+		// Log data processing activities
+		if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, consentProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log consent processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, fingerprintProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log fingerprint processing activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, userCreationLog); logErr != nil {
+			s.Logger.Errorw("failed to log user creation activity", "error", logErr)
+		}
+		if logErr := s.DB.CreateDataProcessingLog(ctx, sessionCreationLog); logErr != nil {
+			s.Logger.Errorw("failed to log session creation activity", "error", logErr)
+		}
+
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	// Complete session creation log
+	now = time.Now()
+	sessionCreationLog.Status = "completed"
+	sessionCreationLog.CompletedAt = &now
+	sessionCreationLog.SessionID = &session.ID
+
+	// Complete request processing log
+	requestProcessingLog.Status = "completed"
+	requestProcessingLog.CompletedAt = &now
+	requestProcessingLog.UserID = &user.ID
+	requestProcessingLog.SessionID = &session.ID
+
+	// Log all data processing activities
+	if logErr := s.DB.CreateDataProcessingLog(ctx, requestProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log request processing activity", "error", logErr)
+	}
+	if logErr := s.DB.CreateDataProcessingLog(ctx, consentProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log consent processing activity", "error", logErr)
+	}
+	if logErr := s.DB.CreateDataProcessingLog(ctx, fingerprintProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log fingerprint processing activity", "error", logErr)
+	}
+	if logErr := s.DB.CreateDataProcessingLog(ctx, userCreationLog); logErr != nil {
+		s.Logger.Errorw("failed to log user creation activity", "error", logErr)
+	}
+	if logErr := s.DB.CreateDataProcessingLog(ctx, sessionCreationLog); logErr != nil {
+		s.Logger.Errorw("failed to log session creation activity", "error", logErr)
+	}
+
+	// Add session info to span
+	span.SetAttributes(
+		attribute.String("session.id", session.ID.String()),
+		attribute.String("session.token_prefix", session.Token[:8]+"..."), // Only log prefix for security
+	)
+
+	// Record successful signup metrics
+	s.SignupCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "success"),
+		attribute.String("method", "email"),
+	))
+
+	s.ActiveSessions.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("user_id", user.ID.String()),
+	))
+
+	// Record business logic metric
+	s.SignupCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "success"),
+	))
+
+	// Return response indicating email verification is required
+	response := map[string]any{
+		"token":                 session.Token,
+		"email":                 user.Email,
+		"is_email_verified":     false,
+		"requires_verification": true,
+		"message":               "Account created successfully. Please check your email to verify your account.",
+	}
+
+	s.generateTokenResponse(w, r, session.Token, user.Email, response)
+
+	// Set successful status
+	span.SetStatus(codes.Ok, "Signup completed successfully")
+	span.SetAttributes(
+		attribute.String("response.status", "success"),
+		attribute.String("session.token_prefix", session.Token[:8]+"..."), // Only log prefix for security
+		attribute.Bool("email_verification.required", true),
+	)
+
+	s.Logger.Infow("user created successfully",
+		"user_id", user.ID,
+		"email", user.Email,
+		"role", user.Roles,
+		"session_id", session.ID,
+		"remote_address", remoteAddr,
+		"device_info", deviceInfo,
+		"device_fingerprint", fingerprintHeader,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+// Login handles both email/password and mobile login
+func (s *OAuthService) Login(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	fingerprintHeader := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "login"),
+		attribute.String("device.fingerprint", fingerprintHeader),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	// Decode request body
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to decode request body")
+		s.Logger.Errorw("could not read body",
+			"error", err,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+			"device_fingerprint", fingerprintHeader,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "decode_error"),
+			attribute.String("endpoint", "login"),
+		))
+		http.Error(w, "invalid credentials", http.StatusBadRequest)
+		return
+	}
+
+	// Add more span attributes after successful decode
+	span.SetAttributes(
+		attribute.String("user.email", body.Email),
+		attribute.String("device.fingerprint", fingerprintHeader),
+	)
+
+	s.Logger.Infow("processing login request",
+		"email", body.Email,
+		"device_fingerprint", fingerprintHeader,
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// Validate inputs
+	if err := s.validateLoginInput(body.Email, body.Password); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Login input validation failed")
+		s.Logger.Errorw("validate login input failed",
+			"error", err,
+			"body_email", body.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "input_validation"),
+			attribute.String("endpoint", "login"),
+		))
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// GDPR Data Processing Log: User authentication data access
+	authDataProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "user_authentication",
+		ProcessedData: "user credentials, IP address, device fingerprint",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   body.Email,
+		Purpose:       "authenticate user login attempt",
+	}
+
+	// Get user by email
+	user, err := s.DB.GetUserByEmail(ctx, body.Email)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Database query failed")
+		s.Logger.Errorw("database error during user lookup",
+			"error", err,
+			"body_email", body.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		authDataProcessingLog.Status = "failed"
+		authDataProcessingLog.CompletedAt = &now
+		authDataProcessingLog.ErrorDetails = "database query failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "database_error"),
+			attribute.String("endpoint", "login"),
+		))
+
+		// Log data processing activity even on failure
+		if logErr := s.DB.CreateDataProcessingLog(ctx, authDataProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	if user == nil {
+		span.SetStatus(codes.Error, "User not found")
+		s.Logger.Errorw("login attempt for non-existent user",
+			"body_email", body.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		authDataProcessingLog.Status = "failed"
+		authDataProcessingLog.CompletedAt = &now
+		authDataProcessingLog.ErrorDetails = "user not found"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "user_not_found"),
+			attribute.String("endpoint", "login"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, authDataProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Add user ID to span now that we have the user
+	span.SetAttributes(
+		attribute.String("user.id", user.ID.String()),
+		attribute.Bool("user.is_email_verified", user.IsEmailVerified),
+		attribute.Bool("user.is_banned", user.IsBanned),
+		attribute.Bool("user.is_locked", user.IsLocked),
+	)
+
+	// Update data processing log with user ID
+	authDataProcessingLog.UserID = &user.ID
+
+	// Security checks
+	if err := s.performSecurityChecks(user, body.Password, r); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Security checks failed")
+		s.Logger.Errorw("failed security check",
+			"error", err,
+			"user_id", user.ID,
+			"user_email", user.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with security failure
+		now := time.Now()
+		authDataProcessingLog.Status = "failed"
+		authDataProcessingLog.CompletedAt = &now
+		authDataProcessingLog.ErrorDetails = "security checks failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "security_check_failed"),
+			attribute.String("endpoint", "login"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, authDataProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Update last login
+	if err := s.updateLastLogin(r.Context(), user); err != nil {
+		span.AddEvent("last_login_update_failed", trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+		s.Logger.Errorw("failed to update last login",
+			"error", err,
+			"user_id", user.ID,
+			"user_email", user.Email,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+	} else {
+		span.AddEvent("last_login_updated")
+	}
+
+	fingerprint := extractFingerprintFromRequest(w, r)
+
+	// GDPR Data Processing Log: Device fingerprint processing
+	now := time.Now()
+	fingerprintDataProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "device_fingerprint_processing",
+		ProcessedData: "device fingerprint, IP address, user agent",
+		RequestedAt:   now,
+		Status:        "completed",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &user.ID,
+		LegalBasis:    "legitimate_interest", // GDPR Article 6(1)(f)
+		DataSubject:   user.Email,
+		Purpose:       "device recognition for security and fraud prevention",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		CompletedAt:   &now,
+	}
+
+	_, err = s.DB.UpsertFingerprint(*fingerprint, user.ID.String(), *fingerprintDataProcessingLog)
+	if err != nil {
+		span.AddEvent("fingerprint_upsert_failed", trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+		s.Logger.Errorw("failed to upsert fingerprint",
+			"error", err,
+			"user_id", user.ID,
+			"fingerprint", fingerprint,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+		// Continue despite fingerprint error - not critical for login
+	} else {
+		span.AddEvent("fingerprint_upserted")
+	}
+
+	// Create session
+	deviceInfo := map[string]string{
+		"ip":         remoteAddr,
+		"userAgent":  userAgent,
+		"deviceInfo": r.Header.Get("X-Device-Info"),
+		"isMobile":   r.Header.Get("X-Is-Mobile"),
+	}
+
+	// GDPR Data Processing Log: Session creation
+	sessionDataProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "session_creation",
+		ProcessedData: "session token, device information, IP address",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		UserID:        &user.ID,
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   user.Email,
+		Purpose:       "maintain user session for authenticated access",
+	}
+
+	session, err := s.DB.CreateSession(user.ID, deviceInfo)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to create session")
+		s.Logger.Errorw("failed to create session",
+			"error", err,
+			"user_id", user.ID,
+			"user_email", user.Email,
+			"device_info", deviceInfo,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update session data processing log with failure
+		now := time.Now()
+		sessionDataProcessingLog.Status = "failed"
+		sessionDataProcessingLog.CompletedAt = &now
+		sessionDataProcessingLog.ErrorDetails = "session creation failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "session_creation"),
+			attribute.String("endpoint", "login"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, sessionDataProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	// Update session data processing log with success
+	now = time.Now()
+	sessionDataProcessingLog.Status = "completed"
+	sessionDataProcessingLog.CompletedAt = &now
+	sessionDataProcessingLog.SessionID = &session.ID
+
+	// Log session creation data processing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, sessionDataProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log session creation data processing activity", "error", logErr)
+	}
+
+	// Update auth data processing log with success
+	now = time.Now()
+	authDataProcessingLog.Status = "completed"
+	authDataProcessingLog.CompletedAt = &now
+	authDataProcessingLog.SessionID = &session.ID
+
+	// Log authentication data processing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, authDataProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log authentication data processing activity", "error", logErr)
+	}
+
+	// Add session info to span
+	span.SetAttributes(
+		attribute.String("session.id", session.ID.String()),
+		attribute.String("session.token_prefix", session.Token[:8]+"..."), // Only log prefix for security
+	)
+
+	// Record successful login metrics
+	s.LoginCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "success"),
+		attribute.String("method", "email"),
+		attribute.Bool("email_verified", user.IsEmailVerified),
+	))
+
+	s.ActiveSessions.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("user_id", user.ID.String()),
+	))
+
+	// Handle unverified email case
+	if !user.IsEmailVerified {
+		span.AddEvent("email_unverified", trace.WithAttributes(
+			attribute.String("user_id", user.ID.String()),
+			attribute.String("account_age", time.Since(user.CreatedAt).String()),
+		))
+
+		// Resend verification email if account is older than 24 hours
+		if time.Since(user.CreatedAt) > 24*time.Hour {
+			if err := s.SendEmailVerification(user.Email, user.ID.String()); err != nil {
+				span.AddEvent("email_verification_resend_failed", trace.WithAttributes(
+					attribute.String("error", err.Error()),
+				))
+				s.Logger.Errorw("Failed to resend verification email during login",
+					"error", err,
+					"user_id", user.ID,
+					"trace_id", traceID,
+					"span_id", spanID,
+				)
+			} else {
+				span.AddEvent("email_verification_resent")
+			}
+		}
+
+		// Return response indicating email needs verification
+		response := map[string]interface{}{
+			"token":                 session.Token,
+			"email":                 user.Email,
+			"is_email_verified":     false,
+			"requires_verification": true,
+			"message":               "Please verify your email to access all features",
+		}
+
+		s.generateTokenResponse(w, r, session.Token, user.Email, response)
+
+		span.SetStatus(codes.Ok, "Login successful - email verification required")
+		s.Logger.Infow("user logged in with unverified email",
+			"user_id", user.ID,
+			"email", user.Email,
+			"session_id", session.ID,
+			"remote_address", remoteAddr,
+			"device_info", deviceInfo,
+			"device_fingerprint", fingerprintHeader,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+		return
+	}
+
+	// Successful login with verified email
+	response := map[string]any{
+		"token":             session.Token,
+		"email":             user.Email,
+		"is_email_verified": true,
+		"message":           "Login successful",
+	}
+
+	// Send response based on client type
+	s.generateTokenResponse(w, r, session.Token, user.Email, response)
+
+	// Record business logic metric
+	s.LoginCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "success"),
+		attribute.String("method", "email"),
+	))
+
+	// Set successful status
+	span.SetStatus(codes.Ok, "Login completed successfully")
+	span.SetAttributes(
+		attribute.String("response.status", "success"),
+		attribute.Bool("email_verification.verified", true),
+	)
+
+	s.Logger.Infow("user logged in successfully",
+		"user_id", user.ID,
+		"email", user.Email,
+		"session_id", session.ID,
+		"remote_address", remoteAddr,
+		"device_info", deviceInfo,
+		"device_fingerprint", fingerprintHeader,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+}
+
+func (s *OAuthService) Logout(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	fingerprint := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "logout"),
+		attribute.String("device.fingerprint", fingerprint),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	s.Logger.Infow("processing logout request",
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"device_fingerprint", fingerprint,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// GDPR Data Processing Log: Initial logout request processing
+	logoutProcessingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "logout_request_processing",
+		ProcessedData: "logout request data, IP address, device fingerprint",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		Purpose:       "process user logout request",
+	}
+
+	// Get token from Authorization header or cookie
+	var sessionToken string
+	var isWebClient bool
+
+	// Try Authorization header first (for mobile/API clients)
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		sessionToken = strings.TrimPrefix(authHeader, "Bearer ")
+		isWebClient = false
+	} else {
+		// Try cookie (for web clients)
+		cookieName := "__Host-session-token"
+		isWebClient = true
+
+		cookie, err := r.Cookie(cookieName)
+		if err != nil || cookie.Value == "" {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "No session token provided")
+
+			s.Logger.Warnw("no session token provided",
+				"error", err,
+				"remote_address", remoteAddr,
+				"device_info", userAgent,
+				"trace_id", traceID,
+				"span_id", spanID,
+			)
+
+			// Update data processing log with failure
+			now := time.Now()
+			logoutProcessingLog.Status = "failed"
+			logoutProcessingLog.CompletedAt = &now
+			logoutProcessingLog.ErrorDetails = "no session token provided"
+
+			// Log data processing activity even on failure
+			if logErr := s.DB.CreateDataProcessingLog(ctx, logoutProcessingLog); logErr != nil {
+				s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+			}
+
+			http.Error(w, "no session token provided", http.StatusBadRequest)
+			return
+		}
+		sessionToken = cookie.Value
+	}
+
+	// Add session token to span (partially masked for security)
+	maskedToken := ""
+	if len(sessionToken) > 8 {
+		maskedToken = sessionToken[:4] + "****" + sessionToken[len(sessionToken)-4:]
+	}
+	span.SetAttributes(
+		attribute.String("session.token_masked", maskedToken),
+		attribute.Bool("client.is_web", isWebClient),
+	)
+
+	// Get and validate session
+	session, err := s.DB.GetSession(r.Context(), sessionToken)
+	if err != nil || session == nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Invalid session token")
+
+		s.Logger.Errorw("invalid session token during logout",
+			"error", err,
+			"session_token_masked", maskedToken,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		logoutProcessingLog.Status = "failed"
+		logoutProcessingLog.CompletedAt = &now
+		logoutProcessingLog.ErrorDetails = "invalid session token"
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, logoutProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		// Still clear cookies for web clients even with invalid session
+		if isWebClient {
+			s.clearAuthCookies(w)
+		}
+
+		http.Error(w, "invalid session", http.StatusUnauthorized)
+		return
+	}
+
+	// Check if session is already revoked
+	if session.IsRevoked {
+		span.AddEvent("session_already_revoked")
+		s.Logger.Warnw("logout attempt on already revoked session",
+			"session_id", session.ID,
+			"user_id", session.UserID,
+			"revoked_at", session.RevokedAt,
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Complete logout processing log
+		now := time.Now()
+		logoutProcessingLog.Status = "completed"
+		logoutProcessingLog.CompletedAt = &now
+		logoutProcessingLog.UserID = &session.UserID
+		logoutProcessingLog.SessionID = &session.ID
+
+		// Get user info for complete data processing logging
+		if user, err := s.DB.GetUserByID(ctx, session.UserID); err == nil && user != nil {
+			logoutProcessingLog.DataSubject = user.Email
+		}
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, logoutProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		// Clear cookies for web clients
+		if isWebClient {
+			s.clearAuthCookies(w)
+		}
+
+		// Return success even for already revoked sessions
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "already logged out",
+		})
+		return
+	}
+
+	// Add user info to span
+	span.SetAttributes(
+		attribute.String("user.id", session.UserID.String()),
+		attribute.String("session.id", session.ID.String()),
+	)
+
+	// Get user info for complete data processing logging
+	var userEmail string
+	if user, err := s.DB.GetUserByID(ctx, session.UserID); err == nil && user != nil {
+		userEmail = user.Email
+		logoutProcessingLog.DataSubject = userEmail
+	}
+
+	// Revoke the session (this will create its own data processing log)
+	revokedSession, err := s.DB.RevokeSession(r.Context(), session)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to revoke session")
+
+		s.Logger.Errorw("failed to revoke session",
+			"error", err,
+			"session_id", session.ID,
+			"user_id", session.UserID,
+			"session_token_masked", maskedToken,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update logout processing log with failure
+		now := time.Now()
+		logoutProcessingLog.Status = "failed"
+		logoutProcessingLog.CompletedAt = &now
+		logoutProcessingLog.ErrorDetails = "session revocation failed"
+		logoutProcessingLog.UserID = &session.UserID
+		logoutProcessingLog.SessionID = &session.ID
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, logoutProcessingLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Clear cookies for web clients
+	if isWebClient {
+		s.clearAuthCookies(w)
+	}
+
+	// Complete logout processing log
+	now := time.Now()
+	logoutProcessingLog.Status = "completed"
+	logoutProcessingLog.CompletedAt = &now
+	logoutProcessingLog.UserID = &session.UserID
+	logoutProcessingLog.SessionID = &session.ID
+
+	// Log logout processing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, logoutProcessingLog); logErr != nil {
+		s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+	}
+
+	// Record successful logout metrics
+	s.LogoutCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "success"),
+		attribute.String("client_type", func() string {
+			if isWebClient {
+				return "web"
+			}
+			return "mobile"
+		}()),
+	))
+
+	// Decrement active sessions counter
+	s.ActiveSessions.Add(ctx, -1, metric.WithAttributes(
+		attribute.String("user_id", session.UserID.String()),
+	))
+
+	// Log successful logout
+	s.Logger.Infow("logout successful",
+		"user_id", session.UserID,
+		"session_id", session.ID,
+		"session_token_masked", maskedToken,
+		"remote_address", remoteAddr,
+		"device_info", userAgent,
+		"is_web_client", isWebClient,
+		"revoked_at", revokedSession.RevokedAt,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	span.SetAttributes(
+		attribute.String("logout.status", "success"),
+		attribute.String("logout.client_type", func() string {
+			if isWebClient {
+				return "web"
+			}
+			return "mobile"
+		}()),
+	)
+	span.SetStatus(codes.Ok, "Logout completed successfully")
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "successfully logged out",
+	})
+}
+
+// AuthMe retrieves authenticated user information by session token with GDPR compliance
+func (s *OAuthService) AuthMe(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	fingerprint := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "auth_me"),
+		attribute.String("device.fingerprint", fingerprint),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	s.Logger.Infow("processing auth/me request",
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"device_fingerprint", fingerprint,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// GDPR Data Processing Log: User profile data access
+	profileAccessLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "user_profile_access",
+		ProcessedData: "user profile information retrieval",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "legitimate_interest", // GDPR Article 6(1)(f)
+		Purpose:       "provide authenticated user profile information",
+	}
+
+	// Get token from Authorization header or cookie
+	var sessionToken string
+	var isWebClient bool
+
+	// Try Authorization header first (for mobile/API clients)
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		sessionToken = strings.TrimPrefix(authHeader, "Bearer ")
+		isWebClient = false
+	} else {
+		// Try cookie (for web clients)
+		cookieName := "__Host-session-token"
+		isWebClient = true
+
+		cookie, err := r.Cookie(cookieName)
+		if err != nil || cookie.Value == "" {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "No session token provided")
+
+			s.Logger.Warnw("no session token provided for auth/me",
+				"error", err,
+				"remote_address", remoteAddr,
+				"device_info", userAgent,
+				"trace_id", traceID,
+				"span_id", spanID,
+			)
+
+			// Update data processing log with failure
+			now := time.Now()
+			profileAccessLog.Status = "failed"
+			profileAccessLog.CompletedAt = &now
+			profileAccessLog.ErrorDetails = "no session token provided"
+
+			// Log data processing activity even on failure
+			if logErr := s.DB.CreateDataProcessingLog(ctx, profileAccessLog); logErr != nil {
+				s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+			}
+
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sessionToken = cookie.Value
+	}
+
+	// Add session token to span (partially masked for security)
+	maskedToken := ""
+	if len(sessionToken) > 8 {
+		maskedToken = sessionToken[:4] + "****" + sessionToken[len(sessionToken)-4:]
+	}
+	span.SetAttributes(
+		attribute.String("session.token_masked", maskedToken),
+		attribute.Bool("client.is_web", isWebClient),
+	)
+
+	// Get user by session token with validation
+	user, session, err := s.DB.GetUserBySessionToken(ctx, sessionToken)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Invalid or expired session")
+
+		s.Logger.Warnw("invalid session token for auth/me",
+			"error", err,
+			"session_token_masked", maskedToken,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		profileAccessLog.Status = "failed"
+		profileAccessLog.CompletedAt = &now
+		profileAccessLog.ErrorDetails = "invalid or expired session"
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, profileAccessLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Add user info to span and data processing log
+	span.SetAttributes(
+		attribute.String("user.id", user.ID.String()),
+		attribute.String("session.id", session.ID.String()),
+		attribute.Bool("user.is_email_verified", user.IsEmailVerified),
+	)
+
+	// Update data processing log with user information
+	profileAccessLog.UserID = &user.ID
+	profileAccessLog.SessionID = &session.ID
+	profileAccessLog.DataSubject = user.Email
+
+	// Create safe user response (exclude sensitive data)
+	safeUser := SafeUserResponse{
+		ID:              user.ID,
+		Email:           user.Email,
+		Roles:           user.Roles,
+		IsEmailVerified: user.IsEmailVerified,
+		MFAEnabled:      user.MFAEnabled,
+		LastLoginAt:     user.LastLoginAt,
+		CreatedAt:       user.CreatedAt,
+		UpdatedAt:       user.UpdatedAt,
+	}
+
+	// Conditionally include PFP and Gender if user has appropriate consents
+	// For now, we'll include them if they exist (in production, check user consents)
+	if user.PFP != "" {
+		safeUser.PFP = &user.PFP
+	}
+	if user.Gender != "" {
+		safeUser.Gender = &user.Gender
+	}
+
+	// Complete data processing log
+	now := time.Now()
+	profileAccessLog.Status = "completed"
+	profileAccessLog.CompletedAt = &now
+
+	// Log data processing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, profileAccessLog); logErr != nil {
+		s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+	}
+
+	// Record successful auth/me metric
+	s.RequestCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("endpoint", "auth_me"),
+		attribute.String("status", "success"),
+		attribute.String("client_type", func() string {
+			if isWebClient {
+				return "web"
+			}
+			return "mobile"
+		}()),
+	))
+
+	// Log successful auth/me request
+	s.Logger.Infow("auth/me request successful",
+		"user_id", user.ID,
+		"session_id", session.ID,
+		"email", user.Email,
+		"session_token_masked", maskedToken,
+		"remote_address", remoteAddr,
+		"device_info", userAgent,
+		"is_web_client", isWebClient,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	span.SetAttributes(
+		attribute.String("auth_me.status", "success"),
+		attribute.String("auth_me.client_type", func() string {
+			if isWebClient {
+				return "web"
+			}
+			return "mobile"
+		}()),
+	)
+	span.SetStatus(codes.Ok, "Auth/me completed successfully")
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"user":    safeUser,
+	})
+}
+
+// // Helper functions
+
+// generateTokenResponse creates a unified response for both web and mobile clients
+func (s *OAuthService) generateTokenResponse(w http.ResponseWriter, r *http.Request, token string, email string, response map[string]any) {
+	// First, try to determine if it's a mobile client based on User-Agent
+	userAgent := strings.ToLower(r.Header.Get("User-Agent"))
+	isMobileClient := strings.Contains(userAgent, "react-native") ||
+		strings.Contains(userAgent, "expo") ||
+		r.Header.Get("X-Client-Type") == "mobile"
+
+	response["token"] = token
+
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	csrf_token := base64.URLEncoding.EncodeToString(b)
+
+	sessionCookieName := "__Host-session-token"
+
+	cookies := map[string]string{
+		sessionCookieName: token,
+		"csrf_token":      csrf_token,
+	}
+
+	s.Logger.Infow("creating tokens", "token", token)
+	// For web clients, also set cookies
+	if !isMobileClient {
+		s.setSecureCookies(w, cookies)
+	}
+
+	// Send JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Session-Token", token)
+	w.Header().Set("X-CSRF-Token", token)
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *OAuthService) validatePassword(password string) error {
+	// Strong password validation
+	if len(password) < 8 {
+		return errors.New("password must be at least 8 characters long")
+	}
+	if len(password) > 64 {
+		return errors.New("password must be at most 64 characters long")
+	}
+
+	var (
+		hasUpper   = false
+		hasLower   = false
+		hasDigit   = false
+		hasSpecial = false
+		categories = 0
+	)
+
+	for _, c := range password {
+		switch {
+		case !hasUpper && unicode.IsUpper(c):
+			hasUpper = true
+			categories++
+		case !hasLower && unicode.IsLower(c):
+			hasLower = true
+			categories++
+		case !hasDigit && unicode.IsDigit(c):
+			hasDigit = true
+			categories++
+		case !hasSpecial && !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			hasSpecial = true
+			categories++
+		}
+
+		// Early exit if we meet minimum categories
+		if categories >= 3 {
+			break
+		}
+	}
+
+	if categories < 3 {
+		return errors.New("password must include characters from at least three of the following categories: uppercase letters, lowercase letters, digits, special characters")
+	}
+
+	return nil
+}
+
+func (s *OAuthService) validateLoginInput(email, password string) error {
+	if email == "" || password == "" {
+		return errors.New("email and password are required")
+	}
+
+	emailPattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	if matched, _ := regexp.MatchString(emailPattern, email); !matched {
+		return errors.New("invalid email format")
+	}
+
+	// Strong password validation
+	if err := s.validatePassword(password); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *OAuthService) clearAuthCookies(w http.ResponseWriter) {
+	// Clear all authentication-related cookies
+	cookiesToClear := []string{
+		"__Host-session-token",
+		"csrf_token",
+		"anonymous_id",
+	}
+
+	for _, cookieName := range cookiesToClear {
+		http.SetCookie(w, &http.Cookie{
+			Name:     cookieName,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			Domain:   s.VaultConfig.CookieDomain,
+			HttpOnly: strings.HasPrefix(cookieName, "__Host-"),
+			Secure:   true, // Always secure - TLS handled by Kubernetes Ingress
+			SameSite: http.SameSiteNoneMode,
+		})
+	}
+
+	// Set CORS headers - Frontend is always served over HTTPS via Kubernetes Ingress
+	frontendURL := fmt.Sprintf("https://%s:%s", s.VaultConfig.FrontendHost, s.VaultConfig.FrontendPort)
+	w.Header().Set("Access-Control-Allow-Origin", frontendURL)
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+
+func (s *OAuthService) setSecureCookies(w http.ResponseWriter, values map[string]string) {
+	// isSecure := false
+	// mode := http.SameSiteLaxMode
+	// domain := ""
+
+	domain := s.VaultConfig.CookieDomain
+	isSecure := true
+	mode := http.SameSiteNoneMode
+
+	for k, v := range values {
+		// httpOnly := (k == "__Host-session-token")
+		httpOnly := strings.HasPrefix(k, "__Host-")
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     k,
+			Value:    v,
+			Path:     "/",
+			MaxAge:   604800,
+			Domain:   domain,
+			HttpOnly: httpOnly,
+			Secure:   isSecure,
+			SameSite: mode,
+		})
+	}
+
+	// Frontend is always served over HTTPS via Kubernetes Ingress
+	frontendURL := fmt.Sprintf("https://%s:%s", s.VaultConfig.FrontendHost, s.VaultConfig.FrontendPort)
+	w.Header().Set("Access-Control-Allow-Origin", frontendURL)
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+
+// updateLastLogin updates the user's last login timestamp
+func (s *OAuthService) updateLastLogin(ctx context.Context, user *types.User) error {
+	return s.DB.UpdateLastLogin(context.Background(), user.ID)
+}
+
+func (s *OAuthService) performSecurityChecks(user *types.User, password string, r *http.Request) error {
+	if user.IsBanned {
+		return errors.New("account is banned")
+	}
+
+	if user.IsLocked {
+		return errors.New("account is locked")
+	}
+
+	if !s.verifyPassword(password, user.Password) {
+		return errors.New("invalid password")
+	}
+
+	userAgent := r.Header.Get("User-Agent")
+	if userAgent == "" {
+		return errors.New("missing user agent")
+	}
+
+	now := time.Now()
+	if user.LastLoginAt.IsZero() {
+		user.LastLoginAt = now
+	}
+
+	timeSinceLastLogin := now.Sub(user.LastLoginAt)
+	if timeSinceLastLogin > 90*24*time.Hour {
+		s.Logger.Warnf("User %s login after %v days", user.Email, timeSinceLastLogin.Hours()/24)
+	}
+
+	activeSessions := 0
+	for _, session := range user.Sessions {
+		if !session.IsRevoked && session.ExpireAt.After(now) {
+			activeSessions++
+		}
+	}
+
+	if activeSessions >= MaxConcurrentLogins {
+		return errors.New("too many active sessions")
+	}
+
+	return nil
+}
+
+func extractFingerprintFromRequest(w http.ResponseWriter, r *http.Request) *types.Fingerprint {
+	// Get anonymous ID from cookie if exists
+	anonymousID, err := r.Cookie("anonymous_id")
+	var anonymousIDValue string
+	if err != nil {
+		// Generate new anonymous ID
+		b := make([]byte, 16)
+		rand.Read(b)
+		anonymousIDValue = base64.URLEncoding.EncodeToString(b)
+		http.SetCookie(w, &http.Cookie{
+			Name:     "anonymous_id",
+			Value:    anonymousIDValue,
+			MaxAge:   int(365 * 24 * time.Hour.Seconds()),
+			Path:     "/",
+			HttpOnly: false, // Needs to be accessible to JavaScript for analytics
+			Secure:   true,  // Always secure - TLS handled by Kubernetes Ingress
+			SameSite: http.SameSiteNoneMode, // Required for cross-origin requests with Secure=true
+		})
+	} else {
+		anonymousIDValue = anonymousID.Value
+	}
+
+	// Get fingerprint data from headers
+	return &types.Fingerprint{
+		ID:            uuid.New(),
+		AnonymousID:   anonymousIDValue,
+		Fingerprint:   r.Header.Get("X-Fingerprint"),
+		Browser:       r.Header.Get("X-Browser"),
+		OS:            r.Header.Get("X-OS"),
+		Device:        r.Header.Get("X-Device"),
+		Screen:        r.Header.Get("X-Screen"),
+		Language:      r.Header.Get("X-Language"),
+		Timezone:      r.Header.Get("X-Timezone"),
+		IP:            r.RemoteAddr,
+		Country:       r.Header.Get("X-Country"),
+		Region:        r.Header.Get("X-Region"),
+		City:          r.Header.Get("X-City"),
+		ISP:           r.Header.Get("X-ISP"),
+		LastSeen:      time.Now(),
+		VisitCount:    1,
+		ConsentStatus: r.Header.Get("X-Consent-Status"),
+	}
+}
+
+// SendEmailVerification generates and sends an email verification token with comprehensive observability and GDPR compliance
+func (s *OAuthService) SendEmailVerification(userEmail, userID string) error {
+	ctx := context.Background()
+	_, span := s.Tracer.Start(ctx, "email_verification_send")
+	defer span.End()
+
+	// Add span attributes
+	span.SetAttributes(
+		attribute.String("email.recipient", userEmail),
+		attribute.String("user.id", userID),
+		attribute.String("email.type", "verification"),
+	)
+
+	// GDPR Data Processing Log: Email verification token generation
+	tokenGenerationLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "email_verification_token_generation",
+		ProcessedData: "email address and verification token generation",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		ProcessorID:   "email-service",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   userEmail,
+		Purpose:       "generate secure email verification token",
+	}
+
+	// Parse user ID to UUID
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Invalid user ID format")
+		s.Logger.Errorw("Invalid user ID format for email verification", "error", err, "user_id", userID)
+
+		// Update data processing log with failure
+		now := time.Now()
+		tokenGenerationLog.Status = "failed"
+		tokenGenerationLog.CompletedAt = &now
+		tokenGenerationLog.ErrorDetails = "invalid user ID format"
+
+		// Record error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "invalid_user_id"),
+			attribute.String("operation", "email_verification"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, tokenGenerationLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		return fmt.Errorf("invalid user ID format: %w", err)
+	}
+
+	tokenGenerationLog.UserID = &userUUID
+
+	// Generate a secure token
+	token, err := generateSecureToken(32)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to generate verification token")
+		s.Logger.Errorw("Failed to generate email verification token", "error", err, "user_id", userID)
+
+		// Update data processing log with failure
+		now := time.Now()
+		tokenGenerationLog.Status = "failed"
+		tokenGenerationLog.CompletedAt = &now
+		tokenGenerationLog.ErrorDetails = "token generation failed"
+
+		// Record error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "token_generation_failed"),
+			attribute.String("operation", "email_verification"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, tokenGenerationLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		return fmt.Errorf("failed to generate verification token: %w", err)
+	}
+
+	// Complete token generation log
+	now := time.Now()
+	tokenGenerationLog.Status = "completed"
+	tokenGenerationLog.CompletedAt = &now
+
+	// Log token generation activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, tokenGenerationLog); logErr != nil {
+		s.Logger.Errorw("failed to log token generation activity", "error", logErr)
+	}
+
+	// Store the token in database
+	verificationToken, err := s.DB.CreateEmailVerificationToken(ctx, userUUID, userEmail, token, "unknown")
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to store verification token")
+		s.Logger.Errorw("Failed to store email verification token", "error", err, "user_id", userID)
+		
+		// Update data processing log with failure
+		now := time.Now()
+		tokenGenerationLog.Status = "failed"
+		tokenGenerationLog.CompletedAt = &now
+		tokenGenerationLog.ErrorDetails = "token storage failed"
+		
+		// Record error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "token_storage_failed"),
+			attribute.String("operation", "email_verification"),
+		))
+		
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, tokenGenerationLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+		
+		return fmt.Errorf("failed to store verification token: %w", err)
+	}
+
+	s.Logger.Infow("Email verification token stored in database", "user_id", userID, "token_length", len(token), "expires_at", verificationToken.ExpiresAt)
+
+	// Create verification URL - Frontend is always served over HTTPS via Kubernetes Ingress
+	verificationURL := fmt.Sprintf("https://%s:%s/verify-email?token=%s",
+		s.VaultConfig.FrontendHost,
+		s.VaultConfig.FrontendPort,
+		token)
+
+	// GDPR Data Processing Log: Email sending
+	emailSendingLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		UserID:        &userUUID,
+		ProcessType:   "email_verification_sending",
+		ProcessedData: "email address for verification email transmission",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		ProcessorID:   "aws-ses",
+		LegalBasis:    "contract_performance", // GDPR Article 6(1)(b)
+		DataSubject:   userEmail,
+		Purpose:       "send email verification link to user",
+	}
+
+	// Create professional email template
+	emailHTML := s.createProfessionalVerificationEmail(userEmail, verificationURL)
+
+	// Send the email using AWS SES
+	input := &ses.SendEmailInput{
+		Source: aws.String("no-reply@plyer.org"),
+		Destination: &awstypes.Destination{
+			ToAddresses: []string{userEmail},
+		},
+		Message: &awstypes.Message{
+			Subject: &awstypes.Content{
+				Data: aws.String("Verify Your Email Address - Plyer"),
+			},
+			Body: &awstypes.Body{
+				Html: &awstypes.Content{
+					Data: aws.String(emailHTML),
+				},
+			},
+		},
+	}
+
+	resp, err := s.SESClient.SendEmail(ctx, input)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to send verification email")
+		s.Logger.Errorw("Failed to send verification email",
+			"error", err,
+			"email", userEmail,
+			"user_id", userID)
+
+		// Update email sending log with failure
+		now := time.Now()
+		emailSendingLog.Status = "failed"
+		emailSendingLog.CompletedAt = &now
+		emailSendingLog.ErrorDetails = "email transmission failed"
+
+		// Record error metric
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "email_sending_failed"),
+			attribute.String("operation", "email_verification"),
+		))
+
+		// Log email sending activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, emailSendingLog); logErr != nil {
+			s.Logger.Errorw("failed to log email sending activity", "error", logErr)
+		}
+
+		return fmt.Errorf("failed to send verification email: %w", err)
+	}
+
+	// Complete email sending log
+	now = time.Now()
+	emailSendingLog.Status = "completed"
+	emailSendingLog.CompletedAt = &now
+
+	// Log email sending activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, emailSendingLog); logErr != nil {
+		s.Logger.Errorw("failed to log email sending activity", "error", logErr)
+	}
+
+	// Record successful email verification metric
+	s.EmailVerifications.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "sent"),
+		attribute.String("email_type", "verification"),
+	))
+
+	// Add span attributes for successful sending
+	span.SetAttributes(
+		attribute.String("email.message_id", *resp.MessageId),
+		attribute.String("email.status", "sent"),
+	)
+	span.SetStatus(codes.Ok, "Email verification sent successfully")
+
+	s.Logger.Infow("Verification email sent successfully",
+		"email", userEmail,
+		"user_id", userID,
+		"message_id", *resp.MessageId,
+		"verification_url_length", len(verificationURL))
+
+	return nil
+}
+
+// RequestPasswordReset initiates a password reset process with OTP
+func (s *OAuthService) RequestPasswordReset(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	fingerprint := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "request_password_reset"),
+		attribute.String("device.fingerprint", fingerprint),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	s.Logger.Infow("processing password reset request",
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"device_fingerprint", fingerprint,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// GDPR Data Processing Log: Password reset request processing
+	resetRequestLog := &types.DataProcessingLog{
+		ID:            uuid.New(),
+		ProcessType:   "password_reset_request_processing",
+		ProcessedData: "password reset request data, email address verification",
+		RequestedAt:   time.Now(),
+		Status:        "processing",
+		RequestIP:     remoteAddr,
+		ProcessorID:   "auth-service",
+		LegalBasis:    "legitimate_interest", // GDPR Article 6(1)(f)
+		Purpose:       "process secure password reset request",
+	}
+
+	var body struct {
+		Email string `json:"email"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to decode request body")
+		s.Logger.Errorw("could not read password reset request body",
+			"error", err,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "request body decode failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "decode_error"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity even on failure
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Validate email format
+	if body.Email == "" {
+		span.SetStatus(codes.Error, "Email is required")
+		s.Logger.Errorw("empty email in password reset request",
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "empty email address"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "validation_error"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "email is required", http.StatusBadRequest)
+		return
+	}
+
+	// Add email to span and processing log
+	span.SetAttributes(attribute.String("user.email", body.Email))
+	resetRequestLog.DataSubject = body.Email
+
+	// Get user by email
+	user, err := s.DB.GetUserByEmailForReset(ctx, body.Email)
+	if err != nil {
+		// For security reasons, we don't reveal if the email exists or not
+		// Always return success to prevent email enumeration attacks
+		span.AddEvent("user_not_found_security_response")
+		s.Logger.Warnw("password reset requested for non-existent email",
+			"email", body.Email,
+			"error", err,
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Complete data processing log with security response
+		now := time.Now()
+		resetRequestLog.Status = "completed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "user not found - security response sent"
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		// Return success to prevent email enumeration
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "If the email exists, a password reset code has been sent.",
+		})
+		return
+	}
+
+	// Add user ID to span and processing log
+	span.SetAttributes(attribute.String("user.id", user.ID.String()))
+	resetRequestLog.UserID = &user.ID
+
+	// Check if user is banned or locked
+	if user.IsBanned {
+		span.SetStatus(codes.Error, "User account is banned")
+		s.Logger.Warnw("password reset attempted for banned user",
+			"user_id", user.ID,
+			"email", body.Email,
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "user account is banned"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "banned_user"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "account access denied", http.StatusForbidden)
+		return
+	}
+
+	if user.IsLocked {
+		span.SetStatus(codes.Error, "User account is locked")
+		s.Logger.Warnw("password reset attempted for locked user",
+			"user_id", user.ID,
+			"email", body.Email,
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "user account is locked"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "locked_user"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "account access denied", http.StatusForbidden)
+		return
+	}
+
+	// Generate secure reset token
+	resetToken, err := generateSecureToken(32)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to generate reset token")
+		s.Logger.Errorw("failed to generate password reset token",
+			"error", err,
+			"user_id", user.ID,
+			"email", body.Email,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "reset token generation failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "token_generation_failed"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Create password reset OTP in database
+	resetOTP, err := s.DB.CreatePasswordResetOTP(ctx, user.ID, user.Email, resetToken, remoteAddr)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to create reset OTP")
+		s.Logger.Errorw("failed to create password reset OTP",
+			"error", err,
+			"user_id", user.ID,
+			"email", body.Email,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with failure
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "OTP creation failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "otp_creation_failed"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Send password reset email with OTP
+	if err := s.SendPasswordResetEmail(user.Email, resetOTP.OTP, resetToken); err != nil {
+		span.RecordError(err)
+		span.AddEvent("password_reset_email_failed", trace.WithAttributes(
+			attribute.String("error", err.Error()),
+		))
+		s.Logger.Errorw("failed to send password reset email",
+			"error", err,
+			"user_id", user.ID,
+			"email", body.Email,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Update data processing log with email failure
+		now := time.Now()
+		resetRequestLog.Status = "failed"
+		resetRequestLog.CompletedAt = &now
+		resetRequestLog.ErrorDetails = "password reset email sending failed"
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "email_sending_failed"),
+			attribute.String("endpoint", "request_password_reset"),
+		))
+
+		// Log data processing activity
+		if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+			s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+		}
+
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Complete data processing log
+	now := time.Now()
+	resetRequestLog.Status = "completed"
+	resetRequestLog.CompletedAt = &now
+
+	// Log data processing activity
+	if logErr := s.DB.CreateDataProcessingLog(ctx, resetRequestLog); logErr != nil {
+		s.Logger.Errorw("failed to log data processing activity", "error", logErr)
+	}
+
+	// Record successful password reset request metric
+	s.PasswordResetCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("status", "requested"),
+		attribute.String("method", "email_otp"),
+	))
+
+	// Add span attributes for successful request
+	span.SetAttributes(
+		attribute.String("reset.token_prefix", resetToken[:8]+"..."),
+		attribute.String("reset.status", "sent"),
+	)
+	span.SetStatus(codes.Ok, "Password reset email sent successfully")
+
+	s.Logger.Infow("password reset email sent successfully",
+		"user_id", user.ID,
+		"email", body.Email,
+		"reset_token_prefix", resetToken[:8]+"...",
+		"otp_expires_at", resetOTP.ExpiresAt,
+		"remote_address", remoteAddr,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "If the email exists, a password reset code has been sent.",
+	})
+}
+
+// VerifyOTP verifies both password reset OTP and email verification tokens
+func (s *OAuthService) VerifyOTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := trace.SpanFromContext(ctx)
+
+	userAgent := r.Header.Get("User-Agent")
+	remoteAddr := r.RemoteAddr
+
+	// Extract trace information for logging
+	traceID := span.SpanContext().TraceID().String()
+	spanID := span.SpanContext().SpanID().String()
+
+	fingerprint := r.Header.Get("X-Fingerprint")
+
+	span.SetAttributes(
+		attribute.String("operation", "verify_otp"),
+		attribute.String("device.fingerprint", fingerprint),
+		attribute.String("http.remote_addr", remoteAddr),
+		attribute.String("http.user_agent", userAgent),
+	)
+
+	s.Logger.Infow("processing OTP/token verification request",
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"device_fingerprint", fingerprint,
+		"trace_id", traceID,
+		"span_id", spanID,
+	)
+
+	var body struct {
+		Token string `json:"token"`
+		OTP   string `json:"otp,omitempty"`   // Optional for email verification
+		Type  string `json:"type,omitempty"`  // "password_reset" or "email_verification"
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to decode request body")
+		s.Logger.Errorw("could not read OTP/token verification request body",
+			"error", err,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "decode_error"),
+			attribute.String("endpoint", "verify_otp"),
+		))
+
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Validate input
+	if body.Token == "" {
+		span.SetStatus(codes.Error, "Token is required")
+		s.Logger.Errorw("missing token in verification request",
+			"has_token", body.Token != "",
+			"has_otp", body.OTP != "",
+			"type", body.Type,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "validation_error"),
+			attribute.String("endpoint", "verify_otp"),
+		))
+
+		http.Error(w, "token is required", http.StatusBadRequest)
+		return
+	}
+
+	// Determine verification type
+	verificationType := body.Type
+	if verificationType == "" {
+		// Auto-detect based on whether OTP is provided
+		if body.OTP != "" {
+			verificationType = "password_reset"
+		} else {
+			verificationType = "email_verification"
+		}
+	}
+
+	// Validate based on type
+	if verificationType == "password_reset" && body.OTP == "" {
+		span.SetStatus(codes.Error, "OTP is required for password reset")
+		s.Logger.Errorw("missing OTP for password reset verification",
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "validation_error"),
+			attribute.String("endpoint", "verify_otp"),
+		))
+
+		http.Error(w, "OTP is required for password reset", http.StatusBadRequest)
+		return
+	}
+
+	// Add masked token to span for security
+	maskedToken := ""
+	if len(body.Token) > 8 {
+		maskedToken = body.Token[:4] + "****" + body.Token[len(body.Token)-4:]
+	}
+	span.SetAttributes(
+		attribute.String("reset.token_masked", maskedToken),
+		attribute.String("otp.length", fmt.Sprintf("%d", len(body.OTP))),
+	)
+
+	// Handle verification based on type
+	if verificationType == "password_reset" {
+		// Verify password reset OTP
+		resetOTP, err := s.DB.VerifyPasswordResetOTP(ctx, body.Token, body.OTP)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "Password reset OTP verification failed")
+			s.Logger.Errorw("Password reset OTP verification failed",
+				"error", err,
+				"token_masked", maskedToken,
+				"otp_length", len(body.OTP),
+				"remote_address", remoteAddr,
+				"device_info", userAgent,
+				"trace_id", traceID,
+				"span_id", spanID,
+			)
+
+			s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("error_type", "password_reset_otp_verification_failed"),
+				attribute.String("endpoint", "verify_otp"),
+			))
+
+			http.Error(w, "invalid or expired OTP", http.StatusUnauthorized)
+			return
+		}
+
+		// Add user info to span
+		span.SetAttributes(
+			attribute.String("user.id", resetOTP.UserID.String()),
+			attribute.String("user.email", resetOTP.Email),
+		)
+
+		// Record successful OTP verification metric
+		s.OTPVerificationCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("status", "success"),
+			attribute.String("type", "password_reset"),
+		))
+
+		// Set successful status
+		span.SetStatus(codes.Ok, "Password reset OTP verification completed successfully")
+		span.SetAttributes(
+			attribute.String("verification.status", "success"),
+			attribute.String("verification.user_id", resetOTP.UserID.String()),
+		)
+
+		s.Logger.Infow("Password reset OTP verification successful",
+			"user_id", resetOTP.UserID,
+			"email", resetOTP.Email,
+			"token_masked", maskedToken,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Send response with reset token for password change
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":     true,
+			"message":     "OTP verified successfully",
+			"reset_token": body.Token, // Return the token for password reset
+		})
+
+	} else if verificationType == "email_verification" {
+		// Verify email verification token
+		verifiedUser, err := s.DB.VerifyEmailToken(ctx, body.Token)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "Email verification token verification failed")
+			s.Logger.Errorw("Email verification token verification failed",
+				"error", err,
+				"token_masked", maskedToken,
+				"remote_address", remoteAddr,
+				"device_info", userAgent,
+				"trace_id", traceID,
+				"span_id", spanID,
+			)
+
+			s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("error_type", "email_verification_token_failed"),
+				attribute.String("endpoint", "verify_otp"),
+			))
+
+			http.Error(w, "invalid or expired verification token", http.StatusUnauthorized)
+			return
+		}
+
+		// Add user info to span
+		span.SetAttributes(
+			attribute.String("user.id", verifiedUser.ID.String()),
+			attribute.String("user.email", verifiedUser.Email),
+		)
+
+		// Record successful email verification metric
+		s.EmailVerifications.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("status", "verified"),
+			attribute.String("method", "token"),
+		))
+
+		// Set successful status
+		span.SetStatus(codes.Ok, "Email verification completed successfully")
+		span.SetAttributes(
+			attribute.String("verification.status", "success"),
+			attribute.String("verification.user_id", verifiedUser.ID.String()),
+		)
+
+		s.Logger.Infow("Email verification successful",
+			"user_id", verifiedUser.ID,
+			"email", verifiedUser.Email,
+			"token_masked", maskedToken,
+			"remote_address", remoteAddr,
+			"device_info", userAgent,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		// Send response for email verification
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Email verified successfully",
+			"user": map[string]interface{}{
+				"id":                verifiedUser.ID,
+				"email":             verifiedUser.Email,
+				"is_email_verified": true,
+			},
+		})
+
+	} else {
+		// Invalid verification type
+		span.SetStatus(codes.Error, "Invalid verification type")
+		s.Logger.Errorw("Invalid verification type",
+			"type", verificationType,
+			"remote_address", remoteAddr,
+			"trace_id", traceID,
+			"span_id", spanID,
+		)
+
+		s.ErrorCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("error_type", "invalid_verification_type"),
+			attribute.String("endpoint", "verify_otp"),
+		))
+
+		http.Error(w, "invalid verification type", http.StatusBadRequest)
+		return
+	}
+}
+
+// createProfessionalVerificationEmail creates a professional HTML email template for email verification
+func (s *OAuthService) createProfessionalVerificationEmail(userEmail, verificationURL string) string {
+	return fmt.Sprintf(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verify Your Email Address - Plyer</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333333;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 600;
+        }
+        .content {
+            padding: 40px 30px;
+        }
+        .content h2 {
+            color: #2c3e50;
+            font-size: 24px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        .content p {
+            margin-bottom: 20px;
+            color: #555555;
+            font-size: 16px;
+        }
+        .verify-button {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            color: white !important;
+            padding: 16px 32px;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 16px;
+            margin: 20px 0;
+            transition: all 0.3s ease;
+        }
+        .verify-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        .security-note {
+            background-color: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin: 30px 0;
+            border-radius: 4px;
+        }
+        .security-note h3 {
+            color: #2c3e50;
+            margin-top: 0;
+            font-size: 18px;
+        }
+        .security-note p {
+            margin-bottom: 10px;
+            color: #666666;
+            font-size: 14px;
+        }
+        .footer {
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            padding: 30px;
+            text-align: center;
+            font-size: 14px;
+        }
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
+        }
+        .divider {
+            height: 1px;
+            background-color: #e9ecef;
+            margin: 30px 0;
+        }
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100%% !important;
+            }
+            .header, .content, .footer {
+                padding: 20px !important;
+            }
+            .verify-button {
+                display: block !important;
+                text-align: center !important;
+                width: 100%% !important;
+                box-sizing: border-box !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Plyer</h1>
+        </div>
+        
+        <div class="content">
+            <h2>Verify Your Email Address</h2>
+            
+            <p>Hello,</p>
+            
+            <p>Thank you for creating an account with Plyer! To complete your registration and access all features, please verify your email address by clicking the button below.</p>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="%s" class="verify-button">Verify Email Address</a>
+            </div>
+            
+            <p>If the button above doesn't work, you can also copy and paste the following link into your browser:</p>
+            <p style="word-break: break-all; color: #667eea; font-size: 14px; background-color: #f8f9fa; padding: 10px; border-radius: 4px;">%s</p>
+            
+            <div class="security-note">
+                <h3>🔒 Security Information</h3>
+                <p>• This verification link will expire in 24 hours for security reasons</p>
+                <p>• If you didn't create an account with Plyer, please ignore this email</p>
+                <p>• Never share this verification link with anyone</p>
+                <p>• This email was sent to: %s</p>
+            </div>
+            
+            <div class="divider"></div>
+            
+            <p>If you have any questions or need assistance, please don't hesitate to contact our support team.</p>
+            
+            <p>Welcome to Plyer!<br>
+            The Plyer Team</p>
+        </div>
+        
+        <div class="footer">
+            <p>© 2024 Plyer. All rights reserved.</p>
+            <p>
+                <a href="#">Privacy Policy</a> | 
+                <a href="#">Terms of Service</a> | 
+                <a href="#">Support</a>
+            </p>
+            <p style="margin-top: 15px; color: #95a5a6; font-size: 12px;">
+                This is an automated message. Please do not reply to this email.
+            </p>
+        </div>
+    </div>
+</body>
+</html>
+	`, verificationURL, verificationURL, userEmail)
+}
+
+// SendPasswordResetEmail sends a professional password reset email with OTP
+func (s *OAuthService) SendPasswordResetEmail(userEmail, otp, resetToken string) error {
+	ctx := context.Background()
+	_, span := s.Tracer.Start(ctx, "password_reset_email_send")
+	defer span.End()
+
+	// Add span attributes
+	span.SetAttributes(
+		attribute.String("email.recipient", userEmail),
+		attribute.String("email.type", "password_reset"),
+		attribute.String("reset.token_prefix", resetToken[:8]+"..."),
+	)
+
+	// Create password reset URL - Frontend is always served over HTTPS via Kubernetes Ingress
+	resetURL := fmt.Sprintf("https://%s:%s/reset-password?token=%s",
+		s.VaultConfig.FrontendHost,
+		s.VaultConfig.FrontendPort,
+		resetToken)
+
+	// Create professional password reset email template
+	emailHTML := s.createProfessionalPasswordResetEmail(userEmail, otp, resetURL)
+
+	// Send the email using AWS SES
+	input := &ses.SendEmailInput{
+		Source: aws.String("no-reply@plyer.org"),
+		Destination: &awstypes.Destination{
+			ToAddresses: []string{userEmail},
+		},
+		Message: &awstypes.Message{
+			Subject: &awstypes.Content{
+				Data: aws.String("Password Reset Request - Plyer"),
+			},
+			Body: &awstypes.Body{
+				Html: &awstypes.Content{
+					Data: aws.String(emailHTML),
+				},
+			},
+		},
+	}
+
+	resp, err := s.SESClient.SendEmail(ctx, input)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to send password reset email")
+		s.Logger.Errorw("Failed to send password reset email",
+			"error", err,
+			"email", userEmail)
+		return fmt.Errorf("failed to send password reset email: %w", err)
+	}
+
+	// Add span attributes for successful sending
+	span.SetAttributes(
+		attribute.String("email.message_id", *resp.MessageId),
+		attribute.String("email.status", "sent"),
+	)
+	span.SetStatus(codes.Ok, "Password reset email sent successfully")
+
+	s.Logger.Infow("Password reset email sent successfully",
+		"email", userEmail,
+		"message_id", *resp.MessageId,
+		"reset_url_length", len(resetURL))
+
+	return nil
+}
+
+// createProfessionalPasswordResetEmail creates a professional HTML email template for password reset
+func (s *OAuthService) createProfessionalPasswordResetEmail(userEmail, otp, resetURL string) string {
+	return fmt.Sprintf(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Password Reset Request - Plyer</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333333;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            background: linear-gradient(135deg, #e74c3c 0%%, #c0392b 100%%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 600;
+        }
+        .content {
+            padding: 40px 30px;
+        }
+        .content h2 {
+            color: #2c3e50;
+            font-size: 24px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        .content p {
+            margin-bottom: 20px;
+            color: #555555;
+            font-size: 16px;
+        }
+        .otp-box {
+            background: linear-gradient(135deg, #e74c3c 0%%, #c0392b 100%%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+            border-radius: 8px;
+            margin: 30px 0;
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: 8px;
+            font-family: 'Courier New', monospace;
+        }
+        .reset-button {
+            display: inline-block;
+            background: linear-gradient(135deg, #e74c3c 0%%, #c0392b 100%%);
+            color: white !important;
+            padding: 16px 32px;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 16px;
+            margin: 20px 0;
+            transition: all 0.3s ease;
+        }
+        .reset-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
+        }
+        .security-warning {
+            background-color: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 20px;
+            margin: 30px 0;
+            border-radius: 4px;
+        }
+        .security-warning h3 {
+            color: #856404;
+            margin-top: 0;
+            font-size: 18px;
+        }
+        .security-warning p {
+            margin-bottom: 10px;
+            color: #856404;
+            font-size: 14px;
+        }
+        .footer {
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            padding: 30px;
+            text-align: center;
+            font-size: 14px;
+        }
+        .footer a {
+            color: #e74c3c;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
+        }
+        .divider {
+            height: 1px;
+            background-color: #e9ecef;
+            margin: 30px 0;
+        }
+        .expire-info {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .expire-info strong {
+            color: #e74c3c;
+        }
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100%% !important;
+            }
+            .header, .content, .footer {
+                padding: 20px !important;
+            }
+            .reset-button {
+                display: block !important;
+                text-align: center !important;
+                width: 100%% !important;
+                box-sizing: border-box !important;
+            }
+            .otp-box {
+                font-size: 24px !important;
+                letter-spacing: 4px !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Plyer</h1>
+        </div>
+        
+        <div class="content">
+            <h2>🔒 Password Reset Request</h2>
+            
+            <p>Hello,</p>
+            
+            <p>We received a request to reset the password for your Plyer account associated with <strong>%s</strong>.</p>
+            
+            <p>Your password reset verification code is:</p>
+            
+            <div class="otp-box">
+                %s
+            </div>
+            
+            <div class="expire-info">
+                <strong>This code expires in 10 minutes</strong>
+            </div>
+            
+            <p>To complete your password reset, enter this code on the password reset page or click the button below:</p>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="%s" class="reset-button">Reset My Password</a>
+            </div>
+            
+            <p>If the button above doesn't work, you can also copy and paste the following link into your browser:</p>
+            <p style="word-break: break-all; color: #e74c3c; font-size: 14px; background-color: #f8f9fa; padding: 10px; border-radius: 4px;">%s</p>
+            
+            <div class="security-warning">
+                <h3>⚠️ Security Information</h3>
+                <p>• This password reset code will expire in 10 minutes</p>
+                <p>• If you didn't request a password reset, please ignore this email</p>
+                <p>• Never share this code with anyone</p>
+                <p>• For security reasons, you have a maximum of 3 attempts to use this code</p>
+                <p>• This request was made for: %s</p>
+            </div>
+            
+            <div class="divider"></div>
+            
+            <p>If you continue to have problems, please contact our support team.</p>
+            
+            <p>Best regards,<br>
+            The Plyer Security Team</p>
+        </div>
+        
+        <div class="footer">
+            <p>© 2024 Plyer. All rights reserved.</p>
+            <p>
+                <a href="#">Privacy Policy</a> | 
+                <a href="#">Terms of Service</a> | 
+                <a href="#">Support</a>
+            </p>
+            <p style="margin-top: 15px; color: #95a5a6; font-size: 12px;">
+                This is an automated security message. Please do not reply to this email.
+            </p>
+        </div>
+    </div>
+</body>
+</html>
+	`, userEmail, otp, resetURL, resetURL, userEmail)
+}
+
+// generateSecureToken creates a cryptographically secure random token
+func generateSecureToken(length int) (string, error) {
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(bytes), nil
+}
+
+// Argon2 parameters
+type params struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	saltLength  uint32
+	keyLength   uint32
+}
+
+// hashPassword hashes a password using Argon2id
+func (s *OAuthService) hashPassword(password string) (string, error) {
+	p := &params{
+		memory:      64 * 1024,
+		iterations:  3,
+		parallelism: 2,
+		saltLength:  16,
+		keyLength:   32,
+	}
+
+	// Generate a salt
+	salt := make([]byte, p.saltLength)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+
+	// Generate the hash
+	hash := argon2.IDKey([]byte(password), salt, p.iterations, p.memory, p.parallelism, p.keyLength)
+
+	// Encode the hash and salt
+	encodedHash := base64.RawStdEncoding.EncodeToString(hash)
+	encodedSalt := base64.RawStdEncoding.EncodeToString(salt)
+
+	// Return the encoded hash with parameters
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, p.memory, p.iterations, p.parallelism, encodedSalt, encodedHash), nil
+}
+
+// verifyPassword verifies a password against an Argon2id hash
+func (s *OAuthService) verifyPassword(password, encodedHash string) bool {
+	// Parse the encoded hash
+	parts := strings.Split(encodedHash, "$")
+	if len(parts) != 6 {
+		return false
+	}
+
+	// Check if it's Argon2id
+	if parts[1] != "argon2id" {
+		return false
+	}
+
+	// Parse parameters
+	var version int
+	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil {
+		return false
+	}
+
+	var memory, iterations uint32
+	var parallelism uint8
+	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &parallelism); err != nil {
+		return false
+	}
+
+	// Decode salt and hash
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return false
+	}
+
+	hash, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil {
+		return false
+	}
+
+	// Generate hash from provided password
+	comparisonHash := argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, uint32(len(hash)))
+
+	// Compare hashes
+	return subtle.ConstantTimeCompare(hash, comparisonHash) == 1
+}
