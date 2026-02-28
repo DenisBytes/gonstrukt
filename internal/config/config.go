@@ -411,6 +411,11 @@ func (p *ProjectConfig) Validate() error {
 		return fmt.Errorf("config source is required")
 	}
 
+	// Validate GDPR email requirement
+	if len(p.GDPRFeatures) > 0 && p.EmailService == nil {
+		return fmt.Errorf("email service is required when GDPR features are enabled")
+	}
+
 	// Validate frontend options
 	if len(p.Frontends) > 0 {
 		// Frontend is only allowed with auth or both services
@@ -430,6 +435,11 @@ func (p *ProjectConfig) Validate() error {
 		// Web frontend requires web framework
 		if hasWeb && p.WebFramework == nil {
 			return fmt.Errorf("web framework is required for web frontend")
+		}
+
+		// Only React+Vite is currently implemented
+		if hasWeb && p.WebFramework != nil && *p.WebFramework != FrameworkReact {
+			return fmt.Errorf("web framework %q is not yet implemented, only %q is currently available", *p.WebFramework, FrameworkReact)
 		}
 
 		// UI library is required when frontend is selected
@@ -552,7 +562,7 @@ func NewTemplateData(cfg *ProjectConfig) *TemplateData {
 		Config:           string(cfg.ConfigSource),
 		HasObservability: cfg.Observability,
 		Year:             time.Now().Year(),
-		GoVersion:        "1.24",
+		GoVersion:        "1.24.0",
 		EnableMFA:        cfg.EnableMFA,
 		EnableRBAC:       cfg.EnableRBAC,
 		AuthCache:        cfg.AuthCache,

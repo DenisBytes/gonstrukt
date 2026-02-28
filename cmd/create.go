@@ -295,6 +295,8 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 				validationErrors = append(validationErrors, errors.New("--web-framework is required for web frontend"))
 			} else if !slices.Contains(config.ValidWebFrameworks(), webFrameworkStr) {
 				validationErrors = append(validationErrors, fmt.Errorf("invalid web framework '%s', valid options: %v", webFrameworkStr, config.ValidWebFrameworks()))
+			} else if webFrameworkStr != string(config.FrameworkReact) {
+				validationErrors = append(validationErrors, fmt.Errorf("web framework %q is not yet implemented, only %q is currently available", webFrameworkStr, config.FrameworkReact))
 			}
 		}
 

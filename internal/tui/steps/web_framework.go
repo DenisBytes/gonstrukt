@@ -22,16 +22,17 @@ func NewWebFrameworkStep() *WebFrameworkStep {
 			Value:       string(config.FrameworkReact),
 			Description: "React with Vite build tool and React Router",
 		},
-		{
-			Label:       "Next.js",
-			Value:       string(config.FrameworkNext),
-			Description: "Full-stack React framework with App Router",
-		},
-		{
-			Label:       "TanStack Start",
-			Value:       string(config.FrameworkTanStack),
-			Description: "Full-stack React framework with TanStack Router",
-		},
+		// Next.js and TanStack Start templates are not yet implemented
+		// {
+		// 	Label:       "Next.js",
+		// 	Value:       string(config.FrameworkNext),
+		// 	Description: "Full-stack React framework with App Router",
+		// },
+		// {
+		// 	Label:       "TanStack Start",
+		// 	Value:       string(config.FrameworkTanStack),
+		// 	Description: "Full-stack React framework with TanStack Router",
+		// },
 	}
 
 	return &WebFrameworkStep{
