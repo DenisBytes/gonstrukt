@@ -108,7 +108,7 @@ func (km *KeyManager) GenerateAccessToken(user *types.User, sessionID string, tt
 }
 
 // ValidateToken validates a JWT token and returns the claims
-func (km *KeyManager) ValidateToken(tokenString string) (jwt.MapClaims, error) {
+func (km *KeyManager) ValidateToken(tokenString string) (map[string]any, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodECDSA); !ok {
 			return nil, errors.New("unexpected signing method")
@@ -129,7 +129,7 @@ func (km *KeyManager) ValidateToken(tokenString string) (jwt.MapClaims, error) {
 		return nil, errors.New("invalid claims")
 	}
 
-	return claims, nil
+	return map[string]any(claims), nil
 }
 
 // GetPublicKey returns the public key for token verification

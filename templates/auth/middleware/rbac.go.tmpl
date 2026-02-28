@@ -2,10 +2,9 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strings"
-
-	"{{.ModuleName}}/internals/types"
 
 	"github.com/casbin/casbin/v2"
 {{- if .HasObservability}}
@@ -62,9 +61,9 @@ func (m *RBACMiddleware) RequirePermission(resource, action string) func(http.Ha
 			)
 {{- end}}
 
-			// Get user from context
-			user, ok := ctx.Value("user").(*types.User)
-			if !ok || user == nil {
+			// Get user ID from context
+			userID, ok := GetUserID(ctx)
+			if !ok || userID == "" {
 {{- if .HasObservability}}
 				span.SetStatus(codes.Error, "User not found in context")
 {{- end}}
@@ -72,13 +71,23 @@ func (m *RBACMiddleware) RequirePermission(resource, action string) func(http.Ha
 				return
 			}
 
+			// Get roles from JWT claims
+			roles, ok := getRolesFromClaims(ctx)
+			if !ok {
 {{- if .HasObservability}}
-			span.SetAttributes(attribute.String("rbac.user_id", user.ID))
+				span.SetStatus(codes.Error, "Roles not found in claims")
+{{- end}}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+{{- if .HasObservability}}
+			span.SetAttributes(attribute.String("rbac.user_id", userID))
 {{- end}}
 
 			// Check permissions for each role
 			allowed := false
-			for _, role := range user.Roles {
+			for _, role := range roles {
 				ok, err := m.enforcer.Enforce(role, resource, action)
 				if err != nil {
 {{- if .HasObservability}}
@@ -120,9 +129,9 @@ func (m *RBACMiddleware) RequireRole(roles ...string) func(http.Handler) http.Ha
 			span.SetAttributes(attribute.StringSlice("rbac.required_roles", roles))
 {{- end}}
 
-			// Get user from context
-			user, ok := ctx.Value("user").(*types.User)
-			if !ok || user == nil {
+			// Get user ID from context
+			userID, ok := GetUserID(ctx)
+			if !ok || userID == "" {
 {{- if .HasObservability}}
 				span.SetStatus(codes.Error, "User not found in context")
 {{- end}}
@@ -130,17 +139,27 @@ func (m *RBACMiddleware) RequireRole(roles ...string) func(http.Handler) http.Ha
 				return
 			}
 
+			// Get roles from JWT claims
+			userRoles, ok := getRolesFromClaims(ctx)
+			if !ok {
+{{- if .HasObservability}}
+				span.SetStatus(codes.Error, "Roles not found in claims")
+{{- end}}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
 {{- if .HasObservability}}
 			span.SetAttributes(
-				attribute.String("rbac.user_id", user.ID),
-				attribute.StringSlice("rbac.user_roles", user.Roles),
+				attribute.String("rbac.user_id", userID),
+				attribute.StringSlice("rbac.user_roles", userRoles),
 			)
 {{- end}}
 
 			// Check if user has any of the required roles
 			hasRole := false
 			for _, requiredRole := range roles {
-				for _, userRole := range user.Roles {
+				for _, userRole := range userRoles {
 					if strings.EqualFold(userRole, requiredRole) {
 						hasRole = true
 						break
@@ -165,6 +184,34 @@ func (m *RBACMiddleware) RequireRole(roles ...string) func(http.Handler) http.Ha
 {{- end}}
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// getRolesFromClaims extracts roles from JWT claims in the request context
+func getRolesFromClaims(ctx context.Context) ([]string, bool) {
+	claims, ok := GetClaims(ctx)
+	if !ok {
+		return nil, false
+	}
+
+	rolesVal, ok := claims["roles"]
+	if !ok {
+		return nil, false
+	}
+
+	switch v := rolesVal.(type) {
+	case []interface{}:
+		roles := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				roles = append(roles, s)
+			}
+		}
+		return roles, len(roles) > 0
+	case []string:
+		return v, len(v) > 0
+	default:
+		return nil, false
 	}
 }
 
