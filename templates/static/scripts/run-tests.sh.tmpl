@@ -19,7 +19,7 @@ echo "Starting test infrastructure..."
 docker compose -f docker-compose.test.yml up -d --wait
 
 # Get dynamic ports
-{{- if or (eq .Database "postgres") (eq .ServiceType "both")}}
+{{- if eq .Database "postgres"}}
 POSTGRES_PORT=$(docker compose -f docker-compose.test.yml port postgres 5432 | cut -d: -f2)
 export TEST_DATABASE_URL="postgres://postgres:postgres@localhost:$POSTGRES_PORT/test_db?sslmode=disable"
 echo "  PostgreSQL: localhost:$POSTGRES_PORT"
@@ -68,11 +68,21 @@ trap cleanup EXIT
 # Run backend tests
 echo ""
 echo "Running backend tests..."
+{{- if eq .ServiceType "both"}}
+if [ $# -eq 0 ]; then
+    cd services/gateway && go test -v -race ./... && cd "$PROJECT_ROOT"
+    cd services/auth_service && go test -v -race ./... && cd "$PROJECT_ROOT"
+else
+    cd services/gateway && go test -v -race "$@" && cd "$PROJECT_ROOT"
+    cd services/auth_service && go test -v -race "$@" && cd "$PROJECT_ROOT"
+fi
+{{- else}}
 if [ $# -eq 0 ]; then
     go test -v -race ./...
 else
     go test -v -race "$@"
 fi
+{{- end}}
 
 {{- if .HasFrontend}}
 
