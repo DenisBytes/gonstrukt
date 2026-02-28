@@ -12,14 +12,14 @@ import (
 
 // CreateDataProcessingLog creates a new GDPR data processing log entry
 func (c *MongoClient) CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error {
-	_, err := c.db.Collection("data_processing_logs").InsertOne(ctx, log)
+	_, err := c.database.Collection("data_processing_logs").InsertOne(ctx, log)
 	return err
 }
 
 // GetDataProcessingLogs retrieves all processing logs for a user
 func (c *MongoClient) GetDataProcessingLogs(ctx context.Context, userID string) ([]*types.DataProcessingLog, error) {
 	opts := options.Find().SetSort(bson.D{bson.E{Key: "created_at", Value: -1}})
-	cursor, err := c.db.Collection("data_processing_logs").Find(ctx, bson.M{"user_id": userID}, opts)
+	cursor, err := c.database.Collection("data_processing_logs").Find(ctx, bson.M{"user_id": userID}, opts)
 	if err != nil {
 		return nil, err
 	}

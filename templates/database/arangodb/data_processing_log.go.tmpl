@@ -11,7 +11,7 @@ import (
 
 // CreateDataProcessingLog creates a new GDPR data processing log entry
 func (c *ArangoClient) CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error {
-	col, err := c.db.Collection(ctx, "data_processing_logs")
+	col, err := c.database.Collection(ctx, "data_processing_logs")
 	if err != nil {
 		return err
 	}
@@ -31,7 +31,7 @@ func (c *ArangoClient) GetDataProcessingLogs(ctx context.Context, userID string)
 		"userID": userID,
 	}
 
-	cursor, err := c.db.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
+	cursor, err := c.database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
 	if err != nil {
 		return nil, err
 	}
