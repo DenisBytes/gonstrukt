@@ -4,6 +4,26 @@
 BINARY_NAME={{.ProjectName}}
 GO=go
 GOFLAGS=-ldflags="-s -w"
+{{- if eq .ServiceType "both"}}
+
+# Build all services
+build:
+	cd services/gateway && $(GO) build $(GOFLAGS) -o ../../bin/gateway ./cmd/gateway
+	cd services/auth_service && $(GO) build $(GOFLAGS) -o ../../bin/auth_service ./cmd/auth_service
+
+# Run (specify service: make run SVC=gateway or make run SVC=auth_service)
+run:
+	cd services/$(SVC) && $(GO) run ./cmd/$(SVC)
+
+# Test all services
+test:
+	cd services/gateway && $(GO) test -v -race ./...
+	cd services/auth_service && $(GO) test -v -race ./...
+
+test-coverage:
+	cd services/gateway && $(GO) test -v -race -coverprofile=../../coverage-gateway.out ./...
+	cd services/auth_service && $(GO) test -v -race -coverprofile=../../coverage-auth.out ./...
+{{- else}}
 
 # Build
 build:
@@ -20,6 +40,7 @@ test:
 test-coverage:
 	$(GO) test -v -race -coverprofile=coverage.out ./...
 	$(GO) tool cover -html=coverage.out -o coverage.html
+{{- end}}
 
 # Integration tests (requires test infrastructure)
 test-int:
@@ -37,47 +58,92 @@ test-e2e:
 
 # Lint
 lint:
+{{- if eq .ServiceType "both"}}
+	cd services/gateway && golangci-lint run
+	cd services/auth_service && golangci-lint run
+{{- else}}
 	golangci-lint run
+{{- end}}
 
 # Format
 fmt:
+{{- if eq .ServiceType "both"}}
+	cd services/gateway && $(GO) fmt ./... && goimports -w .
+	cd services/auth_service && $(GO) fmt ./... && goimports -w .
+{{- else}}
 	$(GO) fmt ./...
 	goimports -w .
+{{- end}}
 
 # Clean
 clean:
 	rm -rf bin/
 	rm -f coverage.out coverage.html
+{{- if eq .ServiceType "both"}}
+	rm -f coverage-gateway.out coverage-auth.out
+{{- end}}
 
 # Dependencies
 deps:
+{{- if eq .ServiceType "both"}}
+	cd services/gateway && $(GO) mod download && $(GO) mod tidy
+	cd services/auth_service && $(GO) mod download && $(GO) mod tidy
+{{- else}}
 	$(GO) mod download
 	$(GO) mod tidy
+{{- end}}
 
 # Docker
 docker-build:
+{{- if eq .ServiceType "both"}}
+	docker build -t {{.ProjectName}}-gateway:latest ./services/gateway
+	docker build -t {{.ProjectName}}-auth:latest ./services/auth_service
+{{- else}}
 	docker build -t {{.ProjectName}}:latest .
+{{- end}}
 
 docker-run:
+{{- if eq .ServiceType "both"}}
+	docker compose up
+{{- else}}
 	docker run -p 8080:8080 {{.ProjectName}}:latest
+{{- end}}
 
 # Database migrations (if using SQL database)
 {{- if .IsSQL}}
 migrate-up:
+{{- if eq .ServiceType "both"}}
+	migrate -path ./services/auth_service/migrations -database "$(DATABASE_URL)" up
+{{- else}}
 	migrate -path ./migrations -database "$(DATABASE_URL)" up
+{{- end}}
 
 migrate-down:
+{{- if eq .ServiceType "both"}}
+	migrate -path ./services/auth_service/migrations -database "$(DATABASE_URL)" down
+{{- else}}
 	migrate -path ./migrations -database "$(DATABASE_URL)" down
+{{- end}}
 
 migrate-create:
+{{- if eq .ServiceType "both"}}
+	migrate create -ext sql -dir ./services/auth_service/migrations -seq $(name)
+{{- else}}
 	migrate create -ext sql -dir ./migrations -seq $(name)
+{{- end}}
 {{- end}}
 
 # Help
 help:
 	@echo "Available commands:"
+{{- if eq .ServiceType "both"}}
+	@echo "  make build              - Build all services"
+	@echo "  make run SVC=gateway    - Run gateway service"
+	@echo "  make run SVC=auth_service - Run auth service"
+{{- else}}
 	@echo "  make build          - Build the binary"
 	@echo "  make run            - Run the application"
+{{- end}}
 	@echo "  make test           - Run unit tests"
 	@echo "  make test-coverage  - Run tests with coverage"
 	@echo "  make test-int       - Run integration tests (requires Docker)"
