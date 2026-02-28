@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 {{- end}}
+{{- if or .HasGDPRConsent .HasGDPRDataExport .HasGDPRDataDeletion}}
 	"encoding/json"
 	"net/http"
+{{- end}}
 {{- if .HasGDPRProcessingLogs}}
 	"os"
 {{- end}}
@@ -20,9 +22,11 @@ import (
 	"{{.ModuleName}}/internals/utils"
 {{- end}}
 
+{{- if or .HasGDPRConsent .HasGDPRProcessingLogs}}
 	"github.com/google/uuid"
+{{- end}}
 	"golang.org/x/crypto/bcrypt"
-{{- if .HasObservability}}
+{{- if and .HasObservability (or .HasGDPRConsent .HasGDPRDataExport .HasGDPRDataDeletion)}}
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"

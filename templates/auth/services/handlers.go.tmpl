@@ -114,56 +114,6 @@ func (s *AuthService) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
-{{- if not .EnableMFA}}
-// handleMFASetup handles MFA setup
-func (s *AuthService) handleMFASetup(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement MFA setup
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-
-// handleMFAVerify handles MFA verification
-func (s *AuthService) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement MFA verification
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-
-// handleMFADisable handles MFA disable
-func (s *AuthService) handleMFADisable(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement MFA disable
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-{{- end}}
-
-{{- if not .HasGDPRConsent}}
-// handleGetConsent handles getting user consent status
-func (s *AuthService) handleGetConsent(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement consent retrieval
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-
-// handleUpdateConsent handles updating user consent
-func (s *AuthService) handleUpdateConsent(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement consent update
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-{{- end}}
-
-{{- if not .HasGDPRDataExport}}
-// handleExportData handles GDPR data export
-func (s *AuthService) handleExportData(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement data export
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-{{- end}}
-
-{{- if not .HasGDPRDataDeletion}}
-// handleDeleteData handles GDPR data deletion
-func (s *AuthService) handleDeleteData(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement data deletion
-	writeError(w, http.StatusNotImplemented, "not implemented")
-}
-{{- end}}
-
 // handleGetUser handles getting current user info
 func (s *AuthService) handleGetUser(w http.ResponseWriter, r *http.Request) {
 	// TODO: Implement user retrieval

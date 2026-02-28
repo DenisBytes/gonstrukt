@@ -86,19 +86,27 @@ func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
 
+{{- if .EnableMFA}}
 	// MFA routes
 	mux.HandleFunc("POST /api/v1/auth/mfa/setup", s.handleMFASetup)
 	mux.HandleFunc("POST /api/v1/auth/mfa/verify", s.handleMFAVerify)
 	mux.HandleFunc("POST /api/v1/auth/mfa/disable", s.handleMFADisable)
+{{- end}}
 
+{{- if .HasGDPR}}
 	// GDPR routes
+{{- if .HasGDPRConsent}}
 	mux.HandleFunc("GET /api/v1/auth/gdpr/consent", s.handleGetConsent)
 	mux.HandleFunc("POST /api/v1/auth/gdpr/consent", s.handleUpdateConsent)
-{{- if .HasGDPRConsent}}
 	mux.HandleFunc("GET /api/v1/auth/gdpr/consent/history", s.handleGetConsentHistory)
 {{- end}}
+{{- if .HasGDPRDataExport}}
 	mux.HandleFunc("GET /api/v1/auth/gdpr/export", s.handleExportData)
+{{- end}}
+{{- if .HasGDPRDataDeletion}}
 	mux.HandleFunc("DELETE /api/v1/auth/gdpr/delete", s.handleDeleteData)
+{{- end}}
+{{- end}}
 
 	// User management routes
 	mux.HandleFunc("GET /api/v1/auth/user", s.handleGetUser)
