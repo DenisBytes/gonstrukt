@@ -329,7 +329,7 @@ func TestIntegration_PasswordChangeFlow(t *testing.T) {
 	})
 }
 
-{{- if .HasGDPR}}
+{{- if or .HasGDPRConsent .HasGDPRDataExport .HasGDPRDataDeletion}}
 
 func TestIntegration_GDPRFlow(t *testing.T) {
 	t.Cleanup(func() {
