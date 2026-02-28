@@ -31,8 +31,12 @@ RUN adduser -D -g '' appuser
 
 # Copy binary and config
 COPY --from=builder /app/auth_service /app/auth_service
+{{- if eq .Config "yaml"}}
 COPY --from=builder /app/config.yaml /app/config.yaml
+{{- end}}
+{{- if .EnableRBAC}}
 COPY --from=builder /app/rbac_model.conf /app/rbac_model.conf
+{{- end}}
 
 # Set ownership
 RUN chown -R appuser:appuser /app

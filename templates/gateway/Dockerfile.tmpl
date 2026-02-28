@@ -31,7 +31,9 @@ RUN adduser -D -g '' appuser
 
 # Copy binary and config
 COPY --from=builder /app/gateway /app/gateway
+{{- if eq .Config "yaml"}}
 COPY --from=builder /app/config.yaml /app/config.yaml
+{{- end}}
 
 # Set ownership
 RUN chown -R appuser:appuser /app

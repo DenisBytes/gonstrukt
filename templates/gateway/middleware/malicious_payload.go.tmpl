@@ -72,16 +72,22 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 {{- end}}
 
 			// Check URL parameters
-			for key, values := range r.URL.Query() {
-				for _, value := range values {
-					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- if .HasObservability}}
+			for key, values := range r.URL.Query() {
+{{- else}}
+			for _, values := range r.URL.Query() {
+{{- end}}
+				for _, value := range values {
+{{- if .HasObservability}}
+					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 						span.SetStatus(codes.Error, "Malicious payload detected in query")
 						span.SetAttributes(
 							attribute.Bool("security.blocked", true),
 							attribute.String("security.param", key),
 							attribute.String("security.detection", pattern),
 						)
+{{- else}}
+					if blocked, _ := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- end}}
 						http.Error(w, "Bad Request", http.StatusBadRequest)
 						return
@@ -93,14 +99,16 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 			headersToCheck := []string{"User-Agent", "Referer", "X-Forwarded-For", "X-Forwarded-Host"}
 			for _, header := range headersToCheck {
 				if value := r.Header.Get(header); value != "" {
-					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- if .HasObservability}}
+					if blocked, pattern := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 						span.SetStatus(codes.Error, "Malicious payload detected in header")
 						span.SetAttributes(
 							attribute.Bool("security.blocked", true),
 							attribute.String("security.header", header),
 							attribute.String("security.detection", pattern),
 						)
+{{- else}}
+					if blocked, _ := checkMaliciousContent(value, cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- end}}
 						http.Error(w, "Bad Request", http.StatusBadRequest)
 						return
@@ -113,13 +121,15 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 				if r.ContentLength > 0 && r.ContentLength <= cfg.MaxBodySize {
 					body, err := io.ReadAll(io.LimitReader(r.Body, cfg.MaxBodySize))
 					if err == nil {
-						if blocked, pattern := checkMaliciousContent(string(body), cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- if .HasObservability}}
+						if blocked, pattern := checkMaliciousContent(string(body), cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 							span.SetStatus(codes.Error, "Malicious payload detected in body")
 							span.SetAttributes(
 								attribute.Bool("security.blocked", true),
 								attribute.String("security.detection", pattern),
 							)
+{{- else}}
+						if blocked, _ := checkMaliciousContent(string(body), cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 {{- end}}
 							http.Error(w, "Bad Request", http.StatusBadRequest)
 							return
