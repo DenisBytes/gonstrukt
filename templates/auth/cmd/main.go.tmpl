@@ -14,6 +14,12 @@ import (
 	"{{.ModuleName}}/internals/middleware"
 	"{{.ModuleName}}/internals/services"
 	"{{.ModuleName}}/internals/utils"
+{{- if .HasCache}}
+	"{{.ModuleName}}/internals/cache"
+{{- end}}
+{{- if .HasRateLimiter}}
+	"{{.ModuleName}}/internals/ratelimiter"
+{{- end}}
 {{- if .HasObservability}}
 	"{{.ModuleName}}/internals/telemetry"
 {{- end}}
@@ -119,6 +125,36 @@ func main() {
 	mfaRateLimiter := services.InitMFARateLimiter()
 {{- end}}
 
+{{- if .HasCache}}
+	// Initialize cache (gateway feature)
+{{- if eq .CacheType "redis"}}
+	cacheClient, cacheErr := cache.NewRedisCache(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	if cacheErr != nil {
+		utils.Fatal("failed to initialize cache", zap.Error(cacheErr))
+	}
+{{- else if eq .CacheType "valkey"}}
+	cacheClient, cacheErr := cache.NewValkeyCache(cfg.Valkey.Addr, cfg.Valkey.Password, cfg.Valkey.DB)
+	if cacheErr != nil {
+		utils.Fatal("failed to initialize cache", zap.Error(cacheErr))
+	}
+{{- else if eq .CacheType "memory"}}
+	cacheClient := cache.NewMemoryCache(cfg.Cache.MaxSize, cfg.Cache.TTL)
+{{- end}}
+{{- end}}
+
+{{- if .HasRateLimiter}}
+	// Initialize rate limiter (gateway feature)
+{{- if eq .RateLimiterType "token-bucket"}}
+	rateLimiter := ratelimiter.NewTokenBucket(cfg.RateLimiter.Rate, cfg.RateLimiter.Burst)
+{{- else if eq .RateLimiterType "sliding-window"}}
+	rateLimiter := ratelimiter.NewSlidingWindow(int(cfg.RateLimiter.Rate), cfg.RateLimiter.WindowSize)
+{{- else if eq .RateLimiterType "leaky-bucket"}}
+	rateLimiter := ratelimiter.NewLeakyBucket(cfg.RateLimiter.Rate, cfg.RateLimiter.Burst)
+{{- else if eq .RateLimiterType "fixed-window"}}
+	rateLimiter := ratelimiter.NewFixedWindow(int(cfg.RateLimiter.Rate), cfg.RateLimiter.WindowSize)
+{{- end}}
+{{- end}}
+
 	// Initialize auth service
 	authSvc := services.NewAuthService(services.AuthServiceConfig{
 		DB:             dbClient,
@@ -138,8 +174,20 @@ func main() {
 	// Auth routes
 	authSvc.RegisterRoutes(mux)
 
+	// Configure auth middleware
+	authMiddleware := middleware.Auth(middleware.AuthConfig{
+		TokenValidator:   keyManager,
+		BlacklistChecker: authSvc,
+		ExcludedPaths: []string{
+			"/health",
+			"/api/v1/auth/register",
+			"/api/v1/auth/login",
+			"/api/v1/auth/refresh",
+		},
+	})
+
 	// Apply middleware chain
-	// Order matters: tracing -> metrics -> logging -> recovery -> security
+	// Order matters: tracing -> metrics -> logging -> recovery -> security -> auth -> rate limiting
 	handler := middleware.Chain(
 		mux,
 {{- if .HasObservability}}
@@ -150,6 +198,10 @@ func main() {
 		middleware.Recovery(utils.Logger),
 		middleware.SecurityHeaders,
 		middleware.RequestValidation(),
+		authMiddleware,
+{{- if .HasRateLimiter}}
+		ratelimiter.Middleware(rateLimiter),
+{{- end}}
 	)
 
 	server := &http.Server{
@@ -202,6 +254,13 @@ func main() {
 {{- if .EnableMFA}}
 	// Close MFA rate limiter (waits for cleanup goroutine)
 	mfaRateLimiter.Close()
+{{- end}}
+
+{{- if .HasCache}}
+	// Close cache connections
+	if err := cacheClient.Close(shutdownCtx); err != nil {
+		utils.Error("cache close error", zap.Error(err))
+	}
 {{- end}}
 
 	// Close database connections

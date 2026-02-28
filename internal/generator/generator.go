@@ -480,11 +480,16 @@ func (g *Generator) generateMonorepo() error {
 	}
 
 	// Generate auth with unique module path
+	// When gateway exists, auth must NOT have cache or rate limiter
+	// (those belong to the gateway service only)
 	authDir := filepath.Join(g.writer.OutputDir(), "services", "auth_service")
 	authConfig := *g.config
 	authConfig.OutputDir = authDir
 	authConfig.ServiceType = config.ServiceAuth
 	authConfig.ModuleName = g.config.ModuleName + "/services/auth_service"
+	authConfig.Cache = nil
+	authConfig.RateLimiter = nil
+	authConfig.AuthCache = false
 
 	authGen := NewGenerator(&authConfig)
 	if err := authGen.generateAuth(); err != nil {
