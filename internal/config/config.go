@@ -366,6 +366,13 @@ type ProjectConfig struct {
 	EnablePostHog bool // Enable PostHog analytics
 	EnableSentry  bool // Enable Sentry error tracking
 
+	// Multi-tenancy (auth-first model)
+	EnableTenancy bool // Enable multi-tenant workspaces
+
+	// K8s dev environment (k3s)
+	EnableK8s bool   // Generate k3s-based local dev environment
+	Domain    string // Local dev domain (e.g., "myapp.dev") - required when EnableK8s is true
+
 	// Testing options
 	TestInfra    *TestInfraType    // docker (default) or testcontainers
 	E2EFramework *E2EFrameworkType // cypress (default) or playwright - only when frontend enabled
@@ -390,6 +397,14 @@ func (p *ProjectConfig) Validate() error {
 		return fmt.Errorf("service type is required")
 	}
 
+	// Validate service type is a known value
+	switch p.ServiceType {
+	case ServiceGateway, ServiceAuth, ServiceBoth:
+		// valid
+	default:
+		return fmt.Errorf("invalid service type %q: must be one of %s", p.ServiceType, strings.Join(ValidServiceTypes(), ", "))
+	}
+
 	// Validate gateway requirements
 	if p.ServiceType == ServiceGateway || p.ServiceType == ServiceBoth {
 		if p.Cache == nil {
@@ -411,9 +426,51 @@ func (p *ProjectConfig) Validate() error {
 		return fmt.Errorf("config source is required")
 	}
 
+	// AuthCache is only valid for gateway or both
+	if p.AuthCache && p.ServiceType == ServiceAuth {
+		return fmt.Errorf("auth cache is only available for gateway or both service types")
+	}
+
+	// Auth-specific features require auth or both service
+	if p.ServiceType == ServiceGateway {
+		if len(p.OAuthProviders) > 0 {
+			return fmt.Errorf("OAuth providers require auth or both service type")
+		}
+		if p.EnableMFA {
+			return fmt.Errorf("MFA requires auth or both service type")
+		}
+		if p.EnableRBAC {
+			return fmt.Errorf("RBAC requires auth or both service type")
+		}
+		if len(p.GDPRFeatures) > 0 {
+			return fmt.Errorf("GDPR features require auth or both service type")
+		}
+	}
+
 	// Validate GDPR email requirement
 	if len(p.GDPRFeatures) > 0 && p.EmailService == nil {
 		return fmt.Errorf("email service is required when GDPR features are enabled")
+	}
+
+	// Tenancy requires auth or both service
+	if p.EnableTenancy && p.ServiceType == ServiceGateway {
+		return fmt.Errorf("tenancy requires auth or both service type")
+	}
+
+	// K8s requires domain
+	if p.EnableK8s && p.Domain == "" {
+		return fmt.Errorf("domain is required when k8s dev environment is enabled")
+	}
+
+	// Validate domain format when provided
+	if p.Domain != "" {
+		if !isValidDomain(p.Domain) {
+			return fmt.Errorf("invalid domain format %q: must be a valid domain (e.g., myapp.dev)", p.Domain)
+		}
+		// Domain without K8s is an orphan — likely a mistake
+		if !p.EnableK8s {
+			return fmt.Errorf("domain %q is set but k8s dev environment is not enabled; use --k8s to enable it", p.Domain)
+		}
 	}
 
 	// Validate frontend options
@@ -460,6 +517,13 @@ func isValidModuleName(name string) bool {
 	// Simple validation for Go module names
 	pattern := `^[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*$`
 	matched, _ := regexp.MatchString(pattern, name)
+	return matched
+}
+
+func isValidDomain(domain string) bool {
+	// Domain must have at least one dot and only valid characters
+	pattern := `^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$`
+	matched, _ := regexp.MatchString(pattern, domain)
 	return matched
 }
 
@@ -537,6 +601,13 @@ type TemplateData struct {
 	HasPostHog bool
 	HasSentry  bool
 
+	// Multi-tenancy
+	HasTenancy bool
+
+	// K8s dev environment
+	HasK8s bool
+	Domain string
+
 	// Testing
 	TestInfra         string // "docker" or "testcontainers"
 	E2EFramework      string // "cypress" or "playwright"
@@ -562,7 +633,7 @@ func NewTemplateData(cfg *ProjectConfig) *TemplateData {
 		Config:           string(cfg.ConfigSource),
 		HasObservability: cfg.Observability,
 		Year:             time.Now().Year(),
-		GoVersion:        "1.24.0",
+		GoVersion:        "1.25.0",
 		EnableMFA:        cfg.EnableMFA,
 		EnableRBAC:       cfg.EnableRBAC,
 		AuthCache:        cfg.AuthCache,
@@ -694,6 +765,13 @@ func NewTemplateData(cfg *ProjectConfig) *TemplateData {
 		data.HasPostHog = cfg.EnablePostHog
 		data.HasSentry = cfg.EnableSentry
 	}
+
+	// Multi-tenancy
+	data.HasTenancy = cfg.EnableTenancy
+
+	// K8s dev environment
+	data.HasK8s = cfg.EnableK8s
+	data.Domain = cfg.Domain
 
 	// Testing options
 	if cfg.TestInfra != nil {

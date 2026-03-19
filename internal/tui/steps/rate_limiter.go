@@ -27,6 +27,16 @@ func NewRateLimiterStep() *RateLimiterStep {
 			Value:       string(config.RateLimiterSlidingWindow),
 			Description: "Approximated sliding window. Smoother rate limiting, less bursty.",
 		},
+		{
+			Label:       "Leaky Bucket",
+			Value:       string(config.RateLimiterLeakyBucket),
+			Description: "Processes requests at a fixed rate. Smoothest output, queues excess.",
+		},
+		{
+			Label:       "Fixed Window",
+			Value:       string(config.RateLimiterFixedWindow),
+			Description: "Simple counter per time window. Easy to reason about, allows bursts at edges.",
+		},
 	}
 
 	return &RateLimiterStep{

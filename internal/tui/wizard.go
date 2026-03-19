@@ -34,7 +34,10 @@ const (
 	StateSelectingUILibrary       // UI library (shadcn, baseui)
 	StateSelectingStateManagement // State management (tanstack, redux)
 	StateSelectingAnalytics       // Analytics (posthog, sentry)
+	StateSelectingTenancy         // Multi-tenancy toggle (after RBAC)
 	StateSelectingObservability
+	StateSelectingK8s             // K8s dev environment toggle (after observability)
+	StateEnteringDomain           // Domain input (only if k8s enabled)
 	StateShowingSummary
 	StateGenerating
 	StateComplete
@@ -78,7 +81,10 @@ type Wizard struct {
 	uiLibraryStep        *steps.UILibraryStep
 	stateManagementStep  *steps.StateManagementStep
 	analyticsStep        *steps.AnalyticsStep
+	tenancyStep          *steps.TenancyStep
 	observabilityStep    *steps.ObservabilityStep
+	k8sStep              *steps.K8sStep
+	domainStep           *steps.DomainStep
 	summaryStep          *steps.SummaryStep
 
 	// Progress
@@ -116,7 +122,10 @@ func NewWizard() *Wizard {
 		uiLibraryStep:        steps.NewUILibraryStep(),
 		stateManagementStep:  steps.NewStateManagementStep(),
 		analyticsStep:        steps.NewAnalyticsStep(),
+		tenancyStep:          steps.NewTenancyStep(),
 		observabilityStep:    steps.NewObservabilityStep(),
+		k8sStep:              steps.NewK8sStep(),
+		domainStep:           steps.NewDomainStep(""),
 		summaryStep:          steps.NewSummaryStep(cfg),
 
 		progress: components.NewProgress([]string{
@@ -277,10 +286,32 @@ func NewWizard() *Wizard {
 			},
 		},
 		{
+			name:        "tenancy",
+			title:       "Multi-Tenancy",
+			description: "Enable auth-first multi-tenant workspaces",
+			required: func(cfg *config.ProjectConfig) bool {
+				return cfg.ServiceType == config.ServiceAuth || cfg.ServiceType == config.ServiceBoth
+			},
+		},
+		{
 			name:        "observability",
 			title:       "Observability",
 			description: "Enable OpenTelemetry tracing and metrics",
 			required:    func(*config.ProjectConfig) bool { return true },
+		},
+		{
+			name:        "k8s",
+			title:       "K8s Dev Environment",
+			description: "Generate k3s-based local dev environment",
+			required:    func(*config.ProjectConfig) bool { return true },
+		},
+		{
+			name:        "domain",
+			title:       "Dev Domain",
+			description: "Local HTTPS domain for k8s",
+			required: func(cfg *config.ProjectConfig) bool {
+				return cfg.EnableK8s
+			},
 		},
 		{
 			name:        "summary",
@@ -439,11 +470,32 @@ func (w *Wizard) handleStepComplete(msg steps.StepCompleteMsg) (tea.Model, tea.C
 		selection := msg.Value.(steps.AnalyticsSelection)
 		w.config.EnablePostHog = selection.PostHog
 		w.config.EnableSentry = selection.Sentry
+		return w.nextStepFromAnalytics()
+
+	case "tenancy":
+		w.config.EnableTenancy = msg.Value.(bool)
 		w.state = StateSelectingObservability
 		return w, nil
 
 	case "observability":
 		w.config.Observability = msg.Value.(bool)
+		w.state = StateSelectingK8s
+		return w, nil
+
+	case "k8s":
+		w.config.EnableK8s = msg.Value.(bool)
+		if w.config.EnableK8s {
+			// Recreate domain step with project name for placeholder
+			w.domainStep = steps.NewDomainStep(w.config.ProjectName)
+			w.state = StateEnteringDomain
+			return w, w.domainStep.Init()
+		}
+		w.summaryStep.UpdateConfig(w.config)
+		w.state = StateShowingSummary
+		return w, nil
+
+	case "domain":
+		w.config.Domain = msg.Value.(string)
 		w.summaryStep.UpdateConfig(w.config)
 		w.state = StateShowingSummary
 		return w, nil
@@ -538,11 +590,25 @@ func (w *Wizard) nextStepFromAuthCache() (tea.Model, tea.Cmd) {
 	return w, nil
 }
 
+// nextStepFromAnalytics determines the next step after analytics
+func (w *Wizard) nextStepFromAnalytics() (tea.Model, tea.Cmd) {
+	if w.config.ServiceType == config.ServiceAuth || w.config.ServiceType == config.ServiceBoth {
+		w.state = StateSelectingTenancy
+	} else {
+		w.state = StateSelectingObservability
+	}
+	return w, nil
+}
+
 // nextStepFromFrontend determines the next step after frontend selection
 func (w *Wizard) nextStepFromFrontend() (tea.Model, tea.Cmd) {
 	if len(w.config.Frontends) == 0 {
-		// No frontend selected: go to observability
-		w.state = StateSelectingObservability
+		// No frontend selected: go to tenancy (if auth/both) or observability
+		if w.config.ServiceType == config.ServiceAuth || w.config.ServiceType == config.ServiceBoth {
+			w.state = StateSelectingTenancy
+		} else {
+			w.state = StateSelectingObservability
+		}
 	} else {
 		// Check if web frontend is selected
 		hasWeb := false
@@ -704,14 +770,11 @@ func (w *Wizard) handleStepBack() (tea.Model, tea.Cmd) {
 		w.stateManagementStep.Reset()
 		w.state = StateSelectingStateManagement
 
-	case StateSelectingObservability:
+	case StateSelectingTenancy:
 		// Go back based on frontend selection
 		if len(w.config.Frontends) > 0 {
 			w.analyticsStep.Reset()
 			w.state = StateSelectingAnalytics
-		} else if w.config.ServiceType == config.ServiceGateway {
-			w.authCacheStep.Reset()
-			w.state = StateSelectingAuthCache
 		} else if w.config.ServiceType == config.ServiceBoth {
 			w.frontendStep.Reset()
 			w.state = StateSelectingFrontend
@@ -720,9 +783,35 @@ func (w *Wizard) handleStepBack() (tea.Model, tea.Cmd) {
 			w.state = StateSelectingFrontend
 		}
 
-	case StateShowingSummary:
+	case StateSelectingObservability:
+		// Go back to tenancy if auth/both, otherwise analytics/frontend/authcache
+		if w.config.ServiceType == config.ServiceAuth || w.config.ServiceType == config.ServiceBoth {
+			w.tenancyStep.Reset()
+			w.state = StateSelectingTenancy
+		} else if len(w.config.Frontends) > 0 {
+			w.analyticsStep.Reset()
+			w.state = StateSelectingAnalytics
+		} else if w.config.ServiceType == config.ServiceGateway {
+			w.authCacheStep.Reset()
+			w.state = StateSelectingAuthCache
+		}
+
+	case StateSelectingK8s:
 		w.observabilityStep.Reset()
 		w.state = StateSelectingObservability
+
+	case StateEnteringDomain:
+		w.k8sStep.Reset()
+		w.state = StateSelectingK8s
+
+	case StateShowingSummary:
+		if w.config.EnableK8s {
+			w.domainStep.Reset()
+			w.state = StateEnteringDomain
+		} else {
+			w.k8sStep.Reset()
+			w.state = StateSelectingK8s
+		}
 	}
 
 	return w, nil
@@ -839,9 +928,24 @@ func (w *Wizard) updateCurrentStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		w.analyticsStep = model.(*steps.AnalyticsStep)
 		cmd = c
 
+	case StateSelectingTenancy:
+		model, c := w.tenancyStep.Update(msg)
+		w.tenancyStep = model.(*steps.TenancyStep)
+		cmd = c
+
 	case StateSelectingObservability:
 		model, c := w.observabilityStep.Update(msg)
 		w.observabilityStep = model.(*steps.ObservabilityStep)
+		cmd = c
+
+	case StateSelectingK8s:
+		model, c := w.k8sStep.Update(msg)
+		w.k8sStep = model.(*steps.K8sStep)
+		cmd = c
+
+	case StateEnteringDomain:
+		model, c := w.domainStep.Update(msg)
+		w.domainStep = model.(*steps.DomainStep)
 		cmd = c
 
 	case StateShowingSummary:
@@ -947,8 +1051,14 @@ func (w *Wizard) renderCurrentStep() string {
 		return w.renderStepWithTitle(w.stateManagementStep)
 	case StateSelectingAnalytics:
 		return w.renderStepWithTitle(w.analyticsStep)
+	case StateSelectingTenancy:
+		return w.renderStepWithTitle(w.tenancyStep)
 	case StateSelectingObservability:
 		return w.renderStepWithTitle(w.observabilityStep)
+	case StateSelectingK8s:
+		return w.renderStepWithTitle(w.k8sStep)
+	case StateEnteringDomain:
+		return w.renderStepWithTitle(w.domainStep)
 	case StateShowingSummary:
 		return w.summaryStep.View()
 	case StateGenerating:
@@ -1067,8 +1177,14 @@ func (w *Wizard) getCurrentStepIndex() int {
 		return indexOf(activeSteps, "state_management")
 	case StateSelectingAnalytics:
 		return indexOf(activeSteps, "analytics")
+	case StateSelectingTenancy:
+		return indexOf(activeSteps, "tenancy")
 	case StateSelectingObservability:
 		return indexOf(activeSteps, "observability")
+	case StateSelectingK8s:
+		return indexOf(activeSteps, "k8s")
+	case StateEnteringDomain:
+		return indexOf(activeSteps, "domain")
 	case StateShowingSummary:
 		return indexOf(activeSteps, "summary")
 	default:

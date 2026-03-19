@@ -39,6 +39,9 @@ func CreateCmd() *cobra.Command {
 		enableSentry      bool
 		testInfraStr      string
 		e2eFrameworkStr   string
+		enableTenancy     bool
+		enableK8s         bool
+		domainStr         string
 	)
 
 	cmd := &cobra.Command{
@@ -77,7 +80,7 @@ Examples:
 			}
 
 			// Non-interactive mode - validate and run
-			return runNonInteractive(cmd, args, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityBool, oauthProviders, enableMFA, enableRBAC, gdprFeatures, emailServiceStr, authCache, frontends, webFrameworkStr, uiLibraryStr, stateMgmtStr, enablePostHog, enableSentry, testInfraStr, e2eFrameworkStr)
+			return runNonInteractive(cmd, args, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityBool, oauthProviders, enableMFA, enableRBAC, gdprFeatures, emailServiceStr, authCache, frontends, webFrameworkStr, uiLibraryStr, stateMgmtStr, enablePostHog, enableSentry, testInfraStr, e2eFrameworkStr, enableTenancy, enableK8s, domainStr)
 		},
 	}
 
@@ -102,6 +105,9 @@ Examples:
 	cmd.Flags().BoolVar(&enableSentry, "sentry", false, "Enable Sentry error tracking (requires --frontend)")
 	cmd.Flags().StringVar(&testInfraStr, "test-infra", "docker", "Test infrastructure (docker, testcontainers)")
 	cmd.Flags().StringVar(&e2eFrameworkStr, "e2e-framework", "cypress", "E2E test framework (cypress, playwright) - only with --frontend")
+	cmd.Flags().BoolVar(&enableTenancy, "tenancy", false, "Enable auth-first multi-tenancy")
+	cmd.Flags().BoolVar(&enableK8s, "k8s", false, "Generate k3s-based local dev environment")
+	cmd.Flags().StringVar(&domainStr, "domain", "", "Local dev domain for k8s (e.g., myapp.dev)")
 
 	cmd.RegisterFlagCompletionFunc("service", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return config.ValidServiceTypes(), cobra.ShellCompDirectiveNoFileComp
@@ -136,7 +142,7 @@ Examples:
 
 // hasAnyFlag checks if any relevant flags were set
 func hasAnyFlag(cmd *cobra.Command) bool {
-	flags := []string{"service", "database", "cache", "config", "rate-limiter", "frontend", "web-framework", "ui-lib", "state-mgmt"}
+	flags := []string{"service", "database", "cache", "config", "rate-limiter", "frontend", "web-framework", "ui-lib", "state-mgmt", "oauth", "mfa", "rbac", "gdpr", "email", "auth-cache", "observability", "posthog", "sentry", "test-infra", "e2e-framework", "tenancy", "k8s", "domain"}
 	for _, name := range flags {
 		if cmd.Flags().Changed(name) {
 			return true
@@ -186,7 +192,7 @@ func runInteractive() error {
 }
 
 // runNonInteractive runs with command-line flags
-func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr string, observability bool, oauthProviders []string, enableMFA, enableRBAC bool, gdprFeatures []string, emailServiceStr string, authCache bool, frontends []string, webFrameworkStr, uiLibraryStr, stateMgmtStr string, enablePostHog, enableSentry bool, testInfraStr, e2eFrameworkStr string) error {
+func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr string, observability bool, oauthProviders []string, enableMFA, enableRBAC bool, gdprFeatures []string, emailServiceStr string, authCache bool, frontends []string, webFrameworkStr, uiLibraryStr, stateMgmtStr string, enablePostHog, enableSentry bool, testInfraStr, e2eFrameworkStr string, enableTenancy, enableK8s bool, domainStr string) error {
 	var validationErrors []error
 
 	// Module name is required in non-interactive mode
@@ -218,6 +224,11 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 
 	// Validate based on service type
 	serviceType := config.ServiceType(serviceTypeStr)
+
+	// AuthCache only valid for gateway or both
+	if authCache && serviceType == config.ServiceAuth {
+		validationErrors = append(validationErrors, errors.New("--auth-cache is only available for gateway or both service types"))
+	}
 
 	// Gateway or both requires cache and rate limiter
 	if serviceType == config.ServiceGateway || serviceType == config.ServiceBoth {
@@ -270,6 +281,21 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 	// Email service is required if GDPR features are selected
 	if len(gdprFeatures) > 0 && emailServiceStr == "" {
 		validationErrors = append(validationErrors, errors.New("--email is required when GDPR features are selected"))
+	}
+
+	// Tenancy requires auth or both
+	if enableTenancy && serviceType == config.ServiceGateway {
+		validationErrors = append(validationErrors, errors.New("--tenancy requires auth or both service type"))
+	}
+
+	// K8s requires domain
+	if enableK8s && domainStr == "" {
+		validationErrors = append(validationErrors, errors.New("--domain is required when --k8s is enabled"))
+	}
+
+	// Domain requires k8s
+	if domainStr != "" && !enableK8s {
+		validationErrors = append(validationErrors, errors.New("--domain requires --k8s to be enabled"))
 	}
 
 	// Validate frontend options
@@ -330,6 +356,9 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 		if enableSentry {
 			validationErrors = append(validationErrors, errors.New("--sentry requires --frontend to be specified"))
 		}
+		if cmd.Flags().Changed("e2e-framework") {
+			validationErrors = append(validationErrors, errors.New("--e2e-framework requires --frontend to be specified"))
+		}
 	}
 
 	if len(validationErrors) > 0 {
@@ -348,6 +377,9 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 		EnableMFA:     enableMFA,
 		EnableRBAC:    enableRBAC,
 		AuthCache:     authCache,
+		EnableTenancy: enableTenancy,
+		EnableK8s:     enableK8s,
+		Domain:        domainStr,
 	}
 
 	if databaseStr != "" {
