@@ -1,0 +1,18 @@
+{{- if .HasEmail}}
+-- Create email verification tokens table
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    verified_at TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_evt_user_id ON email_verification_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_evt_token ON email_verification_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_evt_expires_at ON email_verification_tokens(expires_at);
+{{- end}}

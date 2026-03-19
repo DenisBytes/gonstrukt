@@ -1,0 +1,213 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// CreateInvitation creates a new invitation
+func (c *PostgresClient) CreateInvitation(ctx context.Context, invitation *types.Invitation) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO invitations (id, tenant_id, email, role, status, invited_by, token, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`,
+		invitation.ID,
+		invitation.TenantID,
+		invitation.Email,
+		invitation.Role,
+		invitation.Status,
+		invitation.InvitedBy,
+		invitation.Token,
+		invitation.ExpiresAt,
+		invitation.CreatedAt,
+	)
+	return err
+}
+
+// GetInvitationByID retrieves an invitation by ID
+func (c *PostgresClient) GetInvitationByID(ctx context.Context, id string) (*types.Invitation, error) {
+	inv := &types.Invitation{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations
+		WHERE id = $1
+	`, id).Scan(
+		&inv.ID,
+		&inv.TenantID,
+		&inv.Email,
+		&inv.Role,
+		&inv.Status,
+		&inv.InvitedBy,
+		&inv.Token,
+		&inv.ExpiresAt,
+		&inv.CreatedAt,
+		&inv.AcceptedAt,
+		&inv.RevokedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("invitation not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return inv, nil
+}
+
+// GetInvitationByToken retrieves an invitation by token
+func (c *PostgresClient) GetInvitationByToken(ctx context.Context, token string) (*types.Invitation, error) {
+	inv := &types.Invitation{}
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations
+		WHERE token = $1
+	`, token).Scan(
+		&inv.ID,
+		&inv.TenantID,
+		&inv.Email,
+		&inv.Role,
+		&inv.Status,
+		&inv.InvitedBy,
+		&inv.Token,
+		&inv.ExpiresAt,
+		&inv.CreatedAt,
+		&inv.AcceptedAt,
+		&inv.RevokedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("invitation not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return inv, nil
+}
+
+// GetInvitationsByEmail retrieves all pending invitations for an email
+func (c *PostgresClient) GetInvitationsByEmail(ctx context.Context, email string) ([]*types.Invitation, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT i.id, i.tenant_id, i.email, i.role, i.status, i.invited_by, i.token, i.expires_at, i.created_at, i.accepted_at, i.revoked_at
+		FROM invitations i
+		WHERE i.email = $1 AND i.status = 'pending' AND i.expires_at > NOW()
+		ORDER BY i.created_at DESC
+	`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invitations []*types.Invitation
+	for rows.Next() {
+		inv := &types.Invitation{}
+		if err := rows.Scan(
+			&inv.ID,
+			&inv.TenantID,
+			&inv.Email,
+			&inv.Role,
+			&inv.Status,
+			&inv.InvitedBy,
+			&inv.Token,
+			&inv.ExpiresAt,
+			&inv.CreatedAt,
+			&inv.AcceptedAt,
+			&inv.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		invitations = append(invitations, inv)
+	}
+
+	return invitations, rows.Err()
+}
+
+// GetInvitationsByTenant retrieves all invitations for a tenant
+func (c *PostgresClient) GetInvitationsByTenant(ctx context.Context, tenantID string) ([]*types.Invitation, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations
+		WHERE tenant_id = $1
+		ORDER BY created_at DESC
+	`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invitations []*types.Invitation
+	for rows.Next() {
+		inv := &types.Invitation{}
+		if err := rows.Scan(
+			&inv.ID,
+			&inv.TenantID,
+			&inv.Email,
+			&inv.Role,
+			&inv.Status,
+			&inv.InvitedBy,
+			&inv.Token,
+			&inv.ExpiresAt,
+			&inv.CreatedAt,
+			&inv.AcceptedAt,
+			&inv.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		invitations = append(invitations, inv)
+	}
+
+	return invitations, rows.Err()
+}
+
+// UpdateInvitationStatus updates an invitation's status
+func (c *PostgresClient) UpdateInvitationStatus(ctx context.Context, id, status string) error {
+	now := time.Now()
+	var query string
+	var args []interface{}
+
+	switch status {
+	case "accepted":
+		query = `UPDATE invitations SET status = $2, accepted_at = $3 WHERE id = $1`
+		args = []interface{}{id, status, now}
+	case "revoked":
+		query = `UPDATE invitations SET status = $2, revoked_at = $3 WHERE id = $1`
+		args = []interface{}{id, status, now}
+	default:
+		query = `UPDATE invitations SET status = $2 WHERE id = $1`
+		args = []interface{}{id, status}
+	}
+
+	result, err := c.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("invitation not found")
+	}
+
+	return nil
+}
+
+// UpdateInvitationToken updates the token and expiry for an invitation (for resend)
+func (c *PostgresClient) UpdateInvitationToken(ctx context.Context, id, token string, expiresAt time.Time) error {
+	result, err := c.pool.Exec(ctx, `
+		UPDATE invitations SET token = $2, expires_at = $3
+		WHERE id = $1 AND status = 'pending'
+	`, id, token, expiresAt)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("invitation not found or not pending")
+	}
+
+	return nil
+}

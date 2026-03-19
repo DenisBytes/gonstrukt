@@ -1,0 +1,44 @@
+{{- if .EnableRBAC}}
+-- Create Casbin rules table for RBAC
+CREATE TABLE IF NOT EXISTS casbin_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ptype TEXT NOT NULL,
+    v0 TEXT,
+    v1 TEXT,
+    v2 TEXT,
+    v3 TEXT,
+    v4 TEXT,
+    v5 TEXT
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_ptype ON casbin_rules(ptype);
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_v0 ON casbin_rules(v0);
+CREATE INDEX IF NOT EXISTS idx_casbin_rules_v1 ON casbin_rules(v1);
+
+-- Insert default roles and policies
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', '*', '*');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', 'users', 'read');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', 'users', 'write');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', 'users', 'delete');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', 'roles', 'read');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', 'roles', 'write');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'profile', 'read');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'profile', 'write');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'consents', 'read');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'consents', 'write');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1) VALUES
+    ('g', 'user', 'authenticated');
+INSERT OR IGNORE INTO casbin_rules (ptype, v0, v1) VALUES
+    ('g', 'admin', 'user');
+{{- end}}

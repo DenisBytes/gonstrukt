@@ -1,0 +1,50 @@
+-- Tenants table
+CREATE TABLE IF NOT EXISTS tenants (
+    id UUID PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    plan VARCHAR(50) NOT NULL DEFAULT 'free',
+    settings JSONB DEFAULT '{}',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tenants_slug ON tenants(slug);
+CREATE INDEX IF NOT EXISTS idx_tenants_is_active ON tenants(is_active);
+
+-- User-tenant membership
+CREATE TABLE IF NOT EXISTS user_tenants (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    roles TEXT[] NOT NULL DEFAULT '{member}',
+    is_owner BOOLEAN NOT NULL DEFAULT FALSE,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_tenants_tenant ON user_tenants(tenant_id);
+
+-- Invitations table
+CREATE TABLE IF NOT EXISTS invitations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'member',
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    invited_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    accepted_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_invitations_tenant_status ON invitations(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_invitations_email_status ON invitations(email, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_tenant_email_pending ON invitations(tenant_id, email) WHERE status = 'pending';
+
+-- Update sessions for tenancy
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id UUID;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS token_family VARCHAR(36);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_token_family ON sessions(token_family);

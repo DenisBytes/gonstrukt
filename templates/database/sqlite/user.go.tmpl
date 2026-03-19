@@ -1,0 +1,251 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+{{- if .HasGDPRDataDeletion}}
+	"fmt"
+{{- end}}
+{{- if .HasGDPRDataExport}}
+	"time"
+{{- end}}
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateUser creates a new user
+func (c *SQLiteClient) CreateUser(ctx context.Context, user *types.User) error {
+{{- if .HasOAuth}}
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO users (id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, oauth_provider, oauth_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, user.ID, user.Email, user.PasswordHash, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.Roles, user.OAuthProvider, user.OAuthID, user.CreatedAt.Format("2006-01-02T15:04:05Z"), user.UpdatedAt.Format("2006-01-02T15:04:05Z"))
+{{- else}}
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO users (id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, user.ID, user.Email, user.PasswordHash, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.Roles, user.CreatedAt.Format("2006-01-02T15:04:05Z"), user.UpdatedAt.Format("2006-01-02T15:04:05Z"))
+{{- end}}
+	return err
+}
+
+// GetUserByID retrieves a user by ID
+func (c *SQLiteClient) GetUserByID(ctx context.Context, id string) (*types.User, error) {
+	user := &types.User{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at, deleted_at
+		FROM users WHERE id = ? AND deleted_at IS NULL
+	`, id).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.Roles, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// GetUserByEmail retrieves a user by email
+func (c *SQLiteClient) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
+	user := &types.User{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, roles, created_at, updated_at, deleted_at
+		FROM users WHERE email = ? AND deleted_at IS NULL
+	`, email).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.Roles, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// UpdateUser updates an existing user
+func (c *SQLiteClient) UpdateUser(ctx context.Context, user *types.User) error {
+	result, err := c.db.ExecContext(ctx, `
+		UPDATE users SET email = ?, first_name = ?, last_name = ?, mfa_enabled = ?, mfa_secret = ?, roles = ?, updated_at = datetime('now')
+		WHERE id = ? AND deleted_at IS NULL
+	`, user.Email, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.Roles, user.ID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+// DeleteUser soft deletes a user
+func (c *SQLiteClient) DeleteUser(ctx context.Context, id string) error {
+	result, err := c.db.ExecContext(ctx, `
+		UPDATE users SET deleted_at = datetime('now'), updated_at = datetime('now')
+		WHERE id = ? AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+// HardDeleteUser permanently deletes a user (for GDPR right to erasure)
+func (c *SQLiteClient) HardDeleteUser(ctx context.Context, id string) error {
+	result, err := c.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("user not found")
+	}
+
+	return nil
+}
+
+{{- if .HasGDPRDataDeletion}}
+
+// SoftDeleteUser performs a GDPR-compliant soft delete by anonymizing PII
+func (c *SQLiteClient) SoftDeleteUser(ctx context.Context, id string) error {
+	anonymizedEmail := fmt.Sprintf("deleted_%s@anonymized.local", id)
+
+	result, err := c.db.ExecContext(ctx, `
+		UPDATE users SET
+			email = ?, first_name = 'DELETED', last_name = 'USER',
+			password_hash = '', mfa_enabled = 0, mfa_secret = '',
+			deleted_at = datetime('now'), updated_at = datetime('now')
+		WHERE id = ? AND deleted_at IS NULL
+	`, anonymizedEmail, id)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("user not found")
+	}
+
+	// Delete all user sessions
+	_, _ = c.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, id)
+
+	// Delete MFA backup codes
+	_, _ = c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, id)
+
+	return nil
+}
+{{- end}}
+
+{{- if .HasGDPRDataExport}}
+
+// ExportUserData exports all user data for GDPR data portability
+func (c *SQLiteClient) ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error) {
+	// Get user
+	user, err := c.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get sessions
+	sessions, err := c.GetUserSessions(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get consents
+	consents, err := c.GetUserConsents(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to export types
+	userExport := types.UserExportData{
+		ID:        user.ID,
+		Email:     user.Email,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+	}
+
+	sessionExports := make([]types.SessionExportData, len(sessions))
+	for i, s := range sessions {
+		sessionExports[i] = types.SessionExportData{
+			ID:        s.ID,
+			UserAgent: s.UserAgent,
+			IP:        s.IP,
+			CreatedAt: s.CreatedAt,
+			ExpiresAt: s.ExpiresAt,
+		}
+	}
+
+	consentExports := make([]types.ConsentExportData, len(consents))
+	for i, consent := range consents {
+		consentExports[i] = types.ConsentExportData{
+			Type:      consent.Type,
+			Granted:   consent.Granted,
+			Version:   consent.Version,
+			GrantedAt: consent.GrantedAt,
+			RevokedAt: consent.RevokedAt,
+		}
+	}
+
+	return &types.UserDataExport{
+		ExportedAt: time.Now(),
+		User:       userExport,
+		Sessions:   sessionExports,
+		Consents:   consentExports,
+	}, nil
+}
+{{- end}}
+
+{{- if .HasOAuth}}
+
+// GetUserByOAuthID retrieves a user by OAuth provider and ID
+func (c *SQLiteClient) GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error) {
+	user := &types.User{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, email, password_hash, first_name, last_name,
+		       mfa_enabled, mfa_secret, roles, oauth_provider, oauth_id,
+		       created_at, updated_at, deleted_at
+		FROM users
+		WHERE oauth_provider = ? AND oauth_id = ? AND deleted_at IS NULL
+	`, provider, oauthID).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName,
+		&user.MFAEnabled, &user.MFASecret, &user.Roles, &user.OAuthProvider, &user.OAuthID,
+		&user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+{{- end}}

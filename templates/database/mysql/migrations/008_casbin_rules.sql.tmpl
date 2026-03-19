@@ -1,0 +1,37 @@
+{{- if .EnableRBAC}}
+-- Create Casbin rules table for RBAC
+CREATE TABLE IF NOT EXISTS casbin_rules (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ptype VARCHAR(100) NOT NULL,
+    v0 VARCHAR(255),
+    v1 VARCHAR(255),
+    v2 VARCHAR(255),
+    v3 VARCHAR(255),
+    v4 VARCHAR(255),
+    v5 VARCHAR(255),
+    INDEX idx_casbin_rules_ptype (ptype),
+    INDEX idx_casbin_rules_v0 (v0),
+    INDEX idx_casbin_rules_v1 (v1)
+);
+
+-- Insert default roles and policies
+INSERT IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'admin', '*', '*'),
+    ('p', 'admin', 'users', 'read'),
+    ('p', 'admin', 'users', 'write'),
+    ('p', 'admin', 'users', 'delete'),
+    ('p', 'admin', 'roles', 'read'),
+    ('p', 'admin', 'roles', 'write');
+
+-- User role has limited access
+INSERT IGNORE INTO casbin_rules (ptype, v0, v1, v2) VALUES
+    ('p', 'user', 'profile', 'read'),
+    ('p', 'user', 'profile', 'write'),
+    ('p', 'user', 'consents', 'read'),
+    ('p', 'user', 'consents', 'write');
+
+-- Default role inheritance
+INSERT IGNORE INTO casbin_rules (ptype, v0, v1) VALUES
+    ('g', 'user', 'authenticated'),
+    ('g', 'admin', 'user');
+{{- end}}

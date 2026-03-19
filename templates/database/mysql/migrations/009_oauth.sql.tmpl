@@ -1,0 +1,28 @@
+{{- if .HasOAuth}}
+-- Add OAuth fields to users table
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_provider VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_id VARCHAR(255);
+
+-- Make password_hash nullable for OAuth-only accounts
+ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) DEFAULT '';
+
+-- Create unique index for OAuth provider + ID combination
+CREATE UNIQUE INDEX idx_users_oauth ON users(oauth_provider, oauth_id);
+
+-- Create OAuth tokens table for storing refresh tokens
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    provider VARCHAR(50) NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    token_type VARCHAR(50),
+    expires_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_oauth_tokens_user_id (user_id),
+    INDEX idx_oauth_tokens_provider (provider),
+    UNIQUE KEY idx_oauth_tokens_user_provider (user_id, provider)
+);
+{{- end}}

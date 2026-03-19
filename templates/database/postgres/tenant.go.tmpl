@@ -1,0 +1,154 @@
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// CreateTenant creates a new tenant
+func (c *PostgresClient) CreateTenant(ctx context.Context, tenant *types.Tenant) error {
+	settings, err := json.Marshal(tenant.Settings)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.pool.Exec(ctx, `
+		INSERT INTO tenants (id, name, slug, plan, settings, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`,
+		tenant.ID,
+		tenant.Name,
+		tenant.Slug,
+		tenant.Plan,
+		settings,
+		tenant.IsActive,
+		tenant.CreatedAt,
+		tenant.UpdatedAt,
+	)
+	return err
+}
+
+// GetTenantByID retrieves a tenant by ID
+func (c *PostgresClient) GetTenantByID(ctx context.Context, id string) (*types.Tenant, error) {
+	tenant := &types.Tenant{}
+	var settings []byte
+
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, name, slug, plan, settings, is_active, created_at, updated_at
+		FROM tenants
+		WHERE id = $1
+	`, id).Scan(
+		&tenant.ID,
+		&tenant.Name,
+		&tenant.Slug,
+		&tenant.Plan,
+		&settings,
+		&tenant.IsActive,
+		&tenant.CreatedAt,
+		&tenant.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("tenant not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if len(settings) > 0 {
+		if err := json.Unmarshal(settings, &tenant.Settings); err != nil {
+			return nil, err
+		}
+	}
+
+	return tenant, nil
+}
+
+// GetTenantBySlug retrieves a tenant by slug
+func (c *PostgresClient) GetTenantBySlug(ctx context.Context, slug string) (*types.Tenant, error) {
+	tenant := &types.Tenant{}
+	var settings []byte
+
+	err := c.pool.QueryRow(ctx, `
+		SELECT id, name, slug, plan, settings, is_active, created_at, updated_at
+		FROM tenants
+		WHERE slug = $1
+	`, slug).Scan(
+		&tenant.ID,
+		&tenant.Name,
+		&tenant.Slug,
+		&tenant.Plan,
+		&settings,
+		&tenant.IsActive,
+		&tenant.CreatedAt,
+		&tenant.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("tenant not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if len(settings) > 0 {
+		if err := json.Unmarshal(settings, &tenant.Settings); err != nil {
+			return nil, err
+		}
+	}
+
+	return tenant, nil
+}
+
+// UpdateTenant updates an existing tenant
+func (c *PostgresClient) UpdateTenant(ctx context.Context, tenant *types.Tenant) error {
+	tenant.UpdatedAt = time.Now()
+
+	settings, err := json.Marshal(tenant.Settings)
+	if err != nil {
+		return err
+	}
+
+	result, err := c.pool.Exec(ctx, `
+		UPDATE tenants
+		SET name = $2, slug = $3, plan = $4, settings = $5, is_active = $6, updated_at = $7
+		WHERE id = $1
+	`,
+		tenant.ID,
+		tenant.Name,
+		tenant.Slug,
+		tenant.Plan,
+		settings,
+		tenant.IsActive,
+		tenant.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("tenant not found")
+	}
+
+	return nil
+}
+
+// DeleteTenant deletes a tenant
+func (c *PostgresClient) DeleteTenant(ctx context.Context, id string) error {
+	result, err := c.pool.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return errors.New("tenant not found")
+	}
+
+	return nil
+}

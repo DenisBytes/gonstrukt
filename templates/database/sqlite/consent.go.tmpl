@@ -1,0 +1,115 @@
+package db
+
+import (
+	"context"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateConsent creates a consent record
+func (c *SQLiteClient) CreateConsent(ctx context.Context, consent *types.Consent) error {
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO consents (id, user_id, type, granted, granted_at, expires_at, version, description)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, consent.ID, consent.UserID, consent.Type, consent.Granted, consent.GrantedAt, consent.ExpiresAt, consent.Version, consent.Description)
+	return err
+}
+
+// GetUserConsents retrieves all consents for a user
+func (c *SQLiteClient) GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents WHERE user_id = ?
+		ORDER BY granted_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var consents []*types.Consent
+	for rows.Next() {
+		consent := &types.Consent{}
+		if err := rows.Scan(&consent.ID, &consent.UserID, &consent.Type, &consent.Granted,
+			&consent.GrantedAt, &consent.ExpiresAt, &consent.RevokedAt, &consent.Version, &consent.Description); err != nil {
+			return nil, err
+		}
+		consents = append(consents, consent)
+	}
+
+	return consents, rows.Err()
+}
+
+// UpdateConsent updates a consent record
+func (c *SQLiteClient) UpdateConsent(ctx context.Context, consent *types.Consent) error {
+	if consent.Granted {
+		consent.GrantedAt = time.Now()
+		consent.RevokedAt = nil
+	} else {
+		now := time.Now()
+		consent.RevokedAt = &now
+	}
+
+	_, err := c.db.ExecContext(ctx, `
+		UPDATE consents SET granted = ?, granted_at = ?, revoked_at = ?, version = ?
+		WHERE id = ?
+	`, consent.Granted, consent.GrantedAt, consent.RevokedAt, consent.Version, consent.ID)
+	return err
+}
+
+// GetActiveConsent retrieves the active consent of a specific type for a user
+func (c *SQLiteClient) GetActiveConsent(ctx context.Context, userID, consentType string) (*types.Consent, error) {
+	consent := &types.Consent{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents
+		WHERE user_id = ? AND type = ? AND granted = 1 AND revoked_at IS NULL
+		ORDER BY granted_at DESC
+		LIMIT 1
+	`, userID, consentType).Scan(
+		&consent.ID, &consent.UserID, &consent.Type, &consent.Granted,
+		&consent.GrantedAt, &consent.ExpiresAt, &consent.RevokedAt, &consent.Version, &consent.Description,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return consent, nil
+}
+
+{{- if .HasGDPRConsent}}
+
+// GetActiveConsentsByUserID retrieves all active consents for a user
+func (c *SQLiteClient) GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
+		FROM consents
+		WHERE user_id = ? AND granted = 1 AND revoked_at IS NULL
+		AND (expires_at IS NULL OR expires_at > datetime('now'))
+		ORDER BY granted_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var consents []*types.Consent
+	for rows.Next() {
+		consent := &types.Consent{}
+		if err := rows.Scan(&consent.ID, &consent.UserID, &consent.Type, &consent.Granted,
+			&consent.GrantedAt, &consent.ExpiresAt, &consent.RevokedAt, &consent.Version, &consent.Description); err != nil {
+			return nil, err
+		}
+		consents = append(consents, consent)
+	}
+
+	return consents, rows.Err()
+}
+
+// GetConsentHistory retrieves the full consent history for a user
+func (c *SQLiteClient) GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error) {
+	return c.GetUserConsents(ctx, userID)
+}
+{{- end}}

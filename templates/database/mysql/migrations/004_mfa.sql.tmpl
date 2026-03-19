@@ -1,0 +1,12 @@
+-- Create MFA backup codes table
+CREATE TABLE IF NOT EXISTS mfa_backups (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    code VARCHAR(255) NOT NULL,
+    used BOOLEAN DEFAULT FALSE,
+    used_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_mfa_backups_user_id (user_id),
+    INDEX idx_mfa_backups_used (used)
+);

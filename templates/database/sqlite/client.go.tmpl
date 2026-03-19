@@ -3,14 +3,16 @@ package db
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
-{{- if .HasGDPRDataExport}}
-	"time"
-{{- end}}
+	"sort"
+	"strings"
 
 	_ "modernc.org/sqlite"
-	"{{.ModuleName}}/internals/types"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // SQLiteClient implements the Database interface for SQLite
 type SQLiteClient struct {
@@ -43,76 +45,79 @@ func NewSQLiteClient(path string) (*SQLiteClient, error) {
 
 // Migrate runs database migrations
 func (c *SQLiteClient) Migrate(ctx context.Context) error {
-	// Create users table
+	// Create migrations table if not exists
 	_, err := c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS users (
-			id TEXT PRIMARY KEY,
-			email TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			first_name TEXT,
-			last_name TEXT,
-			mfa_enabled INTEGER DEFAULT 0,
-			mfa_secret TEXT,
-			roles TEXT,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			deleted_at TEXT
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version TEXT PRIMARY KEY,
+			applied_at TEXT DEFAULT (datetime('now'))
 		)
 	`)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create migrations table: %w", err)
 	}
 
-	// Create sessions table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS sessions (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL,
-			refresh_token TEXT UNIQUE NOT NULL,
-			user_agent TEXT,
-			ip TEXT,
-			expires_at TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-		)
-	`)
+	// Read migration files
+	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read migrations directory: %w", err)
 	}
 
-	// Create consents table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS consents (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL,
-			type TEXT NOT NULL,
-			granted INTEGER DEFAULT 0,
-			granted_at TEXT,
-			revoked_at TEXT,
-			version TEXT NOT NULL,
-			description TEXT,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-			UNIQUE(user_id, type, version)
+	// Sort entries by name for consistent ordering
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		version := entry.Name()
+
+		// Check if migration already applied
+		var count int
+		err := c.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+			version,
+		).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("failed to check migration status: %w", err)
+		}
+
+		if count > 0 {
+			continue
+		}
+
+		// Read and execute migration
+		content, err := migrationsFS.ReadFile("migrations/" + version)
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", version, err)
+		}
+
+		// Execute each statement separately (SQLite doesn't support multi-statement exec well)
+		statements := strings.Split(string(content), ";")
+		for _, stmt := range statements {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			_, err = c.db.ExecContext(ctx, stmt)
+			if err != nil {
+				return fmt.Errorf("failed to execute migration %s: %w", version, err)
+			}
+		}
+
+		// Record migration
+		_, err = c.db.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version) VALUES (?)",
+			version,
 		)
-	`)
-	if err != nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to record migration %s: %w", version, err)
+		}
 	}
 
-	// Create mfa_backups table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS mfa_backups (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL,
-			code TEXT NOT NULL,
-			used INTEGER DEFAULT 0,
-			used_at TEXT,
-			created_at TEXT NOT NULL,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-		)
-	`)
-
-	return err
+	return nil
 }
 
 // Ping checks the database connection
@@ -125,305 +130,7 @@ func (c *SQLiteClient) Close(ctx context.Context) error {
 	return c.db.Close()
 }
 
-// User operations
-func (c *SQLiteClient) CreateUser(ctx context.Context, user *types.User) error {
-	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO users (id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, user.ID, user.Email, user.PasswordHash, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.CreatedAt.Format("2006-01-02T15:04:05Z"), user.UpdatedAt.Format("2006-01-02T15:04:05Z"))
-	return err
+// GetDB returns the underlying database connection for advanced queries
+func (c *SQLiteClient) GetDB() *sql.DB {
+	return c.db
 }
-
-func (c *SQLiteClient) GetUserByID(ctx context.Context, id string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at, deleted_at FROM users WHERE id = ? AND deleted_at IS NULL`, id).
-		Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-
-func (c *SQLiteClient) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at, deleted_at FROM users WHERE email = ? AND deleted_at IS NULL`, email).
-		Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-
-func (c *SQLiteClient) UpdateUser(ctx context.Context, user *types.User) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE users SET email = ?, first_name = ?, last_name = ?, mfa_enabled = ?, mfa_secret = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`,
-		user.Email, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.ID)
-	return err
-}
-
-func (c *SQLiteClient) DeleteUser(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE users SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`, id)
-	return err
-}
-
-// Session operations
-func (c *SQLiteClient) CreateSession(ctx context.Context, session *types.Session) error {
-	_, err := c.db.ExecContext(ctx, `INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.RefreshToken, session.UserAgent, session.IP, session.ExpiresAt.Format("2006-01-02T15:04:05Z"), session.CreatedAt.Format("2006-01-02T15:04:05Z"))
-	return err
-}
-
-func (c *SQLiteClient) GetSessionByID(ctx context.Context, id string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE id = ?`, id).
-		Scan(&session.ID, &session.UserID, &session.RefreshToken, &session.UserAgent, &session.IP, &session.ExpiresAt, &session.CreatedAt)
-	return session, err
-}
-
-func (c *SQLiteClient) GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE refresh_token = ?`, token).
-		Scan(&session.ID, &session.UserID, &session.RefreshToken, &session.UserAgent, &session.IP, &session.ExpiresAt, &session.CreatedAt)
-	return session, err
-}
-
-func (c *SQLiteClient) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var sessions []*types.Session
-	for rows.Next() {
-		s := &types.Session{}
-		rows.Scan(&s.ID, &s.UserID, &s.RefreshToken, &s.UserAgent, &s.IP, &s.ExpiresAt, &s.CreatedAt)
-		sessions = append(sessions, s)
-	}
-	return sessions, nil
-}
-
-func (c *SQLiteClient) DeleteSession(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, id)
-	return err
-}
-
-func (c *SQLiteClient) DeleteUserSessions(ctx context.Context, userID string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID)
-	return err
-}
-
-// Consent operations
-func (c *SQLiteClient) CreateConsent(ctx context.Context, consent *types.Consent) error {
-	_, err := c.db.ExecContext(ctx, `INSERT INTO consents (id, user_id, type, granted, granted_at, version, description) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		consent.ID, consent.UserID, consent.Type, consent.Granted, consent.GrantedAt, consent.Version, consent.Description)
-	return err
-}
-
-func (c *SQLiteClient) GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, type, granted, granted_at, revoked_at, version, description FROM consents WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var consents []*types.Consent
-	for rows.Next() {
-		consent := &types.Consent{}
-		rows.Scan(&consent.ID, &consent.UserID, &consent.Type, &consent.Granted, &consent.GrantedAt, &consent.RevokedAt, &consent.Version, &consent.Description)
-		consents = append(consents, consent)
-	}
-	return consents, nil
-}
-
-func (c *SQLiteClient) UpdateConsent(ctx context.Context, consent *types.Consent) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE consents SET granted = ?, granted_at = ?, revoked_at = ? WHERE id = ?`,
-		consent.Granted, consent.GrantedAt, consent.RevokedAt, consent.ID)
-	return err
-}
-
-// MFA operations
-func (c *SQLiteClient) CreateMFABackup(ctx context.Context, backup *types.MFABackup) error {
-	_, err := c.db.ExecContext(ctx, `INSERT INTO mfa_backups (id, user_id, code, used, created_at) VALUES (?, ?, ?, ?, ?)`,
-		backup.ID, backup.UserID, backup.Code, backup.Used, backup.CreatedAt.Format("2006-01-02T15:04:05Z"))
-	return err
-}
-
-func (c *SQLiteClient) GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, code, used, used_at, created_at FROM mfa_backups WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var backups []*types.MFABackup
-	for rows.Next() {
-		b := &types.MFABackup{}
-		rows.Scan(&b.ID, &b.UserID, &b.Code, &b.Used, &b.UsedAt, &b.CreatedAt)
-		backups = append(backups, b)
-	}
-	return backups, nil
-}
-
-func (c *SQLiteClient) UseMFABackup(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE mfa_backups SET used = 1, used_at = datetime('now') WHERE id = ?`, id)
-	return err
-}
-
-func (c *SQLiteClient) DeleteMFABackups(ctx context.Context, userID string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, userID)
-	return err
-}
-
-{{- if .EnableMFA}}
-
-// CreateBackupCode creates a new MFA backup code
-func (c *SQLiteClient) CreateBackupCode(ctx context.Context, backup *types.MFABackup) error {
-	return c.CreateMFABackup(ctx, backup)
-}
-
-// GetBackupCode retrieves a backup code by user ID and hashed code
-func (c *SQLiteClient) GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error) {
-	backup := &types.MFABackup{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT id, user_id, code, used, used_at, created_at
-		FROM mfa_backups WHERE user_id = ? AND code = ?
-	`, userID, hashedCode).Scan(&backup.ID, &backup.UserID, &backup.Code, &backup.Used, &backup.UsedAt, &backup.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return backup, nil
-}
-
-// UpdateBackupCode updates an MFA backup code
-func (c *SQLiteClient) UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE mfa_backups SET used = ?, used_at = ? WHERE id = ?`,
-		backup.Used, backup.UsedAt, backup.ID)
-	return err
-}
-
-// DeleteBackupCodes deletes all MFA backup codes for a user
-func (c *SQLiteClient) DeleteBackupCodes(ctx context.Context, userID string) error {
-	return c.DeleteMFABackups(ctx, userID)
-}
-{{- end}}
-
-{{- if .HasGDPRConsent}}
-
-// GetActiveConsentsByUserID retrieves all active consents for a user
-func (c *SQLiteClient) GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error) {
-	rows, err := c.db.QueryContext(ctx, `
-		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
-		FROM consents
-		WHERE user_id = ? AND granted = 1 AND revoked_at IS NULL
-		AND (expires_at IS NULL OR expires_at > datetime('now'))
-		ORDER BY granted_at DESC
-	`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var consents []*types.Consent
-	for rows.Next() {
-		consent := &types.Consent{}
-		rows.Scan(&consent.ID, &consent.UserID, &consent.Type, &consent.Granted,
-			&consent.GrantedAt, &consent.ExpiresAt, &consent.RevokedAt, &consent.Version, &consent.Description)
-		consents = append(consents, consent)
-	}
-	return consents, nil
-}
-
-// GetConsentHistory retrieves the full consent history for a user
-func (c *SQLiteClient) GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error) {
-	return c.GetUserConsents(ctx, userID)
-}
-{{- end}}
-
-{{- if .HasGDPRDataDeletion}}
-
-// SoftDeleteUser performs a GDPR-compliant soft delete by anonymizing PII
-func (c *SQLiteClient) SoftDeleteUser(ctx context.Context, id string) error {
-	anonymizedEmail := fmt.Sprintf("deleted_%s@anonymized.local", id)
-	_, err := c.db.ExecContext(ctx, `
-		UPDATE users SET
-			email = ?, first_name = 'DELETED', last_name = 'USER',
-			password_hash = '', mfa_enabled = 0, mfa_secret = '',
-			deleted_at = datetime('now'), updated_at = datetime('now')
-		WHERE id = ? AND deleted_at IS NULL
-	`, anonymizedEmail, id)
-	if err != nil {
-		return err
-	}
-
-	c.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, id)
-	c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, id)
-	return nil
-}
-{{- end}}
-
-{{- if .HasGDPRDataExport}}
-
-// ExportUserData exports all user data for GDPR data portability
-func (c *SQLiteClient) ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error) {
-	user, err := c.GetUserByID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	sessions, err := c.GetUserSessions(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	consents, err := c.GetUserConsents(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	userExport := types.UserExportData{
-		ID:        user.ID,
-		Email:     user.Email,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-	}
-
-	sessionExports := make([]types.SessionExportData, len(sessions))
-	for i, s := range sessions {
-		sessionExports[i] = types.SessionExportData{
-			ID:        s.ID,
-			UserAgent: s.UserAgent,
-			IP:        s.IP,
-			CreatedAt: s.CreatedAt,
-			ExpiresAt: s.ExpiresAt,
-		}
-	}
-
-	consentExports := make([]types.ConsentExportData, len(consents))
-	for i, consent := range consents {
-		consentExports[i] = types.ConsentExportData{
-			Type:      consent.Type,
-			Granted:   consent.Granted,
-			Version:   consent.Version,
-			GrantedAt: consent.GrantedAt,
-			RevokedAt: consent.RevokedAt,
-		}
-	}
-
-	return &types.UserDataExport{
-		ExportedAt: time.Now(),
-		User:       userExport,
-		Sessions:   sessionExports,
-		Consents:   consentExports,
-	}, nil
-}
-{{- end}}
-
-{{- if .HasOAuth}}
-
-// GetUserByOAuthID retrieves a user by OAuth provider and ID
-func (c *SQLiteClient) GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT u.id, u.email, u.password_hash, u.first_name, u.last_name,
-		       u.mfa_enabled, u.mfa_secret, u.created_at, u.updated_at, u.deleted_at
-		FROM users u
-		INNER JOIN oauth_accounts oa ON u.id = oa.user_id
-		WHERE oa.provider = ? AND oa.provider_id = ? AND u.deleted_at IS NULL
-	`, provider, oauthID).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName,
-		&user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-{{- end}}

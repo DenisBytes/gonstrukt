@@ -1,0 +1,20 @@
+{{- if .HasEmail}}
+-- Create email verification tokens table
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    token VARCHAR(255) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL,
+    verified_at TIMESTAMP NULL,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_evt_user_id (user_id),
+    INDEX idx_evt_token (token),
+    INDEX idx_evt_expires_at (expires_at)
+);
+
+-- Add email_verified columns to users table
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP NULL;
+{{- end}}

@@ -3,12 +3,17 @@ package db
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"{{.ModuleName}}/internals/types"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // MySQLClient implements the Database interface for MySQL
 type MySQLClient struct {
@@ -38,82 +43,79 @@ func NewMySQLClient(connString string) (*MySQLClient, error) {
 
 // Migrate runs database migrations
 func (c *MySQLClient) Migrate(ctx context.Context) error {
-	// Create users table
+	// Create migrations table if not exists
 	_, err := c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS users (
-			id VARCHAR(36) PRIMARY KEY,
-			email VARCHAR(255) UNIQUE NOT NULL,
-			password_hash VARCHAR(255) NOT NULL,
-			first_name VARCHAR(100),
-			last_name VARCHAR(100),
-			mfa_enabled BOOLEAN DEFAULT FALSE,
-			mfa_secret VARCHAR(255),
-			roles JSON,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			deleted_at TIMESTAMP NULL,
-			INDEX idx_email (email),
-			INDEX idx_deleted_at (deleted_at)
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version VARCHAR(255) PRIMARY KEY,
+			applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)
 	`)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create migrations table: %w", err)
 	}
 
-	// Create sessions table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS sessions (
-			id VARCHAR(36) PRIMARY KEY,
-			user_id VARCHAR(36) NOT NULL,
-			refresh_token VARCHAR(255) UNIQUE NOT NULL,
-			user_agent TEXT,
-			ip VARCHAR(45),
-			expires_at TIMESTAMP NOT NULL,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-			INDEX idx_user_id (user_id),
-			INDEX idx_refresh_token (refresh_token)
-		)
-	`)
+	// Read migration files
+	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read migrations directory: %w", err)
 	}
 
-	// Create consents table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS consents (
-			id VARCHAR(36) PRIMARY KEY,
-			user_id VARCHAR(36) NOT NULL,
-			type VARCHAR(50) NOT NULL,
-			granted BOOLEAN DEFAULT FALSE,
-			granted_at TIMESTAMP NULL,
-			revoked_at TIMESTAMP NULL,
-			version VARCHAR(20) NOT NULL,
-			description TEXT,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-			UNIQUE KEY unique_consent (user_id, type, version),
-			INDEX idx_user_consents (user_id)
+	// Sort entries by name for consistent ordering
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		version := entry.Name()
+
+		// Check if migration already applied
+		var count int
+		err := c.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+			version,
+		).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("failed to check migration status: %w", err)
+		}
+
+		if count > 0 {
+			continue
+		}
+
+		// Read and execute migration
+		content, err := migrationsFS.ReadFile("migrations/" + version)
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", version, err)
+		}
+
+		// Execute each statement separately
+		statements := strings.Split(string(content), ";")
+		for _, stmt := range statements {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			_, err = c.db.ExecContext(ctx, stmt)
+			if err != nil {
+				return fmt.Errorf("failed to execute migration %s: %w", version, err)
+			}
+		}
+
+		// Record migration
+		_, err = c.db.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version) VALUES (?)",
+			version,
 		)
-	`)
-	if err != nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to record migration %s: %w", version, err)
+		}
 	}
 
-	// Create mfa_backups table
-	_, err = c.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS mfa_backups (
-			id VARCHAR(36) PRIMARY KEY,
-			user_id VARCHAR(36) NOT NULL,
-			code VARCHAR(255) NOT NULL,
-			used BOOLEAN DEFAULT FALSE,
-			used_at TIMESTAMP NULL,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-			INDEX idx_mfa_user (user_id)
-		)
-	`)
-
-	return err
+	return nil
 }
 
 // Ping checks the database connection
@@ -126,341 +128,7 @@ func (c *MySQLClient) Close(ctx context.Context) error {
 	return c.db.Close()
 }
 
-// CreateUser creates a new user
-func (c *MySQLClient) CreateUser(ctx context.Context, user *types.User) error {
-	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO users (id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, user.ID, user.Email, user.PasswordHash, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.CreatedAt, user.UpdatedAt)
-	return err
+// GetDB returns the underlying database connection for advanced queries
+func (c *MySQLClient) GetDB() *sql.DB {
+	return c.db
 }
-
-// GetUserByID retrieves a user by ID
-func (c *MySQLClient) GetUserByID(ctx context.Context, id string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at, deleted_at
-		FROM users WHERE id = ? AND deleted_at IS NULL
-	`, id).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-
-// GetUserByEmail retrieves a user by email
-func (c *MySQLClient) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT id, email, password_hash, first_name, last_name, mfa_enabled, mfa_secret, created_at, updated_at, deleted_at
-		FROM users WHERE email = ? AND deleted_at IS NULL
-	`, email).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-
-// UpdateUser updates a user
-func (c *MySQLClient) UpdateUser(ctx context.Context, user *types.User) error {
-	_, err := c.db.ExecContext(ctx, `
-		UPDATE users SET email = ?, first_name = ?, last_name = ?, mfa_enabled = ?, mfa_secret = ?, updated_at = NOW()
-		WHERE id = ? AND deleted_at IS NULL
-	`, user.Email, user.FirstName, user.LastName, user.MFAEnabled, user.MFASecret, user.ID)
-	return err
-}
-
-// DeleteUser soft deletes a user
-func (c *MySQLClient) DeleteUser(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE users SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL`, id)
-	return err
-}
-
-// CreateSession creates a session
-func (c *MySQLClient) CreateSession(ctx context.Context, session *types.Session) error {
-	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, session.ID, session.UserID, session.RefreshToken, session.UserAgent, session.IP, session.ExpiresAt, session.CreatedAt)
-	return err
-}
-
-// GetSessionByID retrieves a session by ID
-func (c *MySQLClient) GetSessionByID(ctx context.Context, id string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE id = ?`, id).
-		Scan(&session.ID, &session.UserID, &session.RefreshToken, &session.UserAgent, &session.IP, &session.ExpiresAt, &session.CreatedAt)
-	return session, err
-}
-
-// GetSessionByRefreshToken retrieves a session by refresh token
-func (c *MySQLClient) GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.db.QueryRowContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE refresh_token = ?`, token).
-		Scan(&session.ID, &session.UserID, &session.RefreshToken, &session.UserAgent, &session.IP, &session.ExpiresAt, &session.CreatedAt)
-	return session, err
-}
-
-// GetUserSessions retrieves all sessions for a user
-func (c *MySQLClient) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at FROM sessions WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var sessions []*types.Session
-	for rows.Next() {
-		s := &types.Session{}
-		if err := rows.Scan(&s.ID, &s.UserID, &s.RefreshToken, &s.UserAgent, &s.IP, &s.ExpiresAt, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		sessions = append(sessions, s)
-	}
-	return sessions, nil
-}
-
-// DeleteSession deletes a session
-func (c *MySQLClient) DeleteSession(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, id)
-	return err
-}
-
-// DeleteUserSessions deletes all sessions for a user
-func (c *MySQLClient) DeleteUserSessions(ctx context.Context, userID string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID)
-	return err
-}
-
-// CreateConsent creates a consent record
-func (c *MySQLClient) CreateConsent(ctx context.Context, consent *types.Consent) error {
-	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO consents (id, user_id, type, granted, granted_at, version, description)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, consent.ID, consent.UserID, consent.Type, consent.Granted, consent.GrantedAt, consent.Version, consent.Description)
-	return err
-}
-
-// GetUserConsents retrieves all consents for a user
-func (c *MySQLClient) GetUserConsents(ctx context.Context, userID string) ([]*types.Consent, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, type, granted, granted_at, revoked_at, version, description FROM consents WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var consents []*types.Consent
-	for rows.Next() {
-		c := &types.Consent{}
-		if err := rows.Scan(&c.ID, &c.UserID, &c.Type, &c.Granted, &c.GrantedAt, &c.RevokedAt, &c.Version, &c.Description); err != nil {
-			return nil, err
-		}
-		consents = append(consents, c)
-	}
-	return consents, nil
-}
-
-// UpdateConsent updates a consent record
-func (c *MySQLClient) UpdateConsent(ctx context.Context, consent *types.Consent) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE consents SET granted = ?, granted_at = ?, revoked_at = ? WHERE id = ?`,
-		consent.Granted, consent.GrantedAt, consent.RevokedAt, consent.ID)
-	return err
-}
-
-// CreateMFABackup creates an MFA backup code
-func (c *MySQLClient) CreateMFABackup(ctx context.Context, backup *types.MFABackup) error {
-	_, err := c.db.ExecContext(ctx, `INSERT INTO mfa_backups (id, user_id, code, used, created_at) VALUES (?, ?, ?, ?, ?)`,
-		backup.ID, backup.UserID, backup.Code, backup.Used, backup.CreatedAt)
-	return err
-}
-
-// GetMFABackups retrieves MFA backup codes for a user
-func (c *MySQLClient) GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, user_id, code, used, used_at, created_at FROM mfa_backups WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var backups []*types.MFABackup
-	for rows.Next() {
-		b := &types.MFABackup{}
-		if err := rows.Scan(&b.ID, &b.UserID, &b.Code, &b.Used, &b.UsedAt, &b.CreatedAt); err != nil {
-			return nil, err
-		}
-		backups = append(backups, b)
-	}
-	return backups, nil
-}
-
-// UseMFABackup marks a backup code as used
-func (c *MySQLClient) UseMFABackup(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE mfa_backups SET used = TRUE, used_at = NOW() WHERE id = ?`, id)
-	return err
-}
-
-// DeleteMFABackups deletes all MFA backup codes for a user
-func (c *MySQLClient) DeleteMFABackups(ctx context.Context, userID string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, userID)
-	return err
-}
-
-{{- if .EnableMFA}}
-
-// CreateBackupCode creates a new MFA backup code
-func (c *MySQLClient) CreateBackupCode(ctx context.Context, backup *types.MFABackup) error {
-	return c.CreateMFABackup(ctx, backup)
-}
-
-// GetBackupCode retrieves a backup code by user ID and hashed code
-func (c *MySQLClient) GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error) {
-	backup := &types.MFABackup{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT id, user_id, code, used, used_at, created_at
-		FROM mfa_backups WHERE user_id = ? AND code = ?
-	`, userID, hashedCode).Scan(&backup.ID, &backup.UserID, &backup.Code, &backup.Used, &backup.UsedAt, &backup.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return backup, nil
-}
-
-// UpdateBackupCode updates an MFA backup code
-func (c *MySQLClient) UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE mfa_backups SET used = ?, used_at = ? WHERE id = ?`,
-		backup.Used, backup.UsedAt, backup.ID)
-	return err
-}
-
-// DeleteBackupCodes deletes all MFA backup codes for a user
-func (c *MySQLClient) DeleteBackupCodes(ctx context.Context, userID string) error {
-	return c.DeleteMFABackups(ctx, userID)
-}
-{{- end}}
-
-{{- if .HasGDPRConsent}}
-
-// GetActiveConsentsByUserID retrieves all active consents for a user
-func (c *MySQLClient) GetActiveConsentsByUserID(ctx context.Context, userID string) ([]*types.Consent, error) {
-	rows, err := c.db.QueryContext(ctx, `
-		SELECT id, user_id, type, granted, granted_at, expires_at, revoked_at, version, description
-		FROM consents
-		WHERE user_id = ? AND granted = TRUE AND revoked_at IS NULL
-		AND (expires_at IS NULL OR expires_at > NOW())
-		ORDER BY granted_at DESC
-	`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var consents []*types.Consent
-	for rows.Next() {
-		consent := &types.Consent{}
-		if err := rows.Scan(&consent.ID, &consent.UserID, &consent.Type, &consent.Granted,
-			&consent.GrantedAt, &consent.ExpiresAt, &consent.RevokedAt, &consent.Version, &consent.Description); err != nil {
-			return nil, err
-		}
-		consents = append(consents, consent)
-	}
-	return consents, nil
-}
-
-// GetConsentHistory retrieves the full consent history for a user
-func (c *MySQLClient) GetConsentHistory(ctx context.Context, userID string) ([]*types.Consent, error) {
-	return c.GetUserConsents(ctx, userID)
-}
-{{- end}}
-
-{{- if .HasGDPRDataDeletion}}
-
-// SoftDeleteUser performs a GDPR-compliant soft delete by anonymizing PII
-func (c *MySQLClient) SoftDeleteUser(ctx context.Context, id string) error {
-	anonymizedEmail := fmt.Sprintf("deleted_%s@anonymized.local", id)
-	_, err := c.db.ExecContext(ctx, `
-		UPDATE users SET
-			email = ?, first_name = 'DELETED', last_name = 'USER',
-			password_hash = '', mfa_enabled = FALSE, mfa_secret = '',
-			deleted_at = NOW(), updated_at = NOW()
-		WHERE id = ? AND deleted_at IS NULL
-	`, anonymizedEmail, id)
-	if err != nil {
-		return err
-	}
-
-	// Delete sessions and MFA backup codes
-	c.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, id)
-	c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, id)
-	return nil
-}
-{{- end}}
-
-{{- if .HasGDPRDataExport}}
-
-// ExportUserData exports all user data for GDPR data portability
-func (c *MySQLClient) ExportUserData(ctx context.Context, userID string) (*types.UserDataExport, error) {
-	user, err := c.GetUserByID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	sessions, err := c.GetUserSessions(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	consents, err := c.GetUserConsents(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	userExport := types.UserExportData{
-		ID:        user.ID,
-		Email:     user.Email,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-	}
-
-	sessionExports := make([]types.SessionExportData, len(sessions))
-	for i, s := range sessions {
-		sessionExports[i] = types.SessionExportData{
-			ID:        s.ID,
-			UserAgent: s.UserAgent,
-			IP:        s.IP,
-			CreatedAt: s.CreatedAt,
-			ExpiresAt: s.ExpiresAt,
-		}
-	}
-
-	consentExports := make([]types.ConsentExportData, len(consents))
-	for i, consent := range consents {
-		consentExports[i] = types.ConsentExportData{
-			Type:      consent.Type,
-			Granted:   consent.Granted,
-			Version:   consent.Version,
-			GrantedAt: consent.GrantedAt,
-			RevokedAt: consent.RevokedAt,
-		}
-	}
-
-	return &types.UserDataExport{
-		ExportedAt: time.Now(),
-		User:       userExport,
-		Sessions:   sessionExports,
-		Consents:   consentExports,
-	}, nil
-}
-{{- end}}
-
-{{- if .HasOAuth}}
-
-// GetUserByOAuthID retrieves a user by OAuth provider and ID
-func (c *MySQLClient) GetUserByOAuthID(ctx context.Context, provider, oauthID string) (*types.User, error) {
-	user := &types.User{}
-	err := c.db.QueryRowContext(ctx, `
-		SELECT u.id, u.email, u.password_hash, u.first_name, u.last_name,
-		       u.mfa_enabled, u.mfa_secret, u.created_at, u.updated_at, u.deleted_at
-		FROM users u
-		INNER JOIN oauth_accounts oa ON u.id = oa.user_id
-		WHERE oa.provider = ? AND oa.provider_id = ? AND u.deleted_at IS NULL
-	`, provider, oauthID).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName,
-		&user.MFAEnabled, &user.MFASecret, &user.CreatedAt, &user.UpdatedAt, &user.DeletedAt)
-	return user, err
-}
-{{- end}}

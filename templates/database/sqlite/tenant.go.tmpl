@@ -1,0 +1,129 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateTenant creates a new tenant
+func (c *SQLiteClient) CreateTenant(ctx context.Context, tenant *types.Tenant) error {
+	settings, err := json.Marshal(tenant.Settings)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.db.ExecContext(ctx, `
+		INSERT INTO tenants (id, name, slug, plan, settings, is_active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, tenant.ID, tenant.Name, tenant.Slug, tenant.Plan, string(settings), tenant.IsActive,
+		tenant.CreatedAt.Format("2006-01-02T15:04:05Z"), tenant.UpdatedAt.Format("2006-01-02T15:04:05Z"))
+	return err
+}
+
+// GetTenantByID retrieves a tenant by ID
+func (c *SQLiteClient) GetTenantByID(ctx context.Context, id string) (*types.Tenant, error) {
+	tenant := &types.Tenant{}
+	var settings string
+
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, name, slug, plan, settings, is_active, created_at, updated_at
+		FROM tenants WHERE id = ?
+	`, id).Scan(
+		&tenant.ID, &tenant.Name, &tenant.Slug, &tenant.Plan,
+		&settings, &tenant.IsActive, &tenant.CreatedAt, &tenant.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("tenant not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if settings != "" {
+		if err := json.Unmarshal([]byte(settings), &tenant.Settings); err != nil {
+			return nil, err
+		}
+	}
+
+	return tenant, nil
+}
+
+// GetTenantBySlug retrieves a tenant by slug
+func (c *SQLiteClient) GetTenantBySlug(ctx context.Context, slug string) (*types.Tenant, error) {
+	tenant := &types.Tenant{}
+	var settings string
+
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, name, slug, plan, settings, is_active, created_at, updated_at
+		FROM tenants WHERE slug = ?
+	`, slug).Scan(
+		&tenant.ID, &tenant.Name, &tenant.Slug, &tenant.Plan,
+		&settings, &tenant.IsActive, &tenant.CreatedAt, &tenant.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("tenant not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if settings != "" {
+		if err := json.Unmarshal([]byte(settings), &tenant.Settings); err != nil {
+			return nil, err
+		}
+	}
+
+	return tenant, nil
+}
+
+// UpdateTenant updates an existing tenant
+func (c *SQLiteClient) UpdateTenant(ctx context.Context, tenant *types.Tenant) error {
+	tenant.UpdatedAt = time.Now()
+
+	settings, err := json.Marshal(tenant.Settings)
+	if err != nil {
+		return err
+	}
+
+	result, err := c.db.ExecContext(ctx, `
+		UPDATE tenants SET name = ?, slug = ?, plan = ?, settings = ?, is_active = ?, updated_at = ?
+		WHERE id = ?
+	`, tenant.Name, tenant.Slug, tenant.Plan, string(settings), tenant.IsActive,
+		tenant.UpdatedAt.Format("2006-01-02T15:04:05Z"), tenant.ID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("tenant not found")
+	}
+
+	return nil
+}
+
+// DeleteTenant deletes a tenant
+func (c *SQLiteClient) DeleteTenant(ctx context.Context, id string) error {
+	result, err := c.db.ExecContext(ctx, `DELETE FROM tenants WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("tenant not found")
+	}
+
+	return nil
+}

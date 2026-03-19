@@ -2,6 +2,9 @@ package db
 
 import (
 	"context"
+{{- if .HasTenancy}}
+	"time"
+{{- end}}
 
 	"{{.ModuleName}}/internals/types"
 )
@@ -59,6 +62,42 @@ type Database interface {
 	// GDPR processing logs
 	CreateDataProcessingLog(ctx context.Context, log *types.DataProcessingLog) error
 	GetDataProcessingLogs(ctx context.Context, userID string) ([]*types.DataProcessingLog, error)
+{{- end}}
+
+{{- if .HasTenancy}}
+	// Tenant operations
+	CreateTenant(ctx context.Context, tenant *types.Tenant) error
+	GetTenantByID(ctx context.Context, id string) (*types.Tenant, error)
+	GetTenantBySlug(ctx context.Context, slug string) (*types.Tenant, error)
+	UpdateTenant(ctx context.Context, tenant *types.Tenant) error
+	DeleteTenant(ctx context.Context, id string) error
+
+	// User-tenant membership operations
+	CreateUserTenant(ctx context.Context, ut *types.UserTenant) error
+	GetUserTenant(ctx context.Context, userID, tenantID string) (*types.UserTenant, error)
+	CheckUserTenantMembership(ctx context.Context, userID, tenantID string) (bool, error)
+	GetUserTenants(ctx context.Context, userID string) ([]*types.UserTenant, error)
+	DeleteUserTenant(ctx context.Context, userID, tenantID string) error
+	GetTenantMembers(ctx context.Context, tenantID string) ([]*types.TenantMember, error)
+	UpdateUserTenantRole(ctx context.Context, userID, tenantID string, roles []string) error
+	CountTenantMembers(ctx context.Context, tenantID string) (int, error)
+	UpdateLastUsedTenant(ctx context.Context, userID, tenantID string) error
+
+	// Invitation operations
+	CreateInvitation(ctx context.Context, invitation *types.Invitation) error
+	GetInvitationByID(ctx context.Context, id string) (*types.Invitation, error)
+	GetInvitationByToken(ctx context.Context, token string) (*types.Invitation, error)
+	GetInvitationsByEmail(ctx context.Context, email string) ([]*types.Invitation, error)
+	GetInvitationsByTenant(ctx context.Context, tenantID string) ([]*types.Invitation, error)
+	UpdateInvitationStatus(ctx context.Context, id, status string) error
+	UpdateInvitationToken(ctx context.Context, id, token string, expiresAt time.Time) error
+{{- end}}
+
+{{- if .HasOAuth}}
+	// OAuth token operations
+	UpsertOAuthToken(ctx context.Context, token *types.OAuthToken) error
+	GetOAuthTokensByUser(ctx context.Context, userID string) ([]*types.OAuthToken, error)
+	DeleteOAuthTokensByUser(ctx context.Context, userID string) error
 {{- end}}
 
 	// Utility

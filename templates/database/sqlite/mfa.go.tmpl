@@ -1,0 +1,105 @@
+package db
+
+import (
+	"context"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateMFABackup creates an MFA backup code
+func (c *SQLiteClient) CreateMFABackup(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO mfa_backups (id, user_id, code, used, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, backup.ID, backup.UserID, backup.Code, backup.Used, backup.CreatedAt.Format("2006-01-02T15:04:05Z"))
+	return err
+}
+
+// GetMFABackups retrieves MFA backup codes for a user
+func (c *SQLiteClient) GetMFABackups(ctx context.Context, userID string) ([]*types.MFABackup, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups WHERE user_id = ?
+		ORDER BY created_at ASC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var backups []*types.MFABackup
+	for rows.Next() {
+		b := &types.MFABackup{}
+		if err := rows.Scan(&b.ID, &b.UserID, &b.Code, &b.Used, &b.UsedAt, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		backups = append(backups, b)
+	}
+
+	return backups, rows.Err()
+}
+
+// UseMFABackup marks a backup code as used
+func (c *SQLiteClient) UseMFABackup(ctx context.Context, id string) error {
+	now := time.Now()
+	_, err := c.db.ExecContext(ctx, `
+		UPDATE mfa_backups SET used = 1, used_at = ?
+		WHERE id = ?
+	`, now.Format("2006-01-02T15:04:05Z"), id)
+	return err
+}
+
+// DeleteMFABackups deletes all MFA backup codes for a user
+func (c *SQLiteClient) DeleteMFABackups(ctx context.Context, userID string) error {
+	_, err := c.db.ExecContext(ctx, `DELETE FROM mfa_backups WHERE user_id = ?`, userID)
+	return err
+}
+
+// GetUnusedMFABackup retrieves an unused backup code by code value
+func (c *SQLiteClient) GetUnusedMFABackup(ctx context.Context, userID, code string) (*types.MFABackup, error) {
+	backup := &types.MFABackup{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups WHERE user_id = ? AND code = ? AND used = 0
+	`, userID, code).Scan(&backup.ID, &backup.UserID, &backup.Code, &backup.Used, &backup.UsedAt, &backup.CreatedAt)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return backup, nil
+}
+
+{{- if .EnableMFA}}
+
+// CreateBackupCode creates a new MFA backup code
+func (c *SQLiteClient) CreateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	return c.CreateMFABackup(ctx, backup)
+}
+
+// GetBackupCode retrieves a backup code by user ID and hashed code
+func (c *SQLiteClient) GetBackupCode(ctx context.Context, userID, hashedCode string) (*types.MFABackup, error) {
+	backup := &types.MFABackup{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, user_id, code, used, used_at, created_at
+		FROM mfa_backups WHERE user_id = ? AND code = ?
+	`, userID, hashedCode).Scan(&backup.ID, &backup.UserID, &backup.Code, &backup.Used, &backup.UsedAt, &backup.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return backup, nil
+}
+
+// UpdateBackupCode updates an MFA backup code
+func (c *SQLiteClient) UpdateBackupCode(ctx context.Context, backup *types.MFABackup) error {
+	_, err := c.db.ExecContext(ctx, `UPDATE mfa_backups SET used = ?, used_at = ? WHERE id = ?`,
+		backup.Used, backup.UsedAt, backup.ID)
+	return err
+}
+
+// DeleteBackupCodes deletes all MFA backup codes for a user
+func (c *SQLiteClient) DeleteBackupCodes(ctx context.Context, userID string) error {
+	return c.DeleteMFABackups(ctx, userID)
+}
+{{- end}}

@@ -1,0 +1,168 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// CreateInvitation creates a new invitation
+func (c *MySQLClient) CreateInvitation(ctx context.Context, invitation *types.Invitation) error {
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO invitations (id, tenant_id, email, role, status, invited_by, token, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, invitation.ID, invitation.TenantID, invitation.Email, invitation.Role,
+		invitation.Status, invitation.InvitedBy, invitation.Token, invitation.ExpiresAt, invitation.CreatedAt)
+	return err
+}
+
+// GetInvitationByID retrieves an invitation by ID
+func (c *MySQLClient) GetInvitationByID(ctx context.Context, id string) (*types.Invitation, error) {
+	inv := &types.Invitation{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations WHERE id = ?
+	`, id).Scan(
+		&inv.ID, &inv.TenantID, &inv.Email, &inv.Role, &inv.Status,
+		&inv.InvitedBy, &inv.Token, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.RevokedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("invitation not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// GetInvitationByToken retrieves an invitation by token
+func (c *MySQLClient) GetInvitationByToken(ctx context.Context, token string) (*types.Invitation, error) {
+	inv := &types.Invitation{}
+	err := c.db.QueryRowContext(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations WHERE token = ?
+	`, token).Scan(
+		&inv.ID, &inv.TenantID, &inv.Email, &inv.Role, &inv.Status,
+		&inv.InvitedBy, &inv.Token, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.RevokedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("invitation not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// GetInvitationsByEmail retrieves all pending invitations for an email
+func (c *MySQLClient) GetInvitationsByEmail(ctx context.Context, email string) ([]*types.Invitation, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations
+		WHERE email = ? AND status = 'pending' AND expires_at > NOW()
+		ORDER BY created_at DESC
+	`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invitations []*types.Invitation
+	for rows.Next() {
+		inv := &types.Invitation{}
+		if err := rows.Scan(
+			&inv.ID, &inv.TenantID, &inv.Email, &inv.Role, &inv.Status,
+			&inv.InvitedBy, &inv.Token, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		invitations = append(invitations, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return invitations, nil
+}
+
+// GetInvitationsByTenant retrieves all invitations for a tenant
+func (c *MySQLClient) GetInvitationsByTenant(ctx context.Context, tenantID string) ([]*types.Invitation, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, tenant_id, email, role, status, invited_by, token, expires_at, created_at, accepted_at, revoked_at
+		FROM invitations
+		WHERE tenant_id = ?
+		ORDER BY created_at DESC
+	`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invitations []*types.Invitation
+	for rows.Next() {
+		inv := &types.Invitation{}
+		if err := rows.Scan(
+			&inv.ID, &inv.TenantID, &inv.Email, &inv.Role, &inv.Status,
+			&inv.InvitedBy, &inv.Token, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		invitations = append(invitations, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return invitations, nil
+}
+
+// UpdateInvitationStatus updates an invitation's status
+func (c *MySQLClient) UpdateInvitationStatus(ctx context.Context, id, status string) error {
+	now := time.Now()
+	var result sql.Result
+	var err error
+
+	switch status {
+	case "accepted":
+		result, err = c.db.ExecContext(ctx, `UPDATE invitations SET status = ?, accepted_at = ? WHERE id = ?`, status, now, id)
+	case "revoked":
+		result, err = c.db.ExecContext(ctx, `UPDATE invitations SET status = ?, revoked_at = ? WHERE id = ?`, status, now, id)
+	default:
+		result, err = c.db.ExecContext(ctx, `UPDATE invitations SET status = ? WHERE id = ?`, status, id)
+	}
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("invitation not found")
+	}
+
+	return nil
+}
+
+// UpdateInvitationToken updates the token and expiry for an invitation (for resend)
+func (c *MySQLClient) UpdateInvitationToken(ctx context.Context, id, token string, expiresAt time.Time) error {
+	result, err := c.db.ExecContext(ctx, `
+		UPDATE invitations SET token = ?, expires_at = ?
+		WHERE id = ? AND status = 'pending'
+	`, token, expiresAt, id)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errors.New("invitation not found or not pending")
+	}
+
+	return nil
+}

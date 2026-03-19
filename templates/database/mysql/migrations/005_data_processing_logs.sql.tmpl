@@ -1,0 +1,25 @@
+{{- if .HasGDPRProcessingLogs}}
+-- Create data processing logs table for GDPR Article 30 compliance
+CREATE TABLE IF NOT EXISTS data_processing_logs (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36),
+    process_type VARCHAR(100) NOT NULL,
+    processed_data TEXT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'processing',
+    request_ip VARCHAR(100),
+    processor_id VARCHAR(100) NOT NULL,
+    legal_basis VARCHAR(100) NOT NULL,
+    purpose TEXT NOT NULL,
+    data_subject VARCHAR(255),
+    error_details TEXT,
+    requested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_dpl_user_id (user_id),
+    INDEX idx_dpl_process_type (process_type),
+    INDEX idx_dpl_status (status),
+    INDEX idx_dpl_legal_basis (legal_basis),
+    INDEX idx_dpl_created_at (created_at)
+);
+{{- end}}

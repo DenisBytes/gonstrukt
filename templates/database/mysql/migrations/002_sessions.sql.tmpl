@@ -1,0 +1,14 @@
+-- Create sessions table
+CREATE TABLE IF NOT EXISTS sessions (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    refresh_token VARCHAR(255) UNIQUE NOT NULL,
+    user_agent TEXT,
+    ip VARCHAR(45),
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_sessions_user_id (user_id),
+    INDEX idx_sessions_refresh_token (refresh_token),
+    INDEX idx_sessions_expires_at (expires_at)
+);

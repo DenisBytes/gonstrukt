@@ -1,0 +1,81 @@
+{{- if .HasOAuth}}
+package db
+
+import (
+	"context"
+	"time"
+
+	"{{.ModuleName}}/internals/types"
+)
+
+// UpsertOAuthToken inserts or updates an OAuth token for a user/provider pair
+func (c *MySQLClient) UpsertOAuthToken(ctx context.Context, token *types.OAuthToken) error {
+	token.UpdatedAt = time.Now()
+	if token.CreatedAt.IsZero() {
+		token.CreatedAt = token.UpdatedAt
+	}
+
+	_, err := c.db.ExecContext(ctx, `
+		INSERT INTO oauth_tokens (id, user_id, provider, access_token, refresh_token, token_type, expires_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			access_token = VALUES(access_token),
+			refresh_token = VALUES(refresh_token),
+			token_type = VALUES(token_type),
+			expires_at = VALUES(expires_at),
+			updated_at = VALUES(updated_at)
+	`,
+		token.ID,
+		token.UserID,
+		token.Provider,
+		token.AccessToken,
+		token.RefreshToken,
+		token.TokenType,
+		token.ExpiresAt,
+		token.CreatedAt,
+		token.UpdatedAt,
+	)
+	return err
+}
+
+// GetOAuthTokensByUser retrieves all OAuth tokens for a user
+func (c *MySQLClient) GetOAuthTokensByUser(ctx context.Context, userID string) ([]*types.OAuthToken, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, user_id, provider, access_token, refresh_token, token_type, expires_at, created_at, updated_at
+		FROM oauth_tokens
+		WHERE user_id = ?
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []*types.OAuthToken
+	for rows.Next() {
+		token := &types.OAuthToken{}
+		if err := rows.Scan(
+			&token.ID,
+			&token.UserID,
+			&token.Provider,
+			&token.AccessToken,
+			&token.RefreshToken,
+			&token.TokenType,
+			&token.ExpiresAt,
+			&token.CreatedAt,
+			&token.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+
+	return tokens, rows.Err()
+}
+
+// DeleteOAuthTokensByUser deletes all OAuth tokens for a user
+func (c *MySQLClient) DeleteOAuthTokensByUser(ctx context.Context, userID string) error {
+	_, err := c.db.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE user_id = ?`, userID)
+	return err
+}
+{{- end}}
