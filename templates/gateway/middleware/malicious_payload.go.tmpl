@@ -56,11 +56,13 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 
 	// Command injection patterns
 	cmdPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`[;&|]`),
+		regexp.MustCompile(`;\s*(ls|cat|rm|chmod|chown|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php)\b`),
+		regexp.MustCompile(`\|\s*(ls|cat|rm|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php)\b`),
+		regexp.MustCompile(`&&\s*(ls|cat|rm|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php)\b`),
 		regexp.MustCompile("(?i)`[^`]+`"),
 		regexp.MustCompile(`\$\([^)]+\)`),
-		regexp.MustCompile(`(?i)(cat|ls|whoami|id|curl|wget|nc|netcat)\s`),
 		regexp.MustCompile(`(?i)/etc/(passwd|shadow|hosts)`),
+		regexp.MustCompile(`(?i)\b(whoami|id)\s*[;&|]`),
 	}
 
 	return func(next http.Handler) http.Handler {
