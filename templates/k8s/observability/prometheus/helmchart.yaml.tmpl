@@ -1,0 +1,53 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: monitoring
+  namespace: kube-system
+spec:
+  repo: https://prometheus-community.github.io/helm-charts
+  chart: kube-prometheus-stack
+  version: "82.5.0"
+  targetNamespace: {{ .ProjectName }}
+  createNamespace: true
+  valuesContent: |-
+    grafana:
+      enabled: true
+      adminUser: admin
+      adminPassword: admin
+      grafana.ini:
+        server:
+          root_url: https://{{ .Domain }}/grafana
+          serve_from_sub_path: true
+        auth.anonymous:
+          enabled: true
+          org_role: Viewer
+      sidecar:
+        dashboards:
+          enabled: true
+          label: grafana_dashboard
+          labelValue: "1"
+          searchNamespace: {{ .ProjectName }}
+          folderAnnotation: grafana_folder
+          provider:
+            foldersFromFilesStructure: true
+
+    alertmanager:
+      enabled: false
+
+    prometheus:
+      prometheusSpec:
+        enableRemoteWriteReceiver: true
+        retention: 7d
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 5Gi
+        serviceMonitorSelectorNilUsesHelmValues: false
+        serviceMonitorNamespaceSelector:
+          matchNames:
+            - {{ .ProjectName }}

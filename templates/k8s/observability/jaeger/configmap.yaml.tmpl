@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-config
+  namespace: {{ .ProjectName }}
+  labels:
+    app: jaeger
+    app.kubernetes.io/part-of: {{ .ProjectName }}
+data:
+  jaeger-config.yaml: |
+    service:
+      extensions: [jaeger_storage, jaeger_query]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter]
+
+    extensions:
+      jaeger_storage:
+        backends:
+          badger_main:
+            badger:
+              directories:
+                keys: /badger/key
+                values: /badger/data
+              ephemeral: false
+      jaeger_query:
+        storage:
+          traces: badger_main
+        base_path: /jaeger
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: badger_main

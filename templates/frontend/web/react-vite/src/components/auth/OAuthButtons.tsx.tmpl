@@ -139,7 +139,7 @@ export function OAuthButtons() {
 {{- if .HasGoogleOAuth}}
       <Button
         kind="secondary"
-        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        overrides={{"{{" }} BaseButton: { style: { width: '100%' } } {{ "}}" }}
         onClick={handleGoogle}
         isLoading={loading === 'google'}
         disabled={loading !== null}
@@ -150,7 +150,7 @@ export function OAuthButtons() {
 {{- if .HasMicrosoftOAuth}}
       <Button
         kind="secondary"
-        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        overrides={{"{{" }} BaseButton: { style: { width: '100%' } } {{ "}}" }}
         onClick={handleMicrosoft}
         isLoading={loading === 'microsoft'}
         disabled={loading !== null}
@@ -161,7 +161,7 @@ export function OAuthButtons() {
 {{- if .HasAppleOAuth}}
       <Button
         kind="secondary"
-        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        overrides={{"{{" }} BaseButton: { style: { width: '100%' } } {{ "}}" }}
         onClick={handleApple}
         isLoading={loading === 'apple'}
         disabled={loading !== null}

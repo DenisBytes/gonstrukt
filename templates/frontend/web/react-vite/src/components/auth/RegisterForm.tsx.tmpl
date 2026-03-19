@@ -121,7 +121,7 @@ export function RegisterForm({ form, onSubmit, isLoading }: RegisterFormProps) {
       </FormControl>
       <Button
         type="submit"
-        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        overrides={{"{{" }} BaseButton: { style: { width: '100%' } } {{ "}}" }}
         isLoading={isLoading}
       >
         Create account

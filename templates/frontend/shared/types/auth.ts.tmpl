@@ -34,6 +34,7 @@ export interface LoginResponse {
   tokens: AuthTokens;
 {{- if .EnableMFA}}
   mfa_required?: boolean;
+  mfa_token?: string;
 {{- end}}
 }
 
@@ -57,6 +58,7 @@ export interface MFASetupResponse {
 }
 
 export interface MFAVerifyRequest {
+  mfa_token?: string;
   code: string;
 }
 

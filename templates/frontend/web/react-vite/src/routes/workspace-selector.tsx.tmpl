@@ -1,0 +1,445 @@
+import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { toast } from 'sonner'
+import { workspaceApi, invitationApi } from '../lib/api/tenancy'
+import type { UserTenant, Invitation } from '../lib/types/tenancy'
+{{- if .HasShadcn}}
+import { Button } from '../components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
+import { Input } from '../components/ui/input'
+import { Label } from '../components/ui/label'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '../components/ui/dialog'
+import { Badge } from '../components/ui/badge'
+import { Separator } from '../components/ui/separator'
+{{- else}}
+import { Button } from 'baseui/button'
+import { Card, StyledBody } from 'baseui/card'
+import { Input } from 'baseui/input'
+import { FormControl } from 'baseui/form-control'
+import { Modal, ModalHeader, ModalBody, ModalFooter, ModalButton } from 'baseui/modal'
+import { Tag } from 'baseui/tag'
+import { styled } from 'baseui'
+import { HeadingSmall, ParagraphSmall, LabelSmall } from 'baseui/typography'
+
+const WorkspaceGrid = styled('div', {
+  display: 'grid',
+  gap: '12px',
+})
+
+const WorkspaceItem = styled('div', {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  padding: '16px',
+  borderRadius: '8px',
+  border: '1px solid #E2E2E2',
+  ':hover': {
+    backgroundColor: '#F7F7F7',
+  },
+})
+
+const InvitationItem = styled('div', {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  padding: '16px',
+  borderRadius: '8px',
+  border: '1px solid #FFD19A',
+  backgroundColor: '#FFF8F0',
+})
+
+const ButtonGroup = styled('div', {
+  display: 'flex',
+  gap: '8px',
+})
+{{- end}}
+
+const createWorkspaceSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(255),
+  slug: z
+    .string()
+    .min(3, 'Slug must be at least 3 characters')
+    .max(100)
+    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Slug must be lowercase alphanumeric with hyphens'),
+})
+
+type CreateWorkspaceData = z.infer<typeof createWorkspaceSchema>
+
+export function WorkspaceSelectorPage() {
+  const navigate = useNavigate()
+  const [tenants, setTenants] = useState<UserTenant[]>([])
+  const [invitations, setInvitations] = useState<Invitation[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [isSelecting, setIsSelecting] = useState<string | null>(null)
+  const [isCreateOpen, setIsCreateOpen] = useState(false)
+  const [isCreating, setIsCreating] = useState(false)
+
+  const form = useForm<CreateWorkspaceData>({
+    resolver: zodResolver(createWorkspaceSchema),
+    defaultValues: {
+      name: '',
+      slug: '',
+    },
+  })
+
+  // Auto-generate slug from name
+  const watchName = form.watch('name')
+  useEffect(() => {
+    if (watchName && !form.getValues('slug')) {
+      const slug = watchName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+      form.setValue('slug', slug)
+    }
+  }, [watchName, form])
+
+  useEffect(() => {
+    loadWorkspaces()
+  }, [])
+
+  const loadWorkspaces = async () => {
+    try {
+      const response = await workspaceApi.getWorkspaces()
+      setTenants(response.tenants || [])
+      setInvitations(response.invitations || [])
+
+      // Auto-select if single tenant and no pending invitations
+      if (
+        response.tenants?.length === 1 &&
+        (!response.invitations || response.invitations.length === 0)
+      ) {
+        await handleSelectTenant(response.tenants[0].tenant_id)
+        return
+      }
+
+      // Auto-select last used tenant if available
+      if (response.last_used_tenant_id && response.tenants?.length > 0) {
+        const lastUsed = response.tenants.find(
+          (t) => t.tenant_id === response.last_used_tenant_id
+        )
+        if (lastUsed && (!response.invitations || response.invitations.length === 0)) {
+          await handleSelectTenant(lastUsed.tenant_id)
+          return
+        }
+      }
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to load workspaces')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleSelectTenant = async (tenantId: string) => {
+    setIsSelecting(tenantId)
+    try {
+      await workspaceApi.selectTenant({ tenant_id: tenantId })
+      navigate('/')
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to select workspace')
+    } finally {
+      setIsSelecting(null)
+    }
+  }
+
+  const handleAcceptInvitation = async (invitationId: string) => {
+    try {
+      await invitationApi.acceptInvitation(invitationId)
+      toast.success('Invitation accepted')
+      await loadWorkspaces()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to accept invitation')
+    }
+  }
+
+  const handleDeclineInvitation = async (invitationId: string) => {
+    try {
+      await invitationApi.declineInvitation(invitationId)
+      toast.success('Invitation declined')
+      setInvitations((prev) => prev.filter((inv) => inv.id !== invitationId))
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to decline invitation')
+    }
+  }
+
+  const onCreateWorkspace = async (data: CreateWorkspaceData) => {
+    setIsCreating(true)
+    try {
+      await workspaceApi.createTenant(data)
+      toast.success('Workspace created')
+      setIsCreateOpen(false)
+      form.reset()
+      await loadWorkspaces()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to create workspace')
+    } finally {
+      setIsCreating(false)
+    }
+  }
+
+  if (isLoading) {
+    return (
+{{- if .HasShadcn}}
+      <div className="flex items-center justify-center min-h-[400px]">
+        <div className="text-muted-foreground">Loading workspaces...</div>
+      </div>
+{{- else}}
+      <div style={{"{{" }} display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '400px' {{ "}}" }}>
+        <ParagraphSmall>Loading workspaces...</ParagraphSmall>
+      </div>
+{{- end}}
+    )
+  }
+
+  return (
+{{- if .HasShadcn}}
+    <div className="max-w-2xl mx-auto space-y-6">
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-2xl">Your Workspaces</CardTitle>
+              <CardDescription>Select a workspace to continue or create a new one</CardDescription>
+            </div>
+            <Dialog open={isCreateOpen} onOpenChange={setIsCreateOpen}>
+              <DialogTrigger asChild>
+                <Button>Create Workspace</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Create New Workspace</DialogTitle>
+                  <DialogDescription>
+                    Set up a new workspace for your team.
+                  </DialogDescription>
+                </DialogHeader>
+                <form onSubmit={form.handleSubmit(onCreateWorkspace)} className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="name">Name</Label>
+                    <Input
+                      id="name"
+                      placeholder="My Workspace"
+                      {...form.register('name')}
+                    />
+                    {form.formState.errors.name && (
+                      <p className="text-sm text-destructive">{form.formState.errors.name.message}</p>
+                    )}
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="slug">Slug</Label>
+                    <Input
+                      id="slug"
+                      placeholder="my-workspace"
+                      {...form.register('slug')}
+                    />
+                    {form.formState.errors.slug && (
+                      <p className="text-sm text-destructive">{form.formState.errors.slug.message}</p>
+                    )}
+                  </div>
+                  <DialogFooter>
+                    <Button type="submit" disabled={isCreating}>
+                      {isCreating ? 'Creating...' : 'Create'}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {tenants.length === 0 && invitations.length === 0 && (
+            <p className="text-center text-muted-foreground py-8">
+              You don't have any workspaces yet. Create one to get started.
+            </p>
+          )}
+
+          {tenants.map((tenant) => (
+            <div
+              key={tenant.tenant_id}
+              className="flex items-center justify-between p-4 rounded-lg border hover:bg-accent/50 transition-colors"
+            >
+              <div>
+                <div className="font-medium">{tenant.tenant_name}</div>
+                <div className="text-sm text-muted-foreground">{tenant.tenant_slug}</div>
+                <div className="flex gap-1 mt-1">
+                  {tenant.is_owner && <Badge variant="default">Owner</Badge>}
+                  {tenant.roles.map((role) => (
+                    <Badge key={role} variant="secondary">{role}</Badge>
+                  ))}
+                </div>
+              </div>
+              <Button
+                onClick={() => handleSelectTenant(tenant.tenant_id)}
+                disabled={isSelecting === tenant.tenant_id}
+              >
+                {isSelecting === tenant.tenant_id ? 'Selecting...' : 'Select'}
+              </Button>
+            </div>
+          ))}
+
+          {invitations.length > 0 && (
+            <>
+              <Separator />
+              <div>
+                <h3 className="font-medium mb-3">Pending Invitations</h3>
+                <div className="space-y-3">
+                  {invitations.map((invitation) => (
+                    <div
+                      key={invitation.id}
+                      className="flex items-center justify-between p-4 rounded-lg border border-amber-200 bg-amber-50"
+                    >
+                      <div>
+                        <div className="font-medium">
+                          {invitation.tenant_name || invitation.tenant_id}
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                          Role: {invitation.role}
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => handleDeclineInvitation(invitation.id)}
+                        >
+                          Decline
+                        </Button>
+                        <Button onClick={() => handleAcceptInvitation(invitation.id)}>
+                          Accept
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+{{- else}}
+    <div style={{"{{" }} maxWidth: '600px', margin: '0 auto' {{ "}}" }}>
+      <Card>
+        <StyledBody>
+          <div style={{"{{" }} display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' {{ "}}" }}>
+            <div>
+              <HeadingSmall marginBottom="4px">Your Workspaces</HeadingSmall>
+              <ParagraphSmall color="contentSecondary">
+                Select a workspace to continue or create a new one
+              </ParagraphSmall>
+            </div>
+            <Button onClick={() => setIsCreateOpen(true)}>Create Workspace</Button>
+          </div>
+
+          {tenants.length === 0 && invitations.length === 0 && (
+            <ParagraphSmall color="contentSecondary" style={{"{{" }} textAlign: 'center', padding: '32px 0' {{ "}}" }}>
+              You don't have any workspaces yet. Create one to get started.
+            </ParagraphSmall>
+          )}
+
+          <WorkspaceGrid>
+            {tenants.map((tenant) => (
+              <WorkspaceItem key={tenant.tenant_id}>
+                <div>
+                  <LabelSmall>{tenant.tenant_name}</LabelSmall>
+                  <ParagraphSmall color="contentSecondary" marginTop="0" marginBottom="4px">
+                    {tenant.tenant_slug}
+                  </ParagraphSmall>
+                  <div style={{"{{" }} display: 'flex', gap: '4px' {{ "}}" }}>
+                    {tenant.is_owner && <Tag closeable={false} kind="primary">Owner</Tag>}
+                    {tenant.roles.map((role) => (
+                      <Tag key={role} closeable={false} kind="neutral">{role}</Tag>
+                    ))}
+                  </div>
+                </div>
+                <Button
+                  onClick={() => handleSelectTenant(tenant.tenant_id)}
+                  isLoading={isSelecting === tenant.tenant_id}
+                >
+                  Select
+                </Button>
+              </WorkspaceItem>
+            ))}
+          </WorkspaceGrid>
+
+          {invitations.length > 0 && (
+            <div style={{"{{" }} marginTop: '24px' {{ "}}" }}>
+              <LabelSmall marginBottom="12px">Pending Invitations</LabelSmall>
+              <WorkspaceGrid>
+                {invitations.map((invitation) => (
+                  <InvitationItem key={invitation.id}>
+                    <div>
+                      <LabelSmall>
+                        {invitation.tenant_name || invitation.tenant_id}
+                      </LabelSmall>
+                      <ParagraphSmall color="contentSecondary" marginTop="0" marginBottom="0">
+                        Role: {invitation.role}
+                      </ParagraphSmall>
+                    </div>
+                    <ButtonGroup>
+                      <Button
+                        kind="secondary"
+                        onClick={() => handleDeclineInvitation(invitation.id)}
+                      >
+                        Decline
+                      </Button>
+                      <Button onClick={() => handleAcceptInvitation(invitation.id)}>
+                        Accept
+                      </Button>
+                    </ButtonGroup>
+                  </InvitationItem>
+                ))}
+              </WorkspaceGrid>
+            </div>
+          )}
+        </StyledBody>
+      </Card>
+
+      <Modal
+        isOpen={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        closeable
+        animate
+        autoFocus
+      >
+        <form onSubmit={form.handleSubmit(onCreateWorkspace)}>
+          <ModalHeader>Create New Workspace</ModalHeader>
+          <ModalBody>
+            <FormControl label="Name" error={form.formState.errors.name?.message}>
+              <Input
+                placeholder="My Workspace"
+                {...form.register('name')}
+                error={!!form.formState.errors.name}
+              />
+            </FormControl>
+            <FormControl label="Slug" error={form.formState.errors.slug?.message}>
+              <Input
+                placeholder="my-workspace"
+                {...form.register('slug')}
+                error={!!form.formState.errors.slug}
+              />
+            </FormControl>
+          </ModalBody>
+          <ModalFooter>
+            <ModalButton kind="tertiary" onClick={() => setIsCreateOpen(false)}>
+              Cancel
+            </ModalButton>
+            <ModalButton type="submit" isLoading={isCreating}>
+              Create
+            </ModalButton>
+          </ModalFooter>
+        </form>
+      </Modal>
+    </div>
+{{- end}}
+  )
+}

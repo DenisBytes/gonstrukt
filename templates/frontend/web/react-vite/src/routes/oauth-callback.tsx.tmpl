@@ -1,0 +1,66 @@
+{{- if .HasOAuth}}
+import { useEffect, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { toast } from 'sonner'
+import { oauthApi } from '../lib/api/auth'
+
+export function OAuthCallbackPage() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const code = searchParams.get('code')
+    const provider = searchParams.get('provider') || searchParams.get('state')?.split(':')[0]
+
+    if (!code) {
+      setError('No authorization code received')
+      return
+    }
+
+    const handleCallback = async () => {
+      try {
+        let handler: ((code: string) => Promise<unknown>) | null = null
+{{- if .HasGoogleOAuth}}
+        if (provider === 'google') handler = oauthApi.handleGoogleCallback
+{{- end}}
+{{- if .HasMicrosoftOAuth}}
+        if (provider === 'microsoft') handler = oauthApi.handleMicrosoftCallback
+{{- end}}
+{{- if .HasAppleOAuth}}
+        if (provider === 'apple') handler = oauthApi.handleAppleCallback
+{{- end}}
+        if (!handler) {
+          setError('Unknown OAuth provider')
+          return
+        }
+
+        await handler(code)
+        toast.success('Signed in successfully!')
+        navigate('/')
+      } catch (err: any) {
+        setError(err.message || 'OAuth sign-in failed')
+      }
+    }
+
+    handleCallback()
+  }, [searchParams, navigate])
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[300px] space-y-4">
+        <p className="text-destructive">{error}</p>
+        <button onClick={() => navigate('/login')} className="text-primary hover:underline">
+          Back to login
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center justify-center min-h-[300px]">
+      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+    </div>
+  )
+}
+{{- end}}

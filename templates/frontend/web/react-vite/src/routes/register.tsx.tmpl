@@ -109,7 +109,7 @@ export function RegisterPage() {
       <StyledBody>
 {{- if .HasOAuth}}
         <OAuthButtons />
-        <div style={{ textAlign: 'center', margin: '16px 0', color: '#666' }}>
+        <div style={{"{{" }} textAlign: 'center', margin: '16px 0', color: '#666' {{ "}}" }}>
           Or continue with email
         </div>
 {{- end}}

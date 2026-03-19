@@ -1,0 +1,84 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: fluent-bit
+  namespace: kube-system
+spec:
+  repo: https://fluent.github.io/helm-charts
+  chart: fluent-bit
+  version: "0.49.3"
+  targetNamespace: {{ .ProjectName }}
+  createNamespace: true
+  valuesContent: |-
+    config:
+      service: |
+        [SERVICE]
+            Flush         5
+            Log_Level     info
+            Daemon        off
+            Parsers_File  /fluent-bit/etc/parsers.conf
+
+      inputs: |
+        [INPUT]
+            Name              tail
+            Tag               kube.*
+            Path              /var/log/containers/*_{{ .ProjectName }}_*.log
+            Parser            cri
+            DB                /var/log/flb_kube.db
+            Mem_Buf_Limit     5MB
+            Skip_Long_Lines   On
+            Refresh_Interval  10
+
+      filters: |
+        [FILTER]
+            Name                kubernetes
+            Match               kube.*
+            Kube_URL            https://kubernetes.default.svc:443
+            Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+            Kube_Tag_Prefix     kube.var.log.containers.
+            Merge_Log           On
+            Keep_Log            Off
+            K8S-Logging.Parser  On
+            K8S-Logging.Exclude On
+
+      outputs: |
+        [OUTPUT]
+            Name              http
+            Match             *
+            Host              api.axiom.co
+            Port              443
+            URI               /v1/datasets/{{ .ProjectName }}/ingest
+            Header            Authorization Bearer ${AXIOM_TOKEN}
+            Header            Content-Type application/x-ndjson
+            Format            json_lines
+            Json_date_key     _time
+            Json_date_format  iso8601
+            tls               On
+            Retry_Limit       3
+
+    env:
+      - name: AXIOM_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: axiom-credentials
+            key: token
+
+    tolerations:
+      - operator: Exists
+        effect: NoSchedule
+
+    daemonSetVolumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+
+    daemonSetVolumeMounts:
+      - name: varlog
+        mountPath: /var/log
+      - name: varlibdockercontainers
+        mountPath: /var/lib/docker/containers
+        readOnly: true

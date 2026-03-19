@@ -56,6 +56,10 @@ export function LoginPage() {
       const response = await login(data)
 {{- if .EnableMFA}}
       if (response.mfa_required) {
+        // Store MFA token for the verify page
+        if (response.mfa_token) {
+          sessionStorage.setItem('mfa_token', response.mfa_token)
+        }
         navigate('/mfa/verify')
         return
       }
@@ -107,7 +111,7 @@ export function LoginPage() {
       <StyledBody>
 {{- if .HasOAuth}}
         <OAuthButtons />
-        <div style={{ textAlign: 'center', margin: '16px 0', color: '#666' }}>
+        <div style={{"{{" }} textAlign: 'center', margin: '16px 0', color: '#666' {{ "}}" }}>
           Or continue with email
         </div>
 {{- end}}

@@ -69,7 +69,7 @@ export function LoginForm({ form, onSubmit, isLoading }: LoginFormProps) {
       </FormControl>
       <Button
         type="submit"
-        overrides={{ BaseButton: { style: { width: '100%' } } }}
+        overrides={{"{{" }} BaseButton: { style: { width: '100%' } } {{ "}}" }}
         isLoading={isLoading}
       >
         Sign in

@@ -1,0 +1,367 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .ProjectName }}-dashboards
+  namespace: {{ .ProjectName }}
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: {{ .ProjectName }}
+data:
+  http-overview.json: |
+    {
+      "uid": "{{ .ProjectName }}-http-overview",
+      "title": "HTTP Overview",
+      "tags": ["{{ .ProjectName }}", "http"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Request Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(http_server_request_duration_seconds_count{service_namespace=\"{{ .ProjectName }}\"}[5m]))",
+              "legendFormat": "requests/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Error Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(http_server_request_duration_seconds_count{service_namespace=\"{{ .ProjectName }}\", http_response_status_code=~\"5..\"}[5m])) / sum(rate(http_server_request_duration_seconds_count{service_namespace=\"{{ .ProjectName }}\"}[5m])) * 100",
+              "legendFormat": "error %"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "max": 100
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Latency p50 / p95 / p99",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(http_server_request_duration_seconds_bucket{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (le))",
+              "legendFormat": "p50"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_request_duration_seconds_bucket{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (le))",
+              "legendFormat": "p95"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (le))",
+              "legendFormat": "p99"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            }
+          }
+        },
+        {
+          "id": 4,
+          "title": "Active Requests",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            {
+              "expr": "sum(http_server_active_requests{service_namespace=\"{{ .ProjectName }}\"})",
+              "legendFormat": "active"
+            }
+          ]
+        }
+      ]
+    }
+  auth-business-metrics.json: |
+    {
+      "uid": "{{ .ProjectName }}-auth-business",
+      "title": "Auth Business Metrics",
+      "tags": ["{{ .ProjectName }}", "auth", "business"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "User Registrations",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_registrations_total{service_namespace=\"{{ .ProjectName }}\"}[5m]))",
+              "legendFormat": "registrations/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Login Attempts",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_logins_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (status)",
+              "legendFormat": "{{`{{status}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Emails Sent",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_emails_sent_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (type)",
+              "legendFormat": "{{`{{type}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 4,
+          "title": "MFA Operations",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_mfa_operations_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (operation, status)",
+              "legendFormat": "{{`{{operation}}`}} ({{`{{status}}`}})"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        }
+{{- if .HasTenancy }},
+        {
+          "id": 5,
+          "title": "Tenant Switches",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_tenant_switches_total{service_namespace=\"{{ .ProjectName }}\"}[5m]))",
+              "legendFormat": "switches/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 6,
+          "title": "Invitations",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "targets": [
+            {
+              "expr": "sum(rate(auth_invitations_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (status)",
+              "legendFormat": "{{`{{status}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        }
+{{- end }}
+      ]
+    }
+  database-performance.json: |
+    {
+      "uid": "{{ .ProjectName }}-db-performance",
+      "title": "Database Performance",
+      "tags": ["{{ .ProjectName }}", "database"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Query Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "sum(rate(db_query_duration_seconds_count{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (operation)",
+              "legendFormat": "{{`{{operation}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Query Latency (p95)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (le, operation))",
+              "legendFormat": "{{`{{operation}}`}} p95"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Error Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "expr": "sum(rate(db_query_errors_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (operation)",
+              "legendFormat": "{{`{{operation}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops"
+            }
+          }
+        },
+        {
+          "id": 4,
+          "title": "Active Connections",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            {
+              "expr": "sum(db_active_connections{service_namespace=\"{{ .ProjectName }}\"})",
+              "legendFormat": "active"
+            }
+          ]
+        }
+      ]
+    }
+  redis-cache.json: |
+    {
+      "uid": "{{ .ProjectName }}-redis-cache",
+      "title": "Redis Cache",
+      "tags": ["{{ .ProjectName }}", "redis", "cache"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Operation Latency",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(redis_command_duration_seconds_bucket{service_namespace=\"{{ .ProjectName }}\"}[5m])) by (le, cmd))",
+              "legendFormat": "{{`{{cmd}}`}} p95"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Memory Usage",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            {
+              "expr": "redis_memory_used_bytes{service_namespace=\"{{ .ProjectName }}\"}",
+              "legendFormat": "used"
+            },
+            {
+              "expr": "redis_memory_max_bytes{service_namespace=\"{{ .ProjectName }}\"}",
+              "legendFormat": "max"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Connected Clients",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "expr": "redis_connected_clients{service_namespace=\"{{ .ProjectName }}\"}",
+              "legendFormat": "clients"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Hit / Miss Ratio",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            {
+              "expr": "rate(redis_keyspace_hits_total{service_namespace=\"{{ .ProjectName }}\"}[5m])",
+              "legendFormat": "hits/s"
+            },
+            {
+              "expr": "rate(redis_keyspace_misses_total{service_namespace=\"{{ .ProjectName }}\"}[5m])",
+              "legendFormat": "misses/s"
+            },
+            {
+              "expr": "rate(redis_keyspace_hits_total{service_namespace=\"{{ .ProjectName }}\"}[5m]) / (rate(redis_keyspace_hits_total{service_namespace=\"{{ .ProjectName }}\"}[5m]) + rate(redis_keyspace_misses_total{service_namespace=\"{{ .ProjectName }}\"}[5m])) * 100",
+              "legendFormat": "hit ratio %"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            }
+          }
+        }
+      ]
+    }

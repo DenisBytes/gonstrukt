@@ -37,7 +37,7 @@ export const authApi = {
    * Register a new user
    */
   async register(data: RegisterRequest): Promise<RegisterResponse> {
-    const response = await api.post<RegisterResponse>('/api/auth/register', data, { skipAuth: true });
+    const response = await api.post<RegisterResponse>('/api/v1/auth/register', data, { skipAuth: true });
 {{- if .IsMobileFrontend}}
     await tokenStorage.setTokens(response.tokens);
 {{- else}}
@@ -50,7 +50,7 @@ export const authApi = {
    * Login with email and password
    */
   async login(data: LoginRequest): Promise<LoginResponse> {
-    const response = await api.post<LoginResponse>('/api/auth/login', data, { skipAuth: true });
+    const response = await api.post<LoginResponse>('/api/v1/auth/login', data, { skipAuth: true });
 {{- if .EnableMFA}}
     if (!response.mfa_required) {
 {{- if .IsMobileFrontend}}
@@ -74,7 +74,7 @@ export const authApi = {
    */
   async logout(): Promise<void> {
     try {
-      await api.post('/api/auth/logout');
+      await api.post('/api/v1/auth/logout');
     } finally {
 {{- if .IsMobileFrontend}}
       await tokenStorage.clearTokens();
@@ -97,7 +97,7 @@ export const authApi = {
       throw new Error('No refresh token available');
     }
     const response = await api.post<RefreshTokenResponse>(
-      '/api/auth/refresh',
+      '/api/v1/auth/refresh',
       { refresh_token: refreshToken },
       { skipAuth: true }
     );
@@ -113,35 +113,35 @@ export const authApi = {
    * Get current user profile
    */
   async getCurrentUser(): Promise<User> {
-    return api.get<User>('/api/auth/me');
+    return api.get<User>('/api/v1/auth/me');
   },
 
   /**
    * Update user profile
    */
   async updateProfile(data: Partial<Pick<User, 'name' | 'email'>>): Promise<User> {
-    return api.patch<User>('/api/auth/me', data);
+    return api.patch<User>('/api/v1/auth/me', data);
   },
 
   /**
    * Change password
    */
   async changePassword(data: PasswordChangeRequest): Promise<void> {
-    await api.post('/api/auth/password/change', data);
+    await api.post('/api/v1/auth/password/change', data);
   },
 
   /**
    * Request password reset email
    */
   async forgotPassword(data: ForgotPasswordRequest): Promise<void> {
-    await api.post('/api/auth/password/forgot', data, { skipAuth: true });
+    await api.post('/api/v1/auth/password/forgot', data, { skipAuth: true });
   },
 
   /**
    * Reset password with token
    */
   async resetPassword(data: ResetPasswordRequest): Promise<void> {
-    await api.post('/api/auth/password/reset', data, { skipAuth: true });
+    await api.post('/api/v1/auth/password/reset', data, { skipAuth: true });
   },
 };
 
@@ -151,21 +151,21 @@ export const sessionsApi = {
    * Get all active sessions
    */
   async getSessions(): Promise<Session[]> {
-    return api.get<Session[]>('/api/auth/sessions');
+    return api.get<Session[]>('/api/v1/auth/sessions');
   },
 
   /**
    * Revoke a specific session
    */
   async revokeSession(sessionId: string): Promise<void> {
-    await api.delete(`/api/auth/sessions/${sessionId}`);
+    await api.delete(`/api/v1/auth/sessions/${sessionId}`);
   },
 
   /**
    * Revoke all sessions except current
    */
   async revokeAllSessions(): Promise<void> {
-    await api.post('/api/auth/sessions/revoke-all');
+    await api.post('/api/v1/auth/sessions/revoke-all');
   },
 };
 
@@ -177,21 +177,21 @@ export const mfaApi = {
    * Start MFA setup - returns secret and QR code
    */
   async setupMFA(): Promise<MFASetupResponse> {
-    return api.post<MFASetupResponse>('/api/auth/mfa/setup');
+    return api.post<MFASetupResponse>('/api/v1/auth/mfa/setup');
   },
 
   /**
    * Verify MFA setup with code
    */
   async verifyMFASetup(data: MFAVerifyRequest): Promise<MFAVerifyResponse> {
-    return api.post<MFAVerifyResponse>('/api/auth/mfa/verify', data);
+    return api.post<MFAVerifyResponse>('/api/v1/auth/mfa/verify', data);
   },
 
   /**
    * Verify MFA code during login
    */
   async verifyMFALogin(data: MFAVerifyRequest): Promise<LoginResponse> {
-    const response = await api.post<LoginResponse>('/api/auth/mfa/login', data, { skipAuth: true });
+    const response = await api.post<LoginResponse>('/api/v1/auth/mfa/login', data, { skipAuth: true });
 {{- if .IsMobileFrontend}}
     await tokenStorage.setTokens(response.tokens);
 {{- else}}
@@ -204,7 +204,7 @@ export const mfaApi = {
    * Disable MFA
    */
   async disableMFA(data: MFAVerifyRequest): Promise<void> {
-    await api.post('/api/auth/mfa/disable', data);
+    await api.post('/api/v1/auth/mfa/disable', data);
   },
 };
 {{- end}}
@@ -218,7 +218,7 @@ export const oauthApi = {
    * Get Google OAuth URL
    */
   async getGoogleAuthUrl(): Promise<{ url: string }> {
-    return api.get<{ url: string }>('/api/auth/oauth/google/url', { skipAuth: true });
+    return api.get<{ url: string }>('/api/v1/auth/oauth/google/url', { skipAuth: true });
   },
 
   /**
@@ -226,7 +226,7 @@ export const oauthApi = {
    */
   async handleGoogleCallback(code: string): Promise<LoginResponse> {
     const response = await api.post<LoginResponse>(
-      '/api/auth/oauth/google/callback',
+      '/api/v1/auth/oauth/google/callback',
       { code },
       { skipAuth: true }
     );
@@ -244,7 +244,7 @@ export const oauthApi = {
    * Get Microsoft OAuth URL
    */
   async getMicrosoftAuthUrl(): Promise<{ url: string }> {
-    return api.get<{ url: string }>('/api/auth/oauth/microsoft/url', { skipAuth: true });
+    return api.get<{ url: string }>('/api/v1/auth/oauth/microsoft/url', { skipAuth: true });
   },
 
   /**
@@ -252,7 +252,7 @@ export const oauthApi = {
    */
   async handleMicrosoftCallback(code: string): Promise<LoginResponse> {
     const response = await api.post<LoginResponse>(
-      '/api/auth/oauth/microsoft/callback',
+      '/api/v1/auth/oauth/microsoft/callback',
       { code },
       { skipAuth: true }
     );
@@ -270,7 +270,7 @@ export const oauthApi = {
    * Get Apple OAuth URL
    */
   async getAppleAuthUrl(): Promise<{ url: string }> {
-    return api.get<{ url: string }>('/api/auth/oauth/apple/url', { skipAuth: true });
+    return api.get<{ url: string }>('/api/v1/auth/oauth/apple/url', { skipAuth: true });
   },
 
   /**
@@ -278,7 +278,7 @@ export const oauthApi = {
    */
   async handleAppleCallback(code: string): Promise<LoginResponse> {
     const response = await api.post<LoginResponse>(
-      '/api/auth/oauth/apple/callback',
+      '/api/v1/auth/oauth/apple/callback',
       { code },
       { skipAuth: true }
     );
@@ -302,14 +302,14 @@ export const gdprApi = {
    * Get all consents
    */
   async getConsents(): Promise<Consent[]> {
-    return api.get<Consent[]>('/api/auth/gdpr/consents');
+    return api.get<Consent[]>('/api/v1/auth/gdpr/consents');
   },
 
   /**
    * Update consent
    */
   async updateConsent(data: UpdateConsentRequest): Promise<Consent> {
-    return api.post<Consent>('/api/auth/gdpr/consents', data);
+    return api.post<Consent>('/api/v1/auth/gdpr/consents', data);
   },
 {{- end}}
 
@@ -318,7 +318,7 @@ export const gdprApi = {
    * Request data export
    */
   async requestDataExport(data: DataExportRequest): Promise<DataExportResponse> {
-    return api.post<DataExportResponse>('/api/auth/gdpr/export', data);
+    return api.post<DataExportResponse>('/api/v1/auth/gdpr/export', data);
   },
 {{- end}}
 
@@ -327,7 +327,7 @@ export const gdprApi = {
    * Request account deletion
    */
   async deleteAccount(data: DeleteAccountRequest): Promise<void> {
-    await api.post('/api/auth/gdpr/delete', data);
+    await api.post('/api/v1/auth/gdpr/delete', data);
 {{- if .IsMobileFrontend}}
     await tokenStorage.clearTokens();
 {{- else}}
