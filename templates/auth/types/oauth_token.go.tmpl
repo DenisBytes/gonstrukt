@@ -1,0 +1,26 @@
+{{- if .HasOAuth}}
+package types
+
+import "time"
+
+// OAuthToken represents stored OAuth provider tokens for revocation on account deletion
+type OAuthToken struct {
+	ID           string     `json:"id"`
+	UserID       string     `json:"user_id"`
+	Provider     string     `json:"provider"`
+	AccessToken  string     `json:"-"`
+	RefreshToken string     `json:"-"`
+	TokenType    string     `json:"token_type,omitempty"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// OAuthTokenResult contains raw token data before encryption
+type OAuthTokenResult struct {
+	AccessToken  string
+	RefreshToken string
+	TokenType    string
+	Expiry       *time.Time
+}
+{{- end}}

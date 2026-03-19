@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"{{.ModuleName}}/internals/crypto"
 	"{{.ModuleName}}/internals/db"
 	"{{.ModuleName}}/internals/types"
 
@@ -27,6 +28,7 @@ type MicrosoftOAuthConfig struct {
 type MicrosoftProvider struct {
 	config *oauth2.Config
 	db     db.Database
+	encKey string
 }
 
 // MicrosoftUserInfo represents the user info returned by Microsoft Graph
@@ -40,7 +42,7 @@ type MicrosoftUserInfo struct {
 }
 
 // NewMicrosoftProvider creates a new Microsoft OAuth provider
-func NewMicrosoftProvider(cfg MicrosoftOAuthConfig, database db.Database) *MicrosoftProvider {
+func NewMicrosoftProvider(cfg MicrosoftOAuthConfig, database db.Database, encryptionKey string) *MicrosoftProvider {
 	tenantID := cfg.TenantID
 	if tenantID == "" {
 		tenantID = "common"
@@ -62,7 +64,8 @@ func NewMicrosoftProvider(cfg MicrosoftOAuthConfig, database db.Database) *Micro
 				TokenURL: fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID),
 			},
 		},
-		db: database,
+		db:     database,
+		encKey: encryptionKey,
 	}
 }
 
@@ -94,7 +97,14 @@ func (p *MicrosoftProvider) HandleCallback(ctx context.Context, code string) (*t
 	// Check if user exists
 	user, err := p.db.GetUserByEmail(ctx, email)
 	if err == nil && user != nil {
-		// Update OAuth info if needed
+		// Link OAuth account if not already linked
+		if user.OAuthProvider == "" {
+			user.OAuthProvider = "microsoft"
+			user.OAuthID = userInfo.ID
+			user.UpdatedAt = time.Now()
+			_ = p.db.UpdateUser(ctx, user)
+		}
+		p.persistOAuthToken(ctx, user.ID, token)
 		return user, nil
 	}
 
@@ -114,7 +124,29 @@ func (p *MicrosoftProvider) HandleCallback(ctx context.Context, code string) (*t
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
+	p.persistOAuthToken(ctx, user.ID, token)
 	return user, nil
+}
+
+// persistOAuthToken encrypts and stores the OAuth token for later revocation
+func (p *MicrosoftProvider) persistOAuthToken(ctx context.Context, userID string, token *oauth2.Token) {
+	if p.encKey == "" {
+		return
+	}
+	encAccess, err := crypto.Encrypt(token.AccessToken, p.encKey)
+	if err != nil {
+		return
+	}
+	encRefresh, _ := crypto.Encrypt(token.RefreshToken, p.encKey)
+	oauthToken := &types.OAuthToken{
+		UserID:       userID,
+		Provider:     "microsoft",
+		AccessToken:  encAccess,
+		RefreshToken: encRefresh,
+		TokenType:    token.TokenType,
+		ExpiresAt:    &token.Expiry,
+	}
+	_ = p.db.UpsertOAuthToken(ctx, oauthToken)
 }
 
 // getUserInfo fetches user info from Microsoft Graph API

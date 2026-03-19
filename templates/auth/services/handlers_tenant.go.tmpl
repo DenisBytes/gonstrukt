@@ -1,0 +1,321 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"{{.ModuleName}}/internals/middleware"
+	"{{.ModuleName}}/internals/types"
+)
+
+// handleGetTenant retrieves a tenant by ID (path param)
+func (s *AuthService) handleGetTenant(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID := r.PathValue("id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant ID required")
+		return
+	}
+
+	// Verify the requesting user is a member of this tenant
+	isMember, err := s.db.CheckUserTenantMembership(r.Context(), userID, tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !isMember {
+		writeError(w, http.StatusForbidden, "not a member of this workspace")
+		return
+	}
+
+	tenant, err := s.db.GetTenantByID(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tenant)
+}
+
+// handleGetCurrentTenant returns the tenant from the current scoped token
+func (s *AuthService) handleGetCurrentTenant(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	tenant, err := s.db.GetTenantByID(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tenant)
+}
+
+// handleUpdateTenant updates the current tenant
+func (s *AuthService) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	var req types.UpdateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tenant, err := s.db.GetTenantByID(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	// Apply updates
+	if req.Name != nil {
+		tenant.Name = *req.Name
+	}
+	if req.Slug != nil {
+		// Check slug uniqueness
+		existing, err := s.db.GetTenantBySlug(r.Context(), *req.Slug)
+		if err == nil && existing != nil && existing.ID != tenantID {
+			writeError(w, http.StatusConflict, "slug is already taken")
+			return
+		}
+		tenant.Slug = *req.Slug
+	}
+	if req.Plan != nil {
+		tenant.Plan = *req.Plan
+	}
+	if req.Settings != nil {
+		tenant.Settings = req.Settings
+	}
+
+	if err := s.db.UpdateTenant(r.Context(), tenant); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update workspace")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tenant)
+}
+
+// handleDeleteTenant deletes the current tenant
+func (s *AuthService) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	// Only owners can delete the tenant
+	membership, err := s.db.GetUserTenant(r.Context(), userID, tenantID)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "not a member of this workspace")
+		return
+	}
+
+	if !membership.IsOwner {
+		writeError(w, http.StatusForbidden, "only the workspace owner can delete it")
+		return
+	}
+
+	if err := s.db.DeleteTenant(r.Context(), tenantID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete workspace")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// handleGetMembers returns all members of the current tenant
+func (s *AuthService) handleGetMembers(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	members, err := s.db.GetTenantMembers(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get members")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, members)
+}
+
+// handleUpdateMemberRole updates a member's role in the current tenant
+func (s *AuthService) handleUpdateMemberRole(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	memberID := r.PathValue("user_id")
+	if memberID == "" {
+		writeError(w, http.StatusBadRequest, "user ID required")
+		return
+	}
+
+	var req types.UpdateMemberRoleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Prevent changing own role
+	if memberID == userID {
+		writeError(w, http.StatusBadRequest, "cannot change your own role")
+		return
+	}
+
+	// Prevent changing the owner's role
+	targetMembership, err := s.db.GetUserTenant(r.Context(), memberID, tenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "member not found")
+		return
+	}
+
+	if targetMembership.IsOwner {
+		writeError(w, http.StatusForbidden, "cannot change the owner's role")
+		return
+	}
+
+	if err := s.db.UpdateUserTenantRole(r.Context(), memberID, tenantID, req.Roles); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update member role")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// handleRemoveMember removes a member from the current tenant
+func (s *AuthService) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	memberID := r.PathValue("user_id")
+	if memberID == "" {
+		writeError(w, http.StatusBadRequest, "user ID required")
+		return
+	}
+
+	// Prevent removing self
+	if memberID == userID {
+		writeError(w, http.StatusBadRequest, "cannot remove yourself; use leave workspace instead")
+		return
+	}
+
+	// Prevent removing the owner
+	targetMembership, err := s.db.GetUserTenant(r.Context(), memberID, tenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "member not found")
+		return
+	}
+
+	if targetMembership.IsOwner {
+		writeError(w, http.StatusForbidden, "cannot remove the workspace owner")
+		return
+	}
+
+	if err := s.db.DeleteUserTenant(r.Context(), memberID, tenantID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to remove member")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}

@@ -1,0 +1,183 @@
+package types
+
+import (
+	"errors"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// Tenant represents a workspace/organization
+type Tenant struct {
+	ID        string                 `json:"id"`
+	Name      string                 `json:"name"`
+	Slug      string                 `json:"slug"`
+	Plan      string                 `json:"plan"`
+	Settings  map[string]interface{} `json:"settings,omitempty"`
+	IsActive  bool                   `json:"is_active"`
+	CreatedAt time.Time              `json:"created_at"`
+	UpdatedAt time.Time              `json:"updated_at"`
+}
+
+// UserTenant represents a user's membership in a tenant
+type UserTenant struct {
+	UserID     string     `json:"user_id"`
+	TenantID   string     `json:"tenant_id"`
+	Roles      []string   `json:"roles"`
+	IsOwner    bool       `json:"is_owner"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	TenantName string     `json:"tenant_name"`
+	TenantSlug string     `json:"tenant_slug"`
+}
+
+// Invitation represents a tenant invitation
+type Invitation struct {
+	ID         string     `json:"id"`
+	TenantID   string     `json:"tenant_id"`
+	Email      string     `json:"email"`
+	Role       string     `json:"role"`
+	Status     string     `json:"status"` // pending, accepted, declined, revoked, expired
+	InvitedBy  string     `json:"invited_by"`
+	Token      string     `json:"-"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	// Populated via joins for API responses
+	TenantName string `json:"tenant_name,omitempty"`
+	TenantSlug string `json:"tenant_slug,omitempty"`
+}
+
+// WorkspacesResponse is returned when a user queries their workspaces
+type WorkspacesResponse struct {
+	Tenants          []*UserTenant  `json:"tenants"`
+	Invitations      []*Invitation  `json:"invitations"`
+	LastUsedTenantID string         `json:"last_used_tenant_id,omitempty"`
+}
+
+// SelectTenantRequest represents a request to select/switch to a tenant
+type SelectTenantRequest struct {
+	TenantID string `json:"tenant_id"`
+}
+
+// SelectTenantResponse is returned after selecting a tenant
+type SelectTenantResponse struct {
+	AccessToken  string  `json:"access_token"`
+	RefreshToken string  `json:"refresh_token"`
+	TokenType    string  `json:"token_type"`
+	ExpiresIn    int     `json:"expires_in"`
+	Tenant       *Tenant `json:"tenant"`
+}
+
+// CreateTenantRequest represents a request to create a new tenant
+type CreateTenantRequest struct {
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+// Validate validates the create tenant request
+func (r *CreateTenantRequest) Validate() error {
+	if r.Name == "" {
+		return errors.New("name is required")
+	}
+	if len(r.Name) > 255 {
+		return errors.New("name must be at most 255 characters")
+	}
+	if r.Slug == "" {
+		return errors.New("slug is required")
+	}
+	if !isValidSlug(r.Slug) {
+		return errors.New("slug must be lowercase alphanumeric with hyphens, 3-100 characters")
+	}
+	return nil
+}
+
+// UpdateTenantRequest represents a request to update a tenant
+type UpdateTenantRequest struct {
+	Name     *string                `json:"name,omitempty"`
+	Slug     *string                `json:"slug,omitempty"`
+	Plan     *string                `json:"plan,omitempty"`
+	Settings map[string]interface{} `json:"settings,omitempty"`
+}
+
+// Validate validates the update tenant request
+func (r *UpdateTenantRequest) Validate() error {
+	if r.Name != nil && *r.Name == "" {
+		return errors.New("name cannot be empty")
+	}
+	if r.Name != nil && len(*r.Name) > 255 {
+		return errors.New("name must be at most 255 characters")
+	}
+	if r.Slug != nil && !isValidSlug(*r.Slug) {
+		return errors.New("slug must be lowercase alphanumeric with hyphens, 3-100 characters")
+	}
+	return nil
+}
+
+// CreateInvitationRequest represents a bulk invitation request
+type CreateInvitationRequest struct {
+	Invitations []InvitationEntry `json:"invitations"`
+}
+
+// InvitationEntry represents a single invitation in a bulk request
+type InvitationEntry struct {
+	Email string `json:"email"`
+	Role  string `json:"role"`
+}
+
+// InvitationResult represents the result of a single invitation in a bulk operation
+type InvitationResult struct {
+	Email   string `json:"email"`
+	Status  string `json:"status"` // sent, error, already_member, already_invited
+	Message string `json:"message,omitempty"`
+}
+
+// TenantMember represents a member of a tenant for API responses
+type TenantMember struct {
+	UserID    string    `json:"user_id"`
+	Email     string    `json:"email"`
+	FirstName string    `json:"first_name,omitempty"`
+	LastName  string    `json:"last_name,omitempty"`
+	Roles     []string  `json:"roles"`
+	IsOwner   bool      `json:"is_owner"`
+	JoinedAt  time.Time `json:"joined_at"`
+}
+
+// UpdateMemberRoleRequest represents a request to update a member's role
+type UpdateMemberRoleRequest struct {
+	Roles []string `json:"roles"`
+}
+
+// Validate validates the update member role request
+func (r *UpdateMemberRoleRequest) Validate() error {
+	if len(r.Roles) == 0 {
+		return errors.New("at least one role is required")
+	}
+	for _, role := range r.Roles {
+		if role == "" {
+			return errors.New("role cannot be empty")
+		}
+	}
+	return nil
+}
+
+// isValidSlug checks if a slug is valid (lowercase alphanumeric with hyphens)
+func isValidSlug(slug string) bool {
+	if len(slug) < 3 || len(slug) > 100 {
+		return false
+	}
+	matched, _ := regexp.MatchString(`^[a-z0-9]+(?:-[a-z0-9]+)*$`, slug)
+	return matched
+}
+
+// IsValidInvitationEmail validates an email for invitations
+func IsValidInvitationEmail(email string) bool {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" {
+		return false
+	}
+	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	matched, _ := regexp.MatchString(pattern, email)
+	return matched
+}

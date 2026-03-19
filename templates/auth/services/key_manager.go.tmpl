@@ -107,6 +107,33 @@ func (km *KeyManager) GenerateAccessToken(user *types.User, sessionID string, tt
 	return token.SignedString(km.privateKey)
 }
 
+{{- if .HasTenancy}}
+// GenerateTenantAccessToken generates a JWT access token scoped to a specific tenant
+func (km *KeyManager) GenerateTenantAccessToken(user *types.User, sessionID, tenantID string, roles []string, ttl time.Duration) (string, error) {
+	now := time.Now()
+
+	claims := jwt.MapClaims{
+		"jti":       uuid.New().String(),
+		"sub":       user.ID,
+		"sid":       sessionID,
+		"email":     user.Email,
+		"iss":       km.issuer,
+		"aud":       km.audience,
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),
+		"exp":       now.Add(ttl).Unix(),
+		"type":      "access",
+		"tenant_id": tenantID,
+		"roles":     roles,
+		"scope":     "tenant",
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+
+	return token.SignedString(km.privateKey)
+}
+{{- end}}
+
 // ValidateToken validates a JWT token and returns the claims
 func (km *KeyManager) ValidateToken(tokenString string) (map[string]any, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {

@@ -1,0 +1,212 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"{{.ModuleName}}/internals/middleware"
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+)
+
+// handleGetWorkspaces returns the user's tenants and pending invitations
+func (s *AuthService) handleGetWorkspaces(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// Get user to resolve email for invitations
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	// Get user's tenants
+	tenants, err := s.db.GetUserTenants(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get workspaces")
+		return
+	}
+
+	// Get pending invitations for the user's email
+	invitations, err := s.db.GetInvitationsByEmail(r.Context(), user.Email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get invitations")
+		return
+	}
+
+	// Determine last used tenant
+	var lastUsedTenantID string
+	if len(tenants) > 0 && tenants[0].LastUsedAt != nil {
+		lastUsedTenantID = tenants[0].TenantID
+	}
+
+	writeJSON(w, http.StatusOK, types.WorkspacesResponse{
+		Tenants:          tenants,
+		Invitations:      invitations,
+		LastUsedTenantID: lastUsedTenantID,
+	})
+}
+
+// handleSelectTenant validates membership and returns a tenant-scoped access token
+func (s *AuthService) handleSelectTenant(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req types.SelectTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.TenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant_id is required")
+		return
+	}
+
+	// Verify membership
+	isMember, err := s.db.CheckUserTenantMembership(r.Context(), userID, req.TenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if !isMember {
+		writeError(w, http.StatusForbidden, "not a member of this workspace")
+		return
+	}
+
+	// Get tenant details
+	tenant, err := s.db.GetTenantByID(r.Context(), req.TenantID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	if !tenant.IsActive {
+		writeError(w, http.StatusForbidden, "workspace is not active")
+		return
+	}
+
+	// Get user for token generation
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	// Get user's membership to include roles in the token
+	membership, err := s.db.GetUserTenant(r.Context(), userID, req.TenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get membership")
+		return
+	}
+
+	// Update last used tenant
+	_ = s.db.UpdateLastUsedTenant(r.Context(), userID, req.TenantID)
+
+	// Generate tenant-scoped tokens
+	sessionID := uuid.New().String()
+	accessToken, err := s.keyManager.GenerateTenantAccessToken(user, sessionID, req.TenantID, membership.Roles, s.tokenTTL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	refreshToken := generateSecureToken(32)
+	if refreshToken == "" {
+		writeError(w, http.StatusInternalServerError, "failed to generate refresh token")
+		return
+	}
+
+	now := time.Now()
+	session := &types.Session{
+		ID:           sessionID,
+		UserID:       user.ID,
+		RefreshToken: refreshToken,
+		ExpiresAt:    now.Add(s.refreshTTL),
+		CreatedAt:    now,
+	}
+
+	if err := s.db.CreateSession(r.Context(), session); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, types.SelectTenantResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int(s.tokenTTL.Seconds()),
+		Tenant:       tenant,
+	})
+}
+
+// handleCreateTenantForUser creates a new tenant and adds the user as owner
+func (s *AuthService) handleCreateTenantForUser(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req types.CreateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Check if slug is taken
+	existing, err := s.db.GetTenantBySlug(r.Context(), req.Slug)
+	if err == nil && existing != nil {
+		writeError(w, http.StatusConflict, "slug is already taken")
+		return
+	}
+
+	now := time.Now()
+	tenant := &types.Tenant{
+		ID:        uuid.New().String(),
+		Name:      req.Name,
+		Slug:      req.Slug,
+		Plan:      "free",
+		Settings:  make(map[string]interface{}),
+		IsActive:  true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := s.db.CreateTenant(r.Context(), tenant); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create workspace")
+		return
+	}
+
+	// Add user as owner
+	membership := &types.UserTenant{
+		UserID:    userID,
+		TenantID:  tenant.ID,
+		Roles:     []string{"admin"},
+		IsOwner:   true,
+		CreatedAt: now,
+	}
+
+	if err := s.db.CreateUserTenant(r.Context(), membership); err != nil {
+		// Attempt to clean up tenant on failure
+		_ = s.db.DeleteTenant(r.Context(), tenant.ID)
+		writeError(w, http.StatusInternalServerError, "failed to create workspace membership")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, tenant)
+}

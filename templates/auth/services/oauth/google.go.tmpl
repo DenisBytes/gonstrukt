@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"{{.ModuleName}}/internals/crypto"
 	"{{.ModuleName}}/internals/db"
 	"{{.ModuleName}}/internals/types"
 
@@ -27,6 +28,7 @@ type GoogleOAuthConfig struct {
 type GoogleProvider struct {
 	config *oauth2.Config
 	db     db.Database
+	encKey string
 }
 
 // GoogleUserInfo represents the user info returned by Google
@@ -41,7 +43,7 @@ type GoogleUserInfo struct {
 }
 
 // NewGoogleProvider creates a new Google OAuth provider
-func NewGoogleProvider(cfg GoogleOAuthConfig, database db.Database) *GoogleProvider {
+func NewGoogleProvider(cfg GoogleOAuthConfig, database db.Database, encryptionKey string) *GoogleProvider {
 	return &GoogleProvider{
 		config: &oauth2.Config{
 			ClientID:     cfg.ClientID,
@@ -53,7 +55,8 @@ func NewGoogleProvider(cfg GoogleOAuthConfig, database db.Database) *GoogleProvi
 			},
 			Endpoint: google.Endpoint,
 		},
-		db: database,
+		db:     database,
+		encKey: encryptionKey,
 	}
 }
 
@@ -79,7 +82,14 @@ func (p *GoogleProvider) HandleCallback(ctx context.Context, code string) (*type
 	// Check if user exists
 	user, err := p.db.GetUserByEmail(ctx, userInfo.Email)
 	if err == nil && user != nil {
-		// Update OAuth info if needed
+		// Link OAuth account if not already linked
+		if user.OAuthProvider == "" {
+			user.OAuthProvider = "google"
+			user.OAuthID = userInfo.ID
+			user.UpdatedAt = time.Now()
+			_ = p.db.UpdateUser(ctx, user)
+		}
+		p.persistOAuthToken(ctx, user.ID, token)
 		return user, nil
 	}
 
@@ -99,7 +109,29 @@ func (p *GoogleProvider) HandleCallback(ctx context.Context, code string) (*type
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
+	p.persistOAuthToken(ctx, user.ID, token)
 	return user, nil
+}
+
+// persistOAuthToken encrypts and stores the OAuth token for later revocation
+func (p *GoogleProvider) persistOAuthToken(ctx context.Context, userID string, token *oauth2.Token) {
+	if p.encKey == "" {
+		return
+	}
+	encAccess, err := crypto.Encrypt(token.AccessToken, p.encKey)
+	if err != nil {
+		return
+	}
+	encRefresh, _ := crypto.Encrypt(token.RefreshToken, p.encKey)
+	oauthToken := &types.OAuthToken{
+		UserID:       userID,
+		Provider:     "google",
+		AccessToken:  encAccess,
+		RefreshToken: encRefresh,
+		TokenType:    token.TokenType,
+		ExpiresAt:    &token.Expiry,
+	}
+	_ = p.db.UpsertOAuthToken(ctx, oauthToken)
 }
 
 // getUserInfo fetches user info from Google API

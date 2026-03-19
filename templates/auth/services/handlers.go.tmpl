@@ -8,6 +8,8 @@ import (
 
 	"{{.ModuleName}}/internals/middleware"
 	"{{.ModuleName}}/internals/types"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // handleRegister handles user registration
@@ -64,6 +66,39 @@ func (s *AuthService) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tokens)
 }
 
+{{- if .EnableMFA}}
+// handleMFALogin completes a login that requires MFA verification
+func (s *AuthService) handleMFALogin(w http.ResponseWriter, r *http.Request) {
+	var req types.MFAVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.MFAToken == "" || req.Code == "" {
+		writeError(w, http.StatusBadRequest, "mfa_token and code are required")
+		return
+	}
+
+	tokens, err := s.VerifyMFALogin(r.Context(), req.MFAToken, req.Code)
+	if err != nil {
+		switch err {
+		case ErrTokenInvalid, ErrTokenExpired:
+			writeError(w, http.StatusUnauthorized, "invalid or expired MFA token, please login again")
+		case ErrInvalidMFACode:
+			writeError(w, http.StatusUnauthorized, "invalid MFA code")
+		case ErrUserNotFound:
+			writeError(w, http.StatusUnauthorized, "user not found")
+		default:
+			writeError(w, http.StatusTooManyRequests, err.Error())
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tokens)
+}
+{{- end}}
+
 // handleRefresh handles token refresh
 func (s *AuthService) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	var req types.RefreshRequest
@@ -116,20 +151,110 @@ func (s *AuthService) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // handleGetUser handles getting current user info
 func (s *AuthService) handleGetUser(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement user retrieval
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	// Clear sensitive fields before returning
+	user.PasswordHash = ""
+	user.MFASecret = ""
+
+	writeJSON(w, http.StatusOK, user)
 }
 
 // handleUpdateUser handles updating user info
 func (s *AuthService) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement user update
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	user.FirstName = req.FirstName
+	user.LastName = req.LastName
+	user.UpdatedAt = time.Now()
+
+	if err := s.db.UpdateUser(r.Context(), user); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update user")
+		return
+	}
+
+	user.PasswordHash = ""
+	user.MFASecret = ""
+
+	writeJSON(w, http.StatusOK, user)
 }
 
 // handleChangePassword handles password change
 func (s *AuthService) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement password change
-	writeError(w, http.StatusNotImplemented, "not implemented")
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req types.ChangePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	// Verify current password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.CurrentPassword)); err != nil {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to hash password")
+		return
+	}
+
+	user.PasswordHash = string(hashedPassword)
+	user.UpdatedAt = time.Now()
+
+	if err := s.db.UpdateUser(r.Context(), user); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update password")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "password changed"})
 }
 
 // handleGetSessions returns all active sessions for the authenticated user

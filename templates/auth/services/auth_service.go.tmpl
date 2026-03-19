@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+{{- if .EnableMFA}}
+	"sync"
+{{- end}}
 	"time"
 
 	"{{.ModuleName}}/internals/db"
@@ -15,6 +18,9 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
+{{- if .EnableMFA}}
+	"github.com/pquerna/otp/totp"
+{{- end}}
 )
 
 var (
@@ -29,6 +35,19 @@ var (
 	ErrInvalidMFACode     = errors.New("invalid mfa code")
 	ErrConsentRequired    = errors.New("consent required")
 )
+
+{{- if .EnableMFA}}
+const (
+	// mfaTokenTTL is how long an MFA token is valid after login
+	mfaTokenTTL = 5 * time.Minute
+)
+
+// mfaPendingLogin represents a login that's waiting for MFA verification
+type mfaPendingLogin struct {
+	UserID    string
+	ExpiresAt time.Time
+}
+{{- end}}
 
 // AuthServiceConfig holds configuration for the auth service
 type AuthServiceConfig struct {
@@ -48,18 +67,29 @@ type AuthService struct {
 	tokenTTL       time.Duration
 	refreshTTL     time.Duration
 	issuer         string
+{{- if .EnableMFA}}
+	mfaPending     map[string]*mfaPendingLogin // mfa_token → pending login
+	mfaPendingMu   sync.Mutex
+{{- end}}
 }
 
 // NewAuthService creates a new auth service
 func NewAuthService(cfg AuthServiceConfig) *AuthService {
-	return &AuthService{
+	svc := &AuthService{
 		db:             cfg.DB,
 		keyManager:     cfg.KeyManager,
 		tokenBlacklist: cfg.TokenBlacklist,
 		tokenTTL:       cfg.TokenTTL,
 		refreshTTL:     cfg.RefreshTTL,
 		issuer:         cfg.Issuer,
+{{- if .EnableMFA}}
+		mfaPending:     make(map[string]*mfaPendingLogin),
+{{- end}}
 	}
+{{- if .EnableMFA}}
+	go svc.cleanupMFAPending()
+{{- end}}
+	return svc
 }
 
 // IsTokenBlacklisted checks if a token has been revoked
@@ -88,6 +118,7 @@ func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
 
 {{- if .EnableMFA}}
 	// MFA routes
+	mux.HandleFunc("POST /api/v1/auth/mfa/login", s.handleMFALogin)
 	mux.HandleFunc("POST /api/v1/auth/mfa/setup", s.handleMFASetup)
 	mux.HandleFunc("POST /api/v1/auth/mfa/verify", s.handleMFAVerify)
 	mux.HandleFunc("POST /api/v1/auth/mfa/disable", s.handleMFADisable)
@@ -106,6 +137,35 @@ func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
 {{- if .HasGDPRDataDeletion}}
 	mux.HandleFunc("DELETE /api/v1/auth/gdpr/delete", s.handleDeleteData)
 {{- end}}
+{{- end}}
+
+{{- if .HasTenancy}}
+	// Workspace routes (tenant-less token)
+	mux.HandleFunc("GET /api/v1/auth/workspaces", s.handleGetWorkspaces)
+	mux.HandleFunc("POST /api/v1/auth/workspaces", s.handleCreateTenantForUser)
+	mux.HandleFunc("POST /api/v1/auth/workspaces/select", s.handleSelectTenant)
+
+	// User invitation routes (tenant-less token)
+	mux.HandleFunc("GET /api/v1/auth/invitations", s.handleGetMyInvitations)
+	mux.HandleFunc("POST /api/v1/auth/invitations/{id}/accept", s.handleAcceptInvitation)
+	mux.HandleFunc("POST /api/v1/auth/invitations/{id}/decline", s.handleDeclineInvitation)
+
+	// Tenant management routes (tenant-scoped token)
+	mux.HandleFunc("GET /api/v1/auth/tenant", s.handleGetCurrentTenant)
+	mux.HandleFunc("GET /api/v1/auth/tenant/{id}", s.handleGetTenant)
+	mux.HandleFunc("PUT /api/v1/auth/tenant", s.handleUpdateTenant)
+	mux.HandleFunc("DELETE /api/v1/auth/tenant", s.handleDeleteTenant)
+
+	// Member management routes (tenant-scoped token)
+	mux.HandleFunc("GET /api/v1/auth/tenant/members", s.handleGetMembers)
+	mux.HandleFunc("PUT /api/v1/auth/tenant/members/{user_id}/role", s.handleUpdateMemberRole)
+	mux.HandleFunc("DELETE /api/v1/auth/tenant/members/{user_id}", s.handleRemoveMember)
+
+	// Tenant invitation routes (tenant-scoped token)
+	mux.HandleFunc("GET /api/v1/auth/tenant/invitations", s.handleGetTenantInvitations)
+	mux.HandleFunc("POST /api/v1/auth/tenant/invitations", s.handleCreateInvitations)
+	mux.HandleFunc("POST /api/v1/auth/tenant/invitations/{id}/resend", s.handleResendInvitation)
+	mux.HandleFunc("DELETE /api/v1/auth/tenant/invitations/{id}", s.handleRevokeInvitation)
 {{- end}}
 
 	// User management routes
@@ -326,10 +386,93 @@ func (s *AuthService) RevokeAllSessions(ctx context.Context, userID, currentSess
 	return lastErr
 }
 
-// generateMFAToken creates a temporary token for MFA verification
+// generateMFAToken creates a temporary token for MFA login verification.
+// The token is stored in memory and maps back to the user ID.
 func (s *AuthService) generateMFAToken(userID string) string {
-	return generateSecureToken(32)
+	token := generateSecureToken(32)
+	if token == "" {
+		return ""
+	}
+{{- if .EnableMFA}}
+	s.mfaPendingMu.Lock()
+	s.mfaPending[token] = &mfaPendingLogin{
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(mfaTokenTTL),
+	}
+	s.mfaPendingMu.Unlock()
+{{- end}}
+	return token
 }
+
+{{- if .EnableMFA}}
+// validateMFAToken validates a pending MFA token and returns the associated user ID.
+// The token is consumed (single use).
+func (s *AuthService) validateMFAToken(token string) (string, error) {
+	s.mfaPendingMu.Lock()
+	defer s.mfaPendingMu.Unlock()
+
+	pending, ok := s.mfaPending[token]
+	if !ok {
+		return "", ErrTokenInvalid
+	}
+	// Always delete to prevent reuse
+	delete(s.mfaPending, token)
+
+	if time.Now().After(pending.ExpiresAt) {
+		return "", ErrTokenExpired
+	}
+	return pending.UserID, nil
+}
+
+// VerifyMFALogin completes a login that requires MFA verification.
+func (s *AuthService) VerifyMFALogin(ctx context.Context, mfaToken, code string) (*types.TokenResponse, error) {
+	userID, err := s.validateMFAToken(mfaToken)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check rate limiting
+	if checkMFARateLimit(userID) {
+		return nil, errors.New("too many failed MFA attempts, try again later")
+	}
+
+	user, err := s.db.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, ErrUserNotFound
+	}
+
+	// Verify TOTP code
+	if !totp.Validate(code, user.MFASecret) {
+		recordMFAAttempt(userID, false)
+		return nil, ErrInvalidMFACode
+	}
+
+	// Clear rate limit on success
+	recordMFAAttempt(userID, true)
+
+	utils.Info("user completed MFA login",
+		zap.String("user_id", user.ID),
+		zap.String("email", user.Email))
+
+	return s.generateTokens(ctx, user)
+}
+
+// cleanupMFAPending periodically removes expired MFA pending tokens.
+func (s *AuthService) cleanupMFAPending() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		s.mfaPendingMu.Lock()
+		for token, pending := range s.mfaPending {
+			if now.After(pending.ExpiresAt) {
+				delete(s.mfaPending, token)
+			}
+		}
+		s.mfaPendingMu.Unlock()
+	}
+}
+{{- end}}
 
 // generateSecureToken generates a cryptographically secure random token
 // Returns empty string if crypto/rand fails (should never happen on properly configured systems)

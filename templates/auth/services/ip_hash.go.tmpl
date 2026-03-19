@@ -1,0 +1,21 @@
+package services
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
+
+// HashIP hashes an IP address with a salt for GDPR-compliant storage.
+// The salt must be non-empty; without it, SHA-256 of an IP is trivially reversible.
+func HashIP(ip, salt string) (string, error) {
+	if ip == "" {
+		return "", nil
+	}
+	if salt == "" {
+		return "", fmt.Errorf("ip hash salt must not be empty: unsalted IP hashes are trivially reversible")
+	}
+	h := sha256.New()
+	h.Write([]byte(salt + ip))
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

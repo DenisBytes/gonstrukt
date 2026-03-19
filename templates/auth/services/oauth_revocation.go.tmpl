@@ -1,0 +1,186 @@
+{{- if and .HasOAuth .HasGDPRDataDeletion}}
+package services
+
+import (
+	"context"
+	"net/http"
+{{- if or .HasGoogleOAuth .HasAppleOAuth}}
+	"net/url"
+{{- end}}
+{{- if .HasAppleOAuth}}
+	"strings"
+{{- end}}
+	"time"
+
+	"{{.ModuleName}}/internals/crypto"
+	"{{.ModuleName}}/internals/types"
+
+	"go.uber.org/zap"
+)
+
+// OAuthRevoker handles revocation of OAuth tokens for GDPR data deletion
+type OAuthRevoker struct {
+	httpClient  *http.Client
+	encKey      string
+	logger      *zap.Logger
+{{- if .HasAppleOAuth}}
+	appleSecret string
+{{- end}}
+}
+
+// NewOAuthRevoker creates a new OAuth token revoker
+func NewOAuthRevoker(encKey string, logger *zap.Logger{{if .HasAppleOAuth}}, appleSecret string{{end}}) *OAuthRevoker {
+	return &OAuthRevoker{
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		encKey:     encKey,
+		logger:     logger,
+{{- if .HasAppleOAuth}}
+		appleSecret: appleSecret,
+{{- end}}
+	}
+}
+
+// RevokeAll revokes all OAuth tokens for the given user.
+// Errors are logged but do not prevent deletion from proceeding.
+func (r *OAuthRevoker) RevokeAll(ctx context.Context, tokens []*types.OAuthToken) {
+	for _, token := range tokens {
+		// Decrypt tokens before revocation
+		accessToken, err := crypto.Decrypt(token.AccessToken, r.encKey)
+		if err != nil {
+			r.logger.Warn("failed to decrypt access token for revocation",
+				zap.String("provider", token.Provider),
+				zap.String("user_id", token.UserID),
+				zap.Error(err))
+			continue
+		}
+
+		refreshToken, _ := crypto.Decrypt(token.RefreshToken, r.encKey)
+
+		switch token.Provider {
+{{- if .HasGoogleOAuth}}
+		case "google":
+			r.revokeGoogle(ctx, accessToken, refreshToken)
+{{- end}}
+{{- if .HasMicrosoftOAuth}}
+		case "microsoft":
+			r.revokeMicrosoft(ctx, accessToken)
+{{- end}}
+{{- if .HasAppleOAuth}}
+		case "apple":
+			r.revokeApple(ctx, accessToken, refreshToken)
+{{- end}}
+		default:
+			r.logger.Warn("unknown OAuth provider for revocation",
+				zap.String("provider", token.Provider),
+				zap.String("user_id", token.UserID))
+		}
+	}
+}
+
+{{- if .HasGoogleOAuth}}
+
+// revokeGoogle revokes a Google OAuth token.
+// Google prefers revoking the refresh token; if unavailable, revoke the access token.
+func (r *OAuthRevoker) revokeGoogle(ctx context.Context, accessToken, refreshToken string) {
+	token := refreshToken
+	if token == "" {
+		token = accessToken
+	}
+	if token == "" {
+		return
+	}
+
+	revokeURL := "https://oauth2.googleapis.com/revoke?token=" + url.QueryEscape(token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, revokeURL, nil)
+	if err != nil {
+		r.logger.Warn("failed to create Google revocation request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		r.logger.Warn("failed to revoke Google token", zap.Error(err))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		r.logger.Warn("Google token revocation returned non-OK status",
+			zap.Int("status", resp.StatusCode))
+	}
+}
+{{- end}}
+
+{{- if .HasMicrosoftOAuth}}
+
+// revokeMicrosoft revokes Microsoft OAuth sessions by calling the revokeSignInSessions endpoint.
+func (r *OAuthRevoker) revokeMicrosoft(ctx context.Context, accessToken string) {
+	if accessToken == "" {
+		return
+	}
+
+	revokeURL := "https://graph.microsoft.com/v1.0/me/revokeSignInSessions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, revokeURL, nil)
+	if err != nil {
+		r.logger.Warn("failed to create Microsoft revocation request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		r.logger.Warn("failed to revoke Microsoft sessions", zap.Error(err))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		r.logger.Warn("Microsoft session revocation returned non-OK status",
+			zap.Int("status", resp.StatusCode))
+	}
+}
+{{- end}}
+
+{{- if .HasAppleOAuth}}
+
+// revokeApple revokes an Apple OAuth token using the auth/revoke endpoint.
+func (r *OAuthRevoker) revokeApple(ctx context.Context, accessToken, refreshToken string) {
+	// Prefer revoking the refresh token
+	token := refreshToken
+	tokenHint := "refresh_token"
+	if token == "" {
+		token = accessToken
+		tokenHint = "access_token"
+	}
+	if token == "" {
+		return
+	}
+
+	data := url.Values{}
+	data.Set("token", token)
+	data.Set("token_type_hint", tokenHint)
+	data.Set("client_secret", r.appleSecret)
+
+	revokeURL := "https://appleid.apple.com/auth/revoke"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, revokeURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		r.logger.Warn("failed to create Apple revocation request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		r.logger.Warn("failed to revoke Apple token", zap.Error(err))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		r.logger.Warn("Apple token revocation returned non-OK status",
+			zap.Int("status", resp.StatusCode))
+	}
+}
+{{- end}}
+{{- end}}

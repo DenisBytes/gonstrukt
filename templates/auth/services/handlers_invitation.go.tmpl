@@ -1,0 +1,417 @@
+package services
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"{{.ModuleName}}/internals/middleware"
+	"{{.ModuleName}}/internals/types"
+
+	"github.com/google/uuid"
+)
+
+// --- User-facing invitation handlers (tenant-less tokens) ---
+
+// handleGetMyInvitations returns all pending invitations for the current user
+func (s *AuthService) handleGetMyInvitations(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	invitations, err := s.db.GetInvitationsByEmail(r.Context(), user.Email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get invitations")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, invitations)
+}
+
+// handleAcceptInvitation accepts a pending invitation
+func (s *AuthService) handleAcceptInvitation(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	invitationID := r.PathValue("id")
+	if invitationID == "" {
+		writeError(w, http.StatusBadRequest, "invitation ID required")
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	invitation, err := s.db.GetInvitationByID(r.Context(), invitationID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "invitation not found")
+		return
+	}
+
+	// Verify the invitation belongs to this user's email
+	if strings.ToLower(invitation.Email) != strings.ToLower(user.Email) {
+		writeError(w, http.StatusForbidden, "invitation does not belong to this user")
+		return
+	}
+
+	if invitation.Status != "pending" {
+		writeError(w, http.StatusBadRequest, "invitation is no longer pending")
+		return
+	}
+
+	if time.Now().After(invitation.ExpiresAt) {
+		_ = s.db.UpdateInvitationStatus(r.Context(), invitationID, "expired")
+		writeError(w, http.StatusBadRequest, "invitation has expired")
+		return
+	}
+
+	// Check if user is already a member
+	isMember, err := s.db.CheckUserTenantMembership(r.Context(), userID, invitation.TenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check membership")
+		return
+	}
+	if isMember {
+		_ = s.db.UpdateInvitationStatus(r.Context(), invitationID, "accepted")
+		writeError(w, http.StatusConflict, "already a member of this workspace")
+		return
+	}
+
+	// Create membership
+	now := time.Now()
+	membership := &types.UserTenant{
+		UserID:    userID,
+		TenantID:  invitation.TenantID,
+		Roles:     []string{invitation.Role},
+		IsOwner:   false,
+		CreatedAt: now,
+	}
+
+	if err := s.db.CreateUserTenant(r.Context(), membership); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to join workspace")
+		return
+	}
+
+	// Mark invitation as accepted
+	if err := s.db.UpdateInvitationStatus(r.Context(), invitationID, "accepted"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update invitation")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted", "tenant_id": invitation.TenantID})
+}
+
+// handleDeclineInvitation declines a pending invitation
+func (s *AuthService) handleDeclineInvitation(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	invitationID := r.PathValue("id")
+	if invitationID == "" {
+		writeError(w, http.StatusBadRequest, "invitation ID required")
+		return
+	}
+
+	user, err := s.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	invitation, err := s.db.GetInvitationByID(r.Context(), invitationID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "invitation not found")
+		return
+	}
+
+	if strings.ToLower(invitation.Email) != strings.ToLower(user.Email) {
+		writeError(w, http.StatusForbidden, "invitation does not belong to this user")
+		return
+	}
+
+	if invitation.Status != "pending" {
+		writeError(w, http.StatusBadRequest, "invitation is no longer pending")
+		return
+	}
+
+	if err := s.db.UpdateInvitationStatus(r.Context(), invitationID, "declined"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to decline invitation")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "declined"})
+}
+
+// --- Admin invitation handlers (tenant-scoped tokens) ---
+
+// handleGetTenantInvitations returns all invitations for the current tenant
+func (s *AuthService) handleGetTenantInvitations(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	invitations, err := s.db.GetInvitationsByTenant(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get invitations")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, invitations)
+}
+
+// handleCreateInvitations creates invitations in bulk
+func (s *AuthService) handleCreateInvitations(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	var req types.CreateInvitationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if len(req.Invitations) == 0 {
+		writeError(w, http.StatusBadRequest, "at least one invitation is required")
+		return
+	}
+
+	if len(req.Invitations) > 50 {
+		writeError(w, http.StatusBadRequest, "maximum 50 invitations per request")
+		return
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(7 * 24 * time.Hour) // 7 days
+	results := make([]types.InvitationResult, 0, len(req.Invitations))
+
+	for _, entry := range req.Invitations {
+		email := strings.TrimSpace(strings.ToLower(entry.Email))
+		role := entry.Role
+		if role == "" {
+			role = "member"
+		}
+
+		result := types.InvitationResult{Email: email}
+
+		if !types.IsValidInvitationEmail(email) {
+			result.Status = "error"
+			result.Message = "invalid email address"
+			results = append(results, result)
+			continue
+		}
+
+		// Check if already a member (by looking up the user by email, then checking membership)
+		existingUser, err := s.db.GetUserByEmail(r.Context(), email)
+		if err == nil && existingUser != nil {
+			isMember, memberErr := s.db.CheckUserTenantMembership(r.Context(), existingUser.ID, tenantID)
+			if memberErr != nil {
+				result.Status = "error"
+				result.Message = "failed to check membership"
+				results = append(results, result)
+				continue
+			}
+			if isMember {
+				result.Status = "already_member"
+				result.Message = "user is already a member"
+				results = append(results, result)
+				continue
+			}
+		}
+
+		// Check for existing pending invitation
+		existingInvitations, invErr := s.db.GetInvitationsByEmail(r.Context(), email)
+		if invErr != nil {
+			result.Status = "error"
+			result.Message = "failed to check existing invitations"
+			results = append(results, result)
+			continue
+		}
+		alreadyInvited := false
+		for _, inv := range existingInvitations {
+			if inv.TenantID == tenantID && inv.Status == "pending" {
+				alreadyInvited = true
+				break
+			}
+		}
+		if alreadyInvited {
+			result.Status = "already_invited"
+			result.Message = "invitation already pending"
+			results = append(results, result)
+			continue
+		}
+
+		invitation := &types.Invitation{
+			ID:        uuid.New().String(),
+			TenantID:  tenantID,
+			Email:     email,
+			Role:      role,
+			Status:    "pending",
+			InvitedBy: userID,
+			Token:     generateSecureToken(32),
+			ExpiresAt: expiresAt,
+			CreatedAt: now,
+		}
+
+		if err := s.db.CreateInvitation(r.Context(), invitation); err != nil {
+			result.Status = "error"
+			result.Message = "failed to create invitation"
+			results = append(results, result)
+			continue
+		}
+
+		result.Status = "sent"
+		results = append(results, result)
+	}
+
+	writeJSON(w, http.StatusOK, results)
+}
+
+// handleResendInvitation regenerates the token and resets expiry for an invitation
+func (s *AuthService) handleResendInvitation(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	invitationID := r.PathValue("id")
+	if invitationID == "" {
+		writeError(w, http.StatusBadRequest, "invitation ID required")
+		return
+	}
+
+	invitation, err := s.db.GetInvitationByID(r.Context(), invitationID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "invitation not found")
+		return
+	}
+
+	if invitation.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "invitation does not belong to this workspace")
+		return
+	}
+
+	if invitation.Status != "pending" {
+		writeError(w, http.StatusBadRequest, "can only resend pending invitations")
+		return
+	}
+
+	newToken := generateSecureToken(32)
+	newExpiry := time.Now().Add(7 * 24 * time.Hour)
+
+	if err := s.db.UpdateInvitationToken(r.Context(), invitationID, newToken, newExpiry); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resend invitation")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "resent"})
+}
+
+// handleRevokeInvitation revokes a pending invitation
+func (s *AuthService) handleRevokeInvitation(w http.ResponseWriter, r *http.Request) {
+	_, ok := middleware.GetUserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tenantID, _ := claims["tenant_id"].(string)
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant-scoped token required")
+		return
+	}
+
+	invitationID := r.PathValue("id")
+	if invitationID == "" {
+		writeError(w, http.StatusBadRequest, "invitation ID required")
+		return
+	}
+
+	invitation, err := s.db.GetInvitationByID(r.Context(), invitationID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "invitation not found")
+		return
+	}
+
+	if invitation.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "invitation does not belong to this workspace")
+		return
+	}
+
+	if invitation.Status != "pending" {
+		writeError(w, http.StatusBadRequest, "can only revoke pending invitations")
+		return
+	}
+
+	if err := s.db.UpdateInvitationStatus(r.Context(), invitationID, "revoked"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke invitation")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
