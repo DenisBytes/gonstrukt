@@ -95,7 +95,7 @@ Examples:
 	cmd.Flags().StringVar(&emailServiceStr, "email", "", "Email service (ses, smtp)")
 	cmd.Flags().BoolVar(&authCache, "auth-cache", false, "Enable auth response caching (gateway)")
 	cmd.Flags().StringSliceVar(&frontends, "frontend", nil, "Frontend types (web, mobile) - can specify both")
-	cmd.Flags().StringVar(&webFrameworkStr, "web-framework", "", "Web framework (react, next, tanstack) - required for web frontend")
+	cmd.Flags().StringVar(&webFrameworkStr, "web-framework", "", "Web framework for web frontend (only react is currently implemented)")
 	cmd.Flags().StringVar(&uiLibraryStr, "ui-lib", "", "UI library (shadcn, baseui)")
 	cmd.Flags().StringVar(&stateMgmtStr, "state-mgmt", "", "State management (tanstack, redux)")
 	cmd.Flags().BoolVar(&enablePostHog, "posthog", false, "Enable PostHog analytics (requires --frontend)")
@@ -125,13 +125,29 @@ Examples:
 		return config.ValidFrontendTypes(), cobra.ShellCompDirectiveNoFileComp
 	})
 	cmd.RegisterFlagCompletionFunc("web-framework", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		return config.ValidWebFrameworks(), cobra.ShellCompDirectiveNoFileComp
+		// Only React is implemented today, so don't tab-complete the unimplemented options.
+		return []string{string(config.FrameworkReact)}, cobra.ShellCompDirectiveNoFileComp
 	})
 	cmd.RegisterFlagCompletionFunc("ui-lib", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return config.ValidUILibraries(), cobra.ShellCompDirectiveNoFileComp
 	})
 	cmd.RegisterFlagCompletionFunc("state-mgmt", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return config.ValidStateManagements(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("oauth", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidOAuthProviders(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("gdpr", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidGDPRFeatures(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("email", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidEmailServices(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("test-infra", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidTestInfraTypes(), cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("e2e-framework", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return config.ValidE2EFrameworkTypes(), cobra.ShellCompDirectiveNoFileComp
 	})
 
 	return cmd

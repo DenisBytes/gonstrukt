@@ -70,49 +70,102 @@ func (s *SummaryStep) View() string {
 	b.WriteString("\n\n")
 
 	// Configuration items
-	items := []struct {
-		label string
-		value string
-	}{
-		{"Module Name", s.config.ModuleName},
-		{"Project Name", config.ExtractProjectName(s.config.ModuleName)},
-		{"Service Type", formatServiceType(s.config.ServiceType)},
+	type summaryItem struct{ label, value string }
+	var items []summaryItem
+	add := func(label, value string) {
+		items = append(items, summaryItem{label, value})
 	}
 
-	// Conditional items based on service type
-	if s.config.ServiceType == config.ServiceAuth || s.config.ServiceType == config.ServiceBoth {
-		if s.config.Database != nil {
-			items = append(items, struct {
-				label string
-				value string
-			}{"Database", formatDatabase(*s.config.Database)})
+	add("Module Name", s.config.ModuleName)
+	add("Project Name", config.ExtractProjectName(s.config.ModuleName))
+	add("Service Type", formatServiceType(s.config.ServiceType))
+
+	isAuth := s.config.ServiceType == config.ServiceAuth || s.config.ServiceType == config.ServiceBoth
+	isGateway := s.config.ServiceType == config.ServiceGateway || s.config.ServiceType == config.ServiceBoth
+
+	if isAuth && s.config.Database != nil {
+		add("Database", formatDatabase(*s.config.Database))
+	}
+	if s.config.Cache != nil {
+		add("Cache", formatCache(*s.config.Cache))
+	}
+	if s.config.RateLimiter != nil {
+		add("Rate Limiter", formatRateLimiter(*s.config.RateLimiter))
+	}
+
+	add("Config Source", formatConfigSource(s.config.ConfigSource))
+	add("Observability", formatObservability(s.config.Observability))
+
+	// Auth feature selections
+	if len(s.config.OAuthProviders) > 0 {
+		providers := make([]string, len(s.config.OAuthProviders))
+		for i, p := range s.config.OAuthProviders {
+			providers[i] = string(p)
+		}
+		add("OAuth Providers", strings.Join(providers, ", "))
+	}
+	if s.config.EnableMFA {
+		add("MFA", "Enabled")
+	}
+	if s.config.EnableRBAC {
+		add("RBAC", "Enabled")
+	}
+	if len(s.config.GDPRFeatures) > 0 {
+		features := make([]string, len(s.config.GDPRFeatures))
+		for i, f := range s.config.GDPRFeatures {
+			features[i] = string(f)
+		}
+		add("GDPR Features", strings.Join(features, ", "))
+	}
+	if s.config.EmailService != nil {
+		add("Email Service", string(*s.config.EmailService))
+	}
+	if isGateway && s.config.AuthCache {
+		add("Auth Cache", "Enabled")
+	}
+
+	// Frontend
+	if len(s.config.Frontends) > 0 {
+		fronts := make([]string, len(s.config.Frontends))
+		for i, f := range s.config.Frontends {
+			fronts[i] = string(f)
+		}
+		add("Frontend", strings.Join(fronts, ", "))
+		if s.config.WebFramework != nil {
+			add("Web Framework", string(*s.config.WebFramework))
+		}
+		if s.config.UILibrary != nil {
+			add("UI Library", string(*s.config.UILibrary))
+		}
+		if s.config.StateManagement != nil {
+			add("State Management", string(*s.config.StateManagement))
+		}
+		if s.config.EnablePostHog {
+			add("PostHog Analytics", "Enabled")
+		}
+		if s.config.EnableSentry {
+			add("Sentry Monitoring", "Enabled")
 		}
 	}
 
-	if s.config.ServiceType == config.ServiceGateway || s.config.ServiceType == config.ServiceBoth {
-		if s.config.Cache != nil {
-			items = append(items, struct {
-				label string
-				value string
-			}{"Cache", formatCache(*s.config.Cache)})
-		}
-		if s.config.RateLimiter != nil {
-			items = append(items, struct {
-				label string
-				value string
-			}{"Rate Limiter", formatRateLimiter(*s.config.RateLimiter)})
+	// Multi-tenancy and k8s
+	if s.config.EnableTenancy {
+		add("Multi-Tenancy", "Enabled")
+	}
+	if s.config.EnableK8s {
+		add("K8s Dev Env", "Enabled")
+		if s.config.Domain != "" {
+			add("Domain", s.config.Domain)
 		}
 	}
 
-	items = append(items, struct {
-		label string
-		value string
-	}{"Config Source", formatConfigSource(s.config.ConfigSource)})
-
-	items = append(items, struct {
-		label string
-		value string
-	}{"Observability", formatObservability(s.config.Observability)})
+	// Testing
+	if s.config.TestInfra != nil {
+		add("Test Infra", string(*s.config.TestInfra))
+	}
+	if s.config.E2EFramework != nil {
+		add("E2E Framework", string(*s.config.E2EFramework))
+	}
 
 	for _, item := range items {
 		b.WriteString(s.styles.SummaryLabel.Render(item.label + ":"))
@@ -223,6 +276,10 @@ func formatRateLimiter(rl config.RateLimiterType) string {
 		return "Token Bucket"
 	case config.RateLimiterSlidingWindow:
 		return "Sliding Window"
+	case config.RateLimiterLeakyBucket:
+		return "Leaky Bucket"
+	case config.RateLimiterFixedWindow:
+		return "Fixed Window"
 	default:
 		return string(rl)
 	}

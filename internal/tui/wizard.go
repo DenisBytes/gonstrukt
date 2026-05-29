@@ -84,6 +84,11 @@ type Wizard struct {
 	domainStep           *steps.DomainStep
 	summaryStep          *steps.SummaryStep
 
+	// gatewayFeaturesEnabled records whether an auth-only project opted into the
+	// optional gateway features (cache + rate limiter). Tracking the choice
+	// explicitly avoids inferring it from Cache/RateLimiter state during back-navigation.
+	gatewayFeaturesEnabled bool
+
 	// Current step info for display
 	stepInfos []stepInfo
 }
@@ -359,8 +364,10 @@ func (w *Wizard) handleStepComplete(msg steps.StepCompleteMsg) (tea.Model, tea.C
 	case "cache":
 		cache := msg.Value.(config.CacheType)
 		w.config.Cache = &cache
-		// For Auth with gateway features, config was already selected, go to rate limiter
-		if w.config.ServiceType == config.ServiceAuth && w.config.ConfigSource != "" {
+		// Auth reaches cache only via the optional gateway-features path, where the
+		// config source was already chosen — continue to the rate limiter. Gateway and
+		// both choose the config source after cache.
+		if w.config.ServiceType == config.ServiceAuth {
 			w.state = StateSelectingRateLimiter
 		} else {
 			w.state = StateSelectingConfigSource
@@ -402,11 +409,15 @@ func (w *Wizard) handleStepComplete(msg steps.StepCompleteMsg) (tea.Model, tea.C
 
 	case "gateway_features":
 		enableGateway := msg.Value.(bool)
+		w.gatewayFeaturesEnabled = enableGateway
 		if enableGateway {
 			// User wants gateway features: go to cache selection
 			w.state = StateSelectingCache
 		} else {
-			// No gateway features: go to frontend selection
+			// No gateway features: clear any previously-picked values so a toggle-off
+			// after going back doesn't leak cache/rate-limiter into generation.
+			w.config.Cache = nil
+			w.config.RateLimiter = nil
 			w.state = StateSelectingFrontend
 		}
 		return w, nil
@@ -549,13 +560,13 @@ func (w *Wizard) nextStepFromEmailService() (tea.Model, tea.Cmd) {
 	return w, nil
 }
 
-// nextStepFromAuthCache determines the next step after auth cache
+// nextStepFromAuthCache determines the next step after auth cache. Auth cache is
+// only reached by gateway-only and both; only "both" includes auth features and a
+// frontend step, so gateway-only skips straight to observability.
 func (w *Wizard) nextStepFromAuthCache() (tea.Model, tea.Cmd) {
-	// Both gateway and both services can have frontend (if auth is involved)
 	if w.config.ServiceType == config.ServiceBoth {
 		w.state = StateSelectingFrontend
 	} else {
-		// Gateway-only: skip frontend, go to observability
 		w.state = StateSelectingObservability
 	}
 	return w, nil
@@ -700,7 +711,7 @@ func (w *Wizard) handleStepBack() (tea.Model, tea.Cmd) {
 			w.authCacheStep.Reset()
 			w.state = StateSelectingAuthCache
 		} else if w.config.ServiceType == config.ServiceAuth {
-			if w.config.Cache != nil || w.config.RateLimiter != nil {
+			if w.gatewayFeaturesEnabled {
 				// Gateway features enabled: go back to rate limiter
 				w.rateLimiterStep.Reset()
 				w.state = StateSelectingRateLimiter
@@ -742,27 +753,22 @@ func (w *Wizard) handleStepBack() (tea.Model, tea.Cmd) {
 		w.state = StateSelectingStateManagement
 
 	case StateSelectingTenancy:
-		// Go back based on frontend selection
+		// Tenancy is only reachable for auth/both. If a frontend was configured we came
+		// from analytics; otherwise we came from the frontend step.
 		if len(w.config.Frontends) > 0 {
 			w.analyticsStep.Reset()
 			w.state = StateSelectingAnalytics
-		} else if w.config.ServiceType == config.ServiceBoth {
-			w.frontendStep.Reset()
-			w.state = StateSelectingFrontend
-		} else if w.config.ServiceType == config.ServiceAuth {
+		} else {
 			w.frontendStep.Reset()
 			w.state = StateSelectingFrontend
 		}
 
 	case StateSelectingObservability:
-		// Go back to tenancy if auth/both, otherwise analytics/frontend/authcache
+		// Auth/both reach observability from tenancy; gateway-only reaches it from auth cache.
 		if w.config.ServiceType == config.ServiceAuth || w.config.ServiceType == config.ServiceBoth {
 			w.tenancyStep.Reset()
 			w.state = StateSelectingTenancy
-		} else if len(w.config.Frontends) > 0 {
-			w.analyticsStep.Reset()
-			w.state = StateSelectingAnalytics
-		} else if w.config.ServiceType == config.ServiceGateway {
+		} else {
 			w.authCacheStep.Reset()
 			w.state = StateSelectingAuthCache
 		}

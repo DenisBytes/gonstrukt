@@ -20,7 +20,7 @@ func NewFrontendStep() *FrontendStep {
 		{
 			Label:       "Web",
 			Value:       string(config.FrontendWeb),
-			Description: "Web frontend with React, Next.js, or TanStack Start",
+			Description: "Web frontend with React (Vite)",
 		},
 		{
 			Label:       "Mobile",
