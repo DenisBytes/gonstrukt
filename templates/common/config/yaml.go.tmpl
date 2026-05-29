@@ -4,9 +4,44 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
+
+var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
+
+// expandEnv expands ${VAR} and ${VAR:-default} in s using os.Getenv.
+func expandEnv(s string) string {
+	return envVarRe.ReplaceAllStringFunc(s, func(match string) string {
+		inner := match[2 : len(match)-1] // strip ${ and }
+		name, defaultVal, hasDefault := "", "", false
+		if idx := findDefault(inner); idx >= 0 {
+			name = inner[:idx]
+			defaultVal = inner[idx+2:]
+			hasDefault = true
+		} else {
+			name = inner
+		}
+		if val := os.Getenv(name); val != "" {
+			return val
+		}
+		if hasDefault {
+			return defaultVal
+		}
+		return ""
+	})
+}
+
+// findDefault returns the index of ":-" in s, or -1 if not found.
+func findDefault(s string) int {
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == ':' && s[i+1] == '-' {
+			return i
+		}
+	}
+	return -1
+}
 
 // LoadYAML loads configuration from a YAML file
 func LoadYAML[T any](path string) (*T, error) {
@@ -27,8 +62,8 @@ func LoadYAML[T any](path string) (*T, error) {
 		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
 	}
 
-	// Expand environment variables in content
-	expandedData := os.ExpandEnv(string(data))
+	// Expand environment variables in content (supports ${VAR:-default} syntax)
+	expandedData := expandEnv(string(data))
 
 	var cfg T
 	if err := yaml.Unmarshal([]byte(expandedData), &cfg); err != nil {

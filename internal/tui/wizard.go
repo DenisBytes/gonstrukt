@@ -39,9 +39,6 @@ const (
 	StateSelectingK8s             // K8s dev environment toggle (after observability)
 	StateEnteringDomain           // Domain input (only if k8s enabled)
 	StateShowingSummary
-	StateGenerating
-	StateComplete
-	StateError
 )
 
 // stepInfo holds information about a wizard step
@@ -87,9 +84,6 @@ type Wizard struct {
 	domainStep           *steps.DomainStep
 	summaryStep          *steps.SummaryStep
 
-	// Progress
-	progress components.Progress
-
 	// Current step info for display
 	stepInfos []stepInfo
 }
@@ -127,16 +121,6 @@ func NewWizard() *Wizard {
 		k8sStep:              steps.NewK8sStep(),
 		domainStep:           steps.NewDomainStep(""),
 		summaryStep:          steps.NewSummaryStep(cfg),
-
-		progress: components.NewProgress([]string{
-			"Creating project structure",
-			"Generating configuration",
-			"Generating service code",
-			"Generating database layer",
-			"Generating middleware",
-			"Running go mod tidy",
-			"Formatting code",
-		}),
 	}
 
 	w.stepInfos = []stepInfo{
@@ -348,19 +332,6 @@ func (w *Wizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case steps.StepBackMsg:
 		return w.handleStepBack()
-
-	case components.ProgressMsg:
-		return w.handleProgress(msg)
-
-	case GenerationCompleteMsg:
-		w.state = StateComplete
-		w.progress.Complete()
-		return w, nil
-
-	case GenerationErrorMsg:
-		w.state = StateError
-		w.err = msg.Error
-		return w, nil
 	}
 
 	// Delegate to current step
@@ -501,8 +472,8 @@ func (w *Wizard) handleStepComplete(msg steps.StepCompleteMsg) (tea.Model, tea.C
 		return w, nil
 
 	case "summary":
-		w.state = StateGenerating
-		return w, w.startGeneration()
+		// Quit the TUI; runInteractive performs generation after the program exits.
+		return w, tea.Quit
 	}
 
 	return w, nil
@@ -817,22 +788,6 @@ func (w *Wizard) handleStepBack() (tea.Model, tea.Cmd) {
 	return w, nil
 }
 
-// handleProgress handles progress updates during generation
-func (w *Wizard) handleProgress(msg components.ProgressMsg) (tea.Model, tea.Cmd) {
-	switch msg.State {
-	case components.ProgressInProgress:
-		w.progress.StartStep(msg.Step, msg.Message)
-	case components.ProgressComplete:
-		w.progress.CompleteStep(msg.Step)
-	case components.ProgressError:
-		w.progress.FailStep(msg.Step, msg.Error)
-	}
-
-	var cmd tea.Cmd
-	w.progress, cmd = w.progress.Update(msg)
-	return w, cmd
-}
-
 // updateCurrentStep delegates update to the current step
 func (w *Wizard) updateCurrentStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -952,9 +907,6 @@ func (w *Wizard) updateCurrentStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 		model, c := w.summaryStep.Update(msg)
 		w.summaryStep = model.(*steps.SummaryStep)
 		cmd = c
-
-	case StateGenerating:
-		w.progress, cmd = w.progress.Update(msg)
 	}
 
 	return w, cmd
@@ -977,9 +929,7 @@ func (w *Wizard) View() string {
 	b.WriteString("\n")
 
 	// Help
-	if w.state != StateGenerating && w.state != StateComplete && w.state != StateError {
-		b.WriteString(w.renderHelp())
-	}
+	b.WriteString(w.renderHelp())
 
 	return w.styles.Container.Render(b.String())
 }
@@ -1002,10 +952,6 @@ func (w *Wizard) renderHeader() string {
 func (w *Wizard) renderStepIndicator() string {
 	currentStep := w.getCurrentStepIndex()
 	totalSteps := w.getTotalSteps()
-
-	if w.state == StateGenerating || w.state == StateComplete || w.state == StateError {
-		return ""
-	}
 
 	return w.styles.StepCounter.Render(
 		fmt.Sprintf("Step %d of %d", currentStep+1, totalSteps),
@@ -1061,12 +1007,6 @@ func (w *Wizard) renderCurrentStep() string {
 		return w.renderStepWithTitle(w.domainStep)
 	case StateShowingSummary:
 		return w.summaryStep.View()
-	case StateGenerating:
-		return w.progress.View()
-	case StateComplete:
-		return w.renderComplete()
-	case StateError:
-		return w.renderError()
 	default:
 		return ""
 	}
@@ -1081,49 +1021,6 @@ func (w *Wizard) renderStepWithTitle(step steps.Step) string {
 	b.WriteString(w.styles.Description.Render(step.Description()))
 	b.WriteString("\n\n")
 	b.WriteString(step.View())
-
-	return b.String()
-}
-
-// renderComplete renders the completion message
-func (w *Wizard) renderComplete() string {
-	var b strings.Builder
-
-	b.WriteString(w.progress.View())
-	b.WriteString("\n\n")
-
-	successStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(components.Success)
-
-	b.WriteString(successStyle.Render("Project generated successfully!"))
-	b.WriteString("\n\n")
-
-	infoStyle := lipgloss.NewStyle().Foreground(components.Muted)
-	b.WriteString(infoStyle.Render("Next steps:"))
-	b.WriteString("\n")
-	b.WriteString(infoStyle.Render(fmt.Sprintf("  cd %s", w.config.ProjectName)))
-	b.WriteString("\n")
-	b.WriteString(infoStyle.Render("  go build ./..."))
-	b.WriteString("\n")
-
-	return b.String()
-}
-
-// renderError renders the error message
-func (w *Wizard) renderError() string {
-	var b strings.Builder
-
-	errorStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(components.Error)
-
-	b.WriteString(errorStyle.Render("Error generating project"))
-	b.WriteString("\n\n")
-
-	if w.err != nil {
-		b.WriteString(w.styles.Error.Render(w.err.Error()))
-	}
 
 	return b.String()
 }
@@ -1218,27 +1115,7 @@ func indexOf(slice []string, item string) int {
 	return -1
 }
 
-// startGeneration initiates the project generation
-func (w *Wizard) startGeneration() tea.Cmd {
-	return func() tea.Msg {
-		return StartGenerationMsg{Config: w.config}
-	}
-}
-
 // Config returns the current configuration
 func (w *Wizard) Config() *config.ProjectConfig {
 	return w.config
-}
-
-// StartGenerationMsg signals that generation should begin
-type StartGenerationMsg struct {
-	Config *config.ProjectConfig
-}
-
-// GenerationCompleteMsg signals that generation completed successfully
-type GenerationCompleteMsg struct{}
-
-// GenerationErrorMsg signals that generation failed
-type GenerationErrorMsg struct {
-	Error error
 }

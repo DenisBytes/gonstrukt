@@ -181,15 +181,18 @@ func main() {
 	})
 
 	// Apply middleware chain
-	// Order matters: tracing -> metrics -> logging -> recovery -> security -> auth -> rate limiting
+	// Order matters: tracing -> recovery -> metrics -> logging -> security -> auth -> rate limiting
+	// Recovery sits just inside tracing so it catches panics from all downstream middleware.
 	handler := middleware.Chain(
 		mux,
 {{- if .HasObservability}}
 		httpTracing.Middleware,    // Creates span context (outermost for full request timing)
+{{- end}}
+		middleware.Recovery(utils.Logger), // Recovers panics from all downstream middleware/handlers
+{{- if .HasObservability}}
 		httpMetrics.Middleware,    // Records RED metrics
 {{- end}}
 		middleware.Logging(utils.Logger), // Logs with trace correlation
-		middleware.Recovery(utils.Logger),
 		middleware.SecurityHeaders,
 		middleware.RequestValidation(),
 		authMiddleware,
@@ -248,6 +251,11 @@ func main() {
 {{- if .EnableMFA}}
 	// Close MFA rate limiter (waits for cleanup goroutine)
 	mfaRateLimiter.Close()
+{{- end}}
+
+{{- if .HasRateLimiter}}
+	// Stop the rate limiter cleanup goroutine
+	rateLimiter.Close()
 {{- end}}
 
 {{- if .HasCache}}

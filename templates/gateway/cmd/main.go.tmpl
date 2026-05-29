@@ -156,15 +156,18 @@ func main() {
 	}
 
 	// Apply middleware chain
-	// Order matters: tracing -> metrics -> logging -> recovery -> security -> rate limiting
+	// Order matters: tracing -> recovery -> metrics -> logging -> security -> rate limiting
+	// Recovery sits just inside tracing so it catches panics from all downstream middleware.
 	handler := middleware.Chain(
 		mux,
 {{- if .HasObservability}}
 		httpTracing.Middleware,    // Creates span context (outermost for full request timing)
+{{- end}}
+		middleware.Recovery(utils.Logger), // Recovers panics from all downstream middleware/handlers
+{{- if .HasObservability}}
 		httpMetrics.Middleware,    // Records RED metrics
 {{- end}}
 		middleware.Logging(utils.Logger), // Logs with trace correlation
-		middleware.Recovery(utils.Logger),
 		middleware.SecurityHeaders,
 		middleware.CORS(corsConfig),
 {{- if .HasRateLimiter}}
@@ -208,7 +211,7 @@ func main() {
 	utils.Info("shutting down server...")
 
 	// Graceful shutdown with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	// 1. Stop accepting new connections and wait for in-flight requests
@@ -216,15 +219,20 @@ func main() {
 		utils.Error("server shutdown error", zap.Error(err))
 	}
 
+{{- if .HasRateLimiter}}
+	// 2. Stop the rate limiter cleanup goroutine
+	rateLimiter.Close()
+{{- end}}
+
 {{- if .HasCache}}
-	// 2. Close cache connections
+	// 3. Close cache connections
 	if err := cacheClient.Close(shutdownCtx); err != nil {
 		utils.Error("cache close error", zap.Error(err))
 	}
 {{- end}}
 
 {{- if .HasObservability}}
-	// 3. Flush telemetry
+	// 4. Flush telemetry
 	if err := telemetryProvider.Shutdown(shutdownCtx); err != nil {
 		utils.Error("telemetry shutdown error", zap.Error(err))
 	}
