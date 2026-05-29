@@ -82,6 +82,16 @@ func (w *FileWriter) CopyStatic(sourcePath, destPath string) error {
 	return w.WriteFile(destPath, content)
 }
 
+// TemplateExists reports whether a template path is present in the embedded FS.
+func (w *FileWriter) TemplateExists(templatePath string) bool {
+	f, err := templates.FS.Open(templatePath)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 // EnsureDir creates a directory if it doesn't exist
 func (w *FileWriter) EnsureDir(relativePath string) error {
 	fullPath := filepath.Join(w.outputDir, relativePath)

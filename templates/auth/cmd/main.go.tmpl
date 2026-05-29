@@ -83,11 +83,19 @@ func main() {
 	httpTracing := telemetry.NewHTTPTracing("{{.ServiceName}}")
 {{- end}}
 
+{{- if .HasObservability}}
+	// Database observability: traces/metrics for queries and connections
+	dbObs, dbObsErr := telemetry.NewDBObservability("{{.ServiceName}}", "{{.Database}}")
+	if dbObsErr != nil {
+		utils.Fatal("failed to initialize database observability", zap.Error(dbObsErr))
+	}
+{{- end}}
+
 	// Initialize database
 {{- if eq .Database "postgres"}}
-	dbClient, err := db.NewPostgresClient(ctx, cfg.Database.URL)
+	dbClient, err := db.NewPostgresClient(ctx, cfg.Database.URL{{if .HasObservability}}, db.WithObservability(dbObs){{end}})
 {{- else if eq .Database "mysql"}}
-	dbClient, err := db.NewMySQLClient(cfg.Database.URL)
+	dbClient, err := db.NewMySQLClient(cfg.Database.URL{{if .HasObservability}}, db.WithObservability(dbObs){{end}})
 {{- end}}
 	if err != nil {
 		utils.Fatal("failed to connect to database", zap.Error(err))
@@ -111,16 +119,8 @@ func main() {
 		utils.Fatal("failed to initialize key manager", zap.Error(err))
 	}
 
-	// Initialize token blacklist for logout/revocation
-	tokenBlacklist := services.NewTokenBlacklist()
-
-{{- if .EnableMFA}}
-	// Initialize MFA rate limiter
-	mfaRateLimiter := services.InitMFARateLimiter()
-{{- end}}
-
 {{- if .HasCache}}
-	// Initialize cache (gateway feature)
+	// Initialize cache (gateway feature). Shared by the token blacklist below.
 {{- if eq .CacheType "redis"}}
 	cacheClient, cacheErr := cache.NewRedisCache(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if cacheErr != nil {
@@ -134,6 +134,28 @@ func main() {
 {{- else if eq .CacheType "memory"}}
 	cacheClient := cache.NewMemoryCache(cfg.Cache.MaxSize, cfg.Cache.TTL)
 {{- end}}
+{{- end}}
+
+	// Initialize token blacklist for logout/revocation
+{{- if .HasCache}}
+	// Cache-backed so revocations are visible across replicas.
+	tokenBlacklist := services.NewTokenBlacklist(services.WithBlacklistCache(cacheClient))
+{{- else}}
+	tokenBlacklist := services.NewTokenBlacklist()
+{{- end}}
+
+{{- if .EnableRBAC}}
+	// Initialize RBAC enforcer. Role checks read JWT role claims; the casbin model
+	// and policy seed live in rbac_model.conf / rbac_policy.csv.
+	rbacMiddleware, rbacErr := middleware.NewRBACMiddleware("rbac_model.conf", "rbac_policy.csv")
+	if rbacErr != nil {
+		utils.Fatal("failed to initialize RBAC", zap.Error(rbacErr))
+	}
+{{- end}}
+
+{{- if .EnableMFA}}
+	// Initialize MFA rate limiter
+	mfaRateLimiter := services.InitMFARateLimiter()
 {{- end}}
 
 {{- if .HasRateLimiter}}
@@ -157,6 +179,9 @@ func main() {
 		TokenTTL:       cfg.JWT.AccessTokenTTL,
 		RefreshTTL:     cfg.JWT.RefreshTokenTTL,
 		Issuer:         cfg.JWT.Issuer,
+{{- if .EnableRBAC}}
+		RBAC:           rbacMiddleware,
+{{- end}}
 	})
 
 	// Setup HTTP server

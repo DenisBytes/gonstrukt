@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"{{.ModuleName}}/internals/db"
+{{- if .EnableRBAC}}
+	"{{.ModuleName}}/internals/middleware"
+{{- end}}
 	"{{.ModuleName}}/internals/types"
 	"{{.ModuleName}}/internals/utils"
 
@@ -57,6 +60,9 @@ type AuthServiceConfig struct {
 	TokenTTL       time.Duration
 	RefreshTTL     time.Duration
 	Issuer         string
+{{- if .EnableRBAC}}
+	RBAC           *middleware.RBACMiddleware
+{{- end}}
 }
 
 // AuthService handles authentication operations
@@ -67,6 +73,9 @@ type AuthService struct {
 	tokenTTL       time.Duration
 	refreshTTL     time.Duration
 	issuer         string
+{{- if .EnableRBAC}}
+	rbac           *middleware.RBACMiddleware
+{{- end}}
 {{- if .EnableMFA}}
 	mfaPending     map[string]*mfaPendingLogin // mfa_token → pending login
 	mfaPendingMu   sync.Mutex
@@ -82,6 +91,9 @@ func NewAuthService(cfg AuthServiceConfig) *AuthService {
 		tokenTTL:       cfg.TokenTTL,
 		refreshTTL:     cfg.RefreshTTL,
 		issuer:         cfg.Issuer,
+{{- if .EnableRBAC}}
+		rbac:           cfg.RBAC,
+{{- end}}
 {{- if .EnableMFA}}
 		mfaPending:     make(map[string]*mfaPendingLogin),
 {{- end}}
@@ -140,6 +152,14 @@ func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
 {{- end}}
 
 {{- if .HasTenancy}}
+{{- if .EnableRBAC}}
+	// admin wraps a handler so only tenant admins/owners (per JWT role claims) may call it.
+	admin := func(h http.HandlerFunc) http.Handler { return s.rbac.RequireRole("admin", "owner")(h) }
+{{- else}}
+	// admin is an identity wrapper when RBAC is disabled.
+	admin := func(h http.HandlerFunc) http.Handler { return h }
+{{- end}}
+
 	// Workspace routes (tenant-less token)
 	mux.HandleFunc("GET /api/v1/auth/workspaces", s.handleGetWorkspaces)
 	mux.HandleFunc("POST /api/v1/auth/workspaces", s.handleCreateTenantForUser)
@@ -150,22 +170,22 @@ func (s *AuthService) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/invitations/{id}/accept", s.handleAcceptInvitation)
 	mux.HandleFunc("POST /api/v1/auth/invitations/{id}/decline", s.handleDeclineInvitation)
 
-	// Tenant management routes (tenant-scoped token)
+	// Tenant management routes (tenant-scoped token; mutations require admin/owner)
 	mux.HandleFunc("GET /api/v1/auth/tenant", s.handleGetCurrentTenant)
 	mux.HandleFunc("GET /api/v1/auth/tenant/{id}", s.handleGetTenant)
-	mux.HandleFunc("PUT /api/v1/auth/tenant", s.handleUpdateTenant)
-	mux.HandleFunc("DELETE /api/v1/auth/tenant", s.handleDeleteTenant)
+	mux.Handle("PUT /api/v1/auth/tenant", admin(s.handleUpdateTenant))
+	mux.Handle("DELETE /api/v1/auth/tenant", admin(s.handleDeleteTenant))
 
-	// Member management routes (tenant-scoped token)
+	// Member management routes (tenant-scoped token; mutations require admin/owner)
 	mux.HandleFunc("GET /api/v1/auth/tenant/members", s.handleGetMembers)
-	mux.HandleFunc("PUT /api/v1/auth/tenant/members/{user_id}/role", s.handleUpdateMemberRole)
-	mux.HandleFunc("DELETE /api/v1/auth/tenant/members/{user_id}", s.handleRemoveMember)
+	mux.Handle("PUT /api/v1/auth/tenant/members/{user_id}/role", admin(s.handleUpdateMemberRole))
+	mux.Handle("DELETE /api/v1/auth/tenant/members/{user_id}", admin(s.handleRemoveMember))
 
-	// Tenant invitation routes (tenant-scoped token)
+	// Tenant invitation routes (tenant-scoped token; mutations require admin/owner)
 	mux.HandleFunc("GET /api/v1/auth/tenant/invitations", s.handleGetTenantInvitations)
-	mux.HandleFunc("POST /api/v1/auth/tenant/invitations", s.handleCreateInvitations)
-	mux.HandleFunc("POST /api/v1/auth/tenant/invitations/{id}/resend", s.handleResendInvitation)
-	mux.HandleFunc("DELETE /api/v1/auth/tenant/invitations/{id}", s.handleRevokeInvitation)
+	mux.Handle("POST /api/v1/auth/tenant/invitations", admin(s.handleCreateInvitations))
+	mux.Handle("POST /api/v1/auth/tenant/invitations/{id}/resend", admin(s.handleResendInvitation))
+	mux.Handle("DELETE /api/v1/auth/tenant/invitations/{id}", admin(s.handleRevokeInvitation))
 {{- end}}
 
 	// User management routes

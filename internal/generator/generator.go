@@ -34,6 +34,19 @@ func NewGenerator(cfg *config.ProjectConfig) *Generator {
 	}
 }
 
+// writeOptional writes a template that may legitimately not exist for a given
+// configuration (e.g. an optional UI/state/test variant). A genuinely missing
+// template is reported as a visible warning and skipped, while a template that
+// exists but fails to parse or render is a real packaging bug and is returned as
+// an error rather than silently swallowed.
+func (g *Generator) writeOptional(writer *writers.FileWriter, templatePath, outputPath string) error {
+	if !writer.TemplateExists(templatePath) {
+		fmt.Fprintf(os.Stderr, "warning: skipping optional template %q (not found)\n", templatePath)
+		return nil
+	}
+	return writer.WriteTemplate(templatePath, outputPath)
+}
+
 // Generate generates the project
 func (g *Generator) Generate(ctx context.Context) error {
 	// Create output directory
@@ -157,6 +170,11 @@ func (g *Generator) generateGateway() error {
 		cacheFile := fmt.Sprintf("gateway/cache/%s.go.tmpl", *g.config.Cache)
 		if err := writer.WriteTemplate(cacheFile, fmt.Sprintf("internals/cache/%s.go", *g.config.Cache)); err != nil {
 			return err
+		}
+		if g.data.HasObservability {
+			if err := writer.WriteTemplate("gateway/cache/instrumented.go.tmpl", "internals/cache/instrumented.go"); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -498,9 +516,12 @@ func (g *Generator) generateAuth() error {
 		return err
 	}
 
-	// Copy rbac_model.conf if RBAC is enabled
+	// Copy casbin model + policy seed if RBAC is enabled (file-based enforcer)
 	if g.config.EnableRBAC {
 		if err := writer.CopyStatic("auth/rbac_model.conf", "rbac_model.conf"); err != nil {
+			return err
+		}
+		if err := writer.CopyStatic("auth/rbac_policy.csv", "rbac_policy.csv"); err != nil {
 			return err
 		}
 	}
@@ -698,7 +719,6 @@ func (g *Generator) generateDatabase(writer *writers.FileWriter) error {
 		{"005_data_processing_logs.sql", g.data.HasGDPRProcessingLogs},
 		{"006_email_verification.sql", g.data.HasEmail},
 		{"007_password_reset.sql", g.data.HasEmail},
-		{"008_casbin_rules.sql", g.data.EnableRBAC},
 		{"009_oauth.sql", g.data.HasOAuth},
 		{"010_tenants.sql", g.data.HasTenancy},
 	}
@@ -804,8 +824,8 @@ func (g *Generator) generateK8s() error {
 	if err := g.writer.WriteTemplate("k8s/ingress/ingress.yaml.tmpl", "k8s/ingress/ingress.yaml"); err != nil {
 		return err
 	}
-	if err := g.writer.WriteTemplate("k8s/ingress/tls-secret.yaml.tmpl", "k8s/ingress/tls-secret.yaml"); err != nil {
-		// Optional - created by setup.sh
+	if err := g.writeOptional(g.writer, "k8s/ingress/tls-secret.yaml.tmpl", "k8s/ingress/tls-secret.yaml"); err != nil {
+		return err
 	}
 
 	// Generate external services
@@ -866,8 +886,8 @@ func (g *Generator) generateK8s() error {
 		if err := g.writer.WriteTemplate("k8s/observability/prometheus/helmchart.yaml.tmpl", "k8s/observability/prometheus/helmchart.yaml"); err != nil {
 			return err
 		}
-		if err := g.writer.WriteTemplate("k8s/observability/prometheus/redis-servicemonitor.yaml.tmpl", "k8s/observability/prometheus/redis-servicemonitor.yaml"); err != nil {
-			// Optional - only useful when Redis is deployed
+		if err := g.writeOptional(g.writer, "k8s/observability/prometheus/redis-servicemonitor.yaml.tmpl", "k8s/observability/prometheus/redis-servicemonitor.yaml"); err != nil {
+			return err
 		}
 
 		// Fluent Bit
@@ -941,21 +961,21 @@ func (g *Generator) runGoFmtIn(dir string) error {
 // generateGatewayTests generates test files for gateway service
 func (g *Generator) generateGatewayTests(writer *writers.FileWriter) error {
 	// Generate service test helpers
-	if err := writer.WriteTemplate("gateway/services/testhelpers_test.go.tmpl", "internals/services/testhelpers_test.go"); err != nil {
-		// Test helpers might not exist yet
+	if err := g.writeOptional(writer, "gateway/services/testhelpers_test.go.tmpl", "internals/services/testhelpers_test.go"); err != nil {
+		return err
 	}
 
 	// Generate cache tests if cache is enabled
 	if g.config.Cache != nil {
-		if err := writer.WriteTemplate("gateway/cache/cache_test.go.tmpl", "internals/cache/cache_test.go"); err != nil {
-			// Cache tests might not exist
+		if err := g.writeOptional(writer, "gateway/cache/cache_test.go.tmpl", "internals/cache/cache_test.go"); err != nil {
+			return err
 		}
 	}
 
 	// Generate rate limiter tests if rate limiter is enabled
 	if g.config.RateLimiter != nil {
-		if err := writer.WriteTemplate("gateway/ratelimiter/ratelimiter_test.go.tmpl", "internals/ratelimiter/ratelimiter_test.go"); err != nil {
-			// Rate limiter tests might not exist
+		if err := g.writeOptional(writer, "gateway/ratelimiter/ratelimiter_test.go.tmpl", "internals/ratelimiter/ratelimiter_test.go"); err != nil {
+			return err
 		}
 	}
 
@@ -965,43 +985,43 @@ func (g *Generator) generateGatewayTests(writer *writers.FileWriter) error {
 // generateAuthTests generates test files for auth service
 func (g *Generator) generateAuthTests(writer *writers.FileWriter) error {
 	// Generate test helpers
-	if err := writer.WriteTemplate("auth/services/testhelpers_test.go.tmpl", "internals/services/testhelpers_test.go"); err != nil {
-		// Test helpers might not exist yet
+	if err := g.writeOptional(writer, "auth/services/testhelpers_test.go.tmpl", "internals/services/testhelpers_test.go"); err != nil {
+		return err
 	}
 
 	// Generate auth service unit tests
-	if err := writer.WriteTemplate("auth/services/auth_service_test.go.tmpl", "internals/services/auth_service_test.go"); err != nil {
-		// Tests might not exist
+	if err := g.writeOptional(writer, "auth/services/auth_service_test.go.tmpl", "internals/services/auth_service_test.go"); err != nil {
+		return err
 	}
 
 	// Generate handler tests
-	if err := writer.WriteTemplate("auth/services/handlers_test.go.tmpl", "internals/services/handlers_test.go"); err != nil {
-		// Tests might not exist
+	if err := g.writeOptional(writer, "auth/services/handlers_test.go.tmpl", "internals/services/handlers_test.go"); err != nil {
+		return err
 	}
 
 	// Generate integration tests
-	if err := writer.WriteTemplate("auth/services/integration_test.go.tmpl", "internals/services/integration_test.go"); err != nil {
-		// Tests might not exist
+	if err := g.writeOptional(writer, "auth/services/integration_test.go.tmpl", "internals/services/integration_test.go"); err != nil {
+		return err
 	}
 
 	// Generate cache tests if cache is enabled (optional gateway feature)
 	if g.config.Cache != nil {
-		if err := writer.WriteTemplate("gateway/cache/cache_test.go.tmpl", "internals/cache/cache_test.go"); err != nil {
-			// Cache tests might not exist
+		if err := g.writeOptional(writer, "gateway/cache/cache_test.go.tmpl", "internals/cache/cache_test.go"); err != nil {
+			return err
 		}
 	}
 
 	// Generate rate limiter tests if rate limiter is enabled (optional gateway feature)
 	if g.config.RateLimiter != nil {
-		if err := writer.WriteTemplate("gateway/ratelimiter/ratelimiter_test.go.tmpl", "internals/ratelimiter/ratelimiter_test.go"); err != nil {
-			// Rate limiter tests might not exist
+		if err := g.writeOptional(writer, "gateway/ratelimiter/ratelimiter_test.go.tmpl", "internals/ratelimiter/ratelimiter_test.go"); err != nil {
+			return err
 		}
 	}
 
 	// Generate database tests
 	if g.config.Database != nil {
 		if err := g.generateDatabaseTests(writer); err != nil {
-			// DB tests might not exist
+			return err
 		}
 	}
 
@@ -1012,13 +1032,9 @@ func (g *Generator) generateAuthTests(writer *writers.FileWriter) error {
 func (g *Generator) generateDatabaseTests(writer *writers.FileWriter) error {
 	dbType := string(*g.config.Database)
 
-	// Generate database test helpers
+	// Generate database test helpers (not all DB types ship a db_test.go template)
 	tmplFile := fmt.Sprintf("database/%s/db_test.go.tmpl", dbType)
-	if err := writer.WriteTemplate(tmplFile, "internals/db/db_test.go"); err != nil {
-		// DB tests might not exist for all DB types
-	}
-
-	return nil
+	return g.writeOptional(writer, tmplFile, "internals/db/db_test.go")
 }
 
 // generateFrontend generates frontend applications
@@ -1130,8 +1146,8 @@ func (g *Generator) generateWebFrontend(writer *writers.FileWriter) error {
 	}
 
 	for tmpl, out := range configFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Config file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1154,8 +1170,8 @@ func (g *Generator) generateWebFrontend(writer *writers.FileWriter) error {
 	}
 
 	for tmpl, out := range sharedFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Shared file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1223,8 +1239,8 @@ func (g *Generator) generateWebFrontend(writer *writers.FileWriter) error {
 	sourceFiles[frameworkPath+"/src/lib/utils.ts.tmpl"] = "src/lib/utils.ts"
 
 	for tmpl, out := range sourceFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Source file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1275,8 +1291,8 @@ func (g *Generator) generateWebTests(writer *writers.FileWriter, frameworkPath s
 	}
 
 	for tmpl, out := range testFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Test file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1286,8 +1302,8 @@ func (g *Generator) generateWebTests(writer *writers.FileWriter, frameworkPath s
 	}
 
 	for tmpl, out := range componentTests {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Test file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1321,8 +1337,8 @@ func (g *Generator) generateE2ETests(writer *writers.FileWriter, frameworkPath s
 		}
 
 		for tmpl, out := range cypressFiles {
-			if err := writer.WriteTemplate(tmpl, out); err != nil {
-				// E2E file might not exist, continue
+			if err := g.writeOptional(writer, tmpl, out); err != nil {
+				return err
 			}
 		}
 	}
@@ -1345,8 +1361,8 @@ func (g *Generator) generateE2ETests(writer *writers.FileWriter, frameworkPath s
 		}
 
 		for tmpl, out := range playwrightFiles {
-			if err := writer.WriteTemplate(tmpl, out); err != nil {
-				// E2E file might not exist, continue
+			if err := g.writeOptional(writer, tmpl, out); err != nil {
+				return err
 			}
 		}
 	}
@@ -1393,8 +1409,8 @@ func (g *Generator) generateMobileFrontend(writer *writers.FileWriter) error {
 	}
 
 	for tmpl, out := range configFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Config file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1417,8 +1433,8 @@ func (g *Generator) generateMobileFrontend(writer *writers.FileWriter) error {
 	}
 
 	for tmpl, out := range sharedFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Shared file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1455,8 +1471,8 @@ func (g *Generator) generateMobileTests(writer *writers.FileWriter) error {
 	}
 
 	for tmpl, out := range testFiles {
-		if err := writer.WriteTemplate(tmpl, out); err != nil {
-			// Test file might not exist, continue
+		if err := g.writeOptional(writer, tmpl, out); err != nil {
+			return err
 		}
 	}
 
@@ -1480,8 +1496,8 @@ func (g *Generator) generateStateManagement(writer *writers.FileWriter) error {
 		writer.EnsureDir("src/lib/providers")
 
 		for tmpl, out := range files {
-			if err := writer.WriteTemplate(tmpl, out); err != nil {
-				// File might not exist, continue
+			if err := g.writeOptional(writer, tmpl, out); err != nil {
+				return err
 			}
 		}
 
@@ -1497,8 +1513,8 @@ func (g *Generator) generateStateManagement(writer *writers.FileWriter) error {
 		writer.EnsureDir("src/lib/providers")
 
 		for tmpl, out := range files {
-			if err := writer.WriteTemplate(tmpl, out); err != nil {
-				// File might not exist, continue
+			if err := g.writeOptional(writer, tmpl, out); err != nil {
+				return err
 			}
 		}
 	}
@@ -1524,16 +1540,16 @@ func (g *Generator) generateUILibrary(writer *writers.FileWriter) error {
 			"frontend/ui/shadcn/components/ui/switch.tsx.tmpl":    "src/components/ui/switch.tsx",
 		}
 		for tmpl, out := range files {
-			if err := writer.WriteTemplate(tmpl, out); err != nil {
-				// File might not exist, continue
+			if err := g.writeOptional(writer, tmpl, out); err != nil {
+				return err
 			}
 		}
 
 	case config.UILibBaseUI:
 		// BaseUI doesn't need component files - uses npm package directly
 		// Just generate theme customization if needed
-		if err := writer.WriteTemplate("frontend/ui/baseui/lib/theme.ts.tmpl", "src/lib/theme.ts"); err != nil {
-			// File might not exist, continue
+		if err := g.writeOptional(writer, "frontend/ui/baseui/lib/theme.ts.tmpl", "src/lib/theme.ts"); err != nil {
+			return err
 		}
 	}
 

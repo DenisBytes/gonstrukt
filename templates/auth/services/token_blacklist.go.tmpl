@@ -6,6 +6,10 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+{{- if .HasCache}}
+
+	"{{.ModuleName}}/internals/cache"
+{{- end}}
 )
 
 // TokenBlacklist manages revoked tokens
@@ -15,14 +19,32 @@ type TokenBlacklist struct {
 	mu     sync.RWMutex
 	stopCh chan struct{}
 	doneCh chan struct{}
+{{- if .HasCache}}
+	cache  cache.Cache // optional shared cache for cross-replica revocation
+{{- end}}
 }
 
+// BlacklistOption configures a TokenBlacklist.
+type BlacklistOption func(*TokenBlacklist)
+
+{{- if .HasCache}}
+
+// WithBlacklistCache backs the blacklist with a shared cache so revocations are
+// visible across replicas. In-memory storage remains as a local fallback.
+func WithBlacklistCache(c cache.Cache) BlacklistOption {
+	return func(tb *TokenBlacklist) { tb.cache = c }
+}
+{{- end}}
+
 // NewTokenBlacklist creates a new token blacklist
-func NewTokenBlacklist() *TokenBlacklist {
+func NewTokenBlacklist(opts ...BlacklistOption) *TokenBlacklist {
 	tb := &TokenBlacklist{
 		tokens: make(map[string]time.Time),
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(tb)
 	}
 
 	// Start cleanup goroutine
@@ -31,15 +53,28 @@ func NewTokenBlacklist() *TokenBlacklist {
 	return tb
 }
 
+{{- if .HasCache}}
+
+// blacklistKey namespaces a token hash within the shared cache.
+func blacklistKey(hash string) string { return "blacklist:" + hash }
+{{- end}}
+
 // Blacklist adds a token to the blacklist until its expiration
 // ctx is accepted for interface compatibility with potential database-backed implementations
-func (tb *TokenBlacklist) Blacklist(_ context.Context, token string, expiresAt time.Time) error {
+func (tb *TokenBlacklist) Blacklist({{if .HasCache}}ctx{{else}}_{{end}} context.Context, token string, expiresAt time.Time) error {
 	// Don't blacklist already expired tokens
 	if time.Now().After(expiresAt) {
 		return nil
 	}
 
 	hash := hashToken(token)
+
+{{- if .HasCache}}
+	if tb.cache != nil {
+		// Store until the token would expire so the cache self-evicts.
+		return tb.cache.Set(ctx, blacklistKey(hash), []byte("1"), time.Until(expiresAt))
+	}
+{{- end}}
 
 	tb.mu.Lock()
 	tb.tokens[hash] = expiresAt
@@ -50,8 +85,17 @@ func (tb *TokenBlacklist) Blacklist(_ context.Context, token string, expiresAt t
 
 // IsBlacklisted checks if a token is blacklisted
 // ctx is accepted for interface compatibility with potential database-backed implementations
-func (tb *TokenBlacklist) IsBlacklisted(_ context.Context, token string) bool {
+func (tb *TokenBlacklist) IsBlacklisted({{if .HasCache}}ctx{{else}}_{{end}} context.Context, token string) bool {
 	hash := hashToken(token)
+
+{{- if .HasCache}}
+	if tb.cache != nil {
+		if ok, err := tb.cache.Exists(ctx, blacklistKey(hash)); err == nil {
+			return ok
+		}
+		// On cache error, fall through to the in-memory view.
+	}
+{{- end}}
 
 	tb.mu.RLock()
 	expiresAt, exists := tb.tokens[hash]

@@ -4,9 +4,16 @@ import (
 	"context"
 	"embed"
 	"fmt"
+{{- if .HasObservability}}
+	"strings"
+{{- end}}
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+{{- if .HasObservability}}
+
+	"{{.ModuleName}}/internals/telemetry"
+{{- end}}
 )
 
 //go:embed migrations/*.sql
@@ -17,8 +24,61 @@ type PostgresClient struct {
 	pool *pgxpool.Pool
 }
 
+type clientOptions struct {
+{{- if .HasObservability}}
+	obs *telemetry.DBObservability
+{{- end}}
+}
+
+// Option configures a PostgresClient.
+type Option func(*clientOptions)
+
+{{- if .HasObservability}}
+
+// WithObservability traces and records metrics for every query through the
+// shared DBObservability instance, with no per-query instrumentation needed.
+func WithObservability(obs *telemetry.DBObservability) Option {
+	return func(o *clientOptions) { o.obs = obs }
+}
+
+// queryTracer bridges pgx's query tracing hooks to DBObservability.
+type queryTracer struct {
+	obs *telemetry.DBObservability
+}
+
+type tracerDoneKey struct{}
+
+func (t *queryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	ctx, done := t.obs.TraceQuery(ctx, telemetry.QueryOptions{
+		Operation: sqlOperation(data.SQL),
+		Query:     data.SQL,
+	})
+	return context.WithValue(ctx, tracerDoneKey{}, done)
+}
+
+func (t *queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	if done, ok := ctx.Value(tracerDoneKey{}).(func(error)); ok {
+		done(data.Err)
+	}
+}
+
+// sqlOperation returns the leading SQL keyword (SELECT, INSERT, ...).
+func sqlOperation(sql string) string {
+	sql = strings.TrimSpace(sql)
+	if i := strings.IndexByte(sql, ' '); i > 0 {
+		return strings.ToUpper(sql[:i])
+	}
+	return strings.ToUpper(sql)
+}
+{{- end}}
+
 // NewPostgresClient creates a new PostgreSQL client
-func NewPostgresClient(ctx context.Context, connString string) (*PostgresClient, error) {
+func NewPostgresClient(ctx context.Context, connString string, opts ...Option) (*PostgresClient, error) {
+	var options clientOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	config, err := pgxpool.ParseConfig(connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse connection string: %w", err)
@@ -27,6 +87,12 @@ func NewPostgresClient(ctx context.Context, connString string) (*PostgresClient,
 	// Set connection pool settings
 	config.MaxConns = 25
 	config.MinConns = 5
+
+{{- if .HasObservability}}
+	if options.obs != nil {
+		config.ConnConfig.Tracer = &queryTracer{obs: options.obs}
+	}
+{{- end}}
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {

@@ -1,0 +1,9 @@
+p, owner, /*, *
+p, admin, /api/v1/auth/tenant, *
+p, admin, /api/v1/auth/tenant/members, *
+p, admin, /api/v1/auth/tenant/members/*, *
+p, admin, /api/v1/auth/tenant/invitations, *
+p, admin, /api/v1/auth/tenant/invitations/*, *
+p, member, /api/v1/auth/tenant, GET
+p, member, /api/v1/auth/tenant/members, GET
+g, owner, admin

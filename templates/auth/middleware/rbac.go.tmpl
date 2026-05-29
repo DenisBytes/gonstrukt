@@ -31,23 +31,6 @@ func NewRBACMiddleware(modelPath, policyPath string) (*RBACMiddleware, error) {
 	}, nil
 }
 
-// NewRBACMiddlewareWithAdapter creates RBAC middleware with a database adapter
-func NewRBACMiddlewareWithAdapter(modelPath string, adapter interface{}) (*RBACMiddleware, error) {
-	enforcer, err := casbin.NewEnforcer(modelPath, adapter)
-	if err != nil {
-		return nil, err
-	}
-
-	// Load policies from the adapter
-	if err := enforcer.LoadPolicy(); err != nil {
-		return nil, err
-	}
-
-	return &RBACMiddleware{
-		enforcer: enforcer,
-	}, nil
-}
-
 // RequirePermission creates middleware that requires a specific permission
 func (m *RBACMiddleware) RequirePermission(resource, action string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

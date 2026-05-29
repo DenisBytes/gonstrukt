@@ -10,6 +10,10 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+{{- if .HasObservability}}
+
+	"{{.ModuleName}}/internals/telemetry"
+{{- end}}
 )
 
 //go:embed migrations/*.sql
@@ -18,10 +22,36 @@ var migrationsFS embed.FS
 // MySQLClient implements the Database interface for MySQL
 type MySQLClient struct {
 	db *sql.DB
+{{- if .HasObservability}}
+	obs *telemetry.DBObservability
+{{- end}}
 }
 
+type clientOptions struct {
+{{- if .HasObservability}}
+	obs *telemetry.DBObservability
+{{- end}}
+}
+
+// Option configures a MySQLClient.
+type Option func(*clientOptions)
+
+{{- if .HasObservability}}
+
+// WithObservability records database connection metrics through the shared
+// DBObservability instance.
+func WithObservability(obs *telemetry.DBObservability) Option {
+	return func(o *clientOptions) { o.obs = obs }
+}
+{{- end}}
+
 // NewMySQLClient creates a new MySQL client
-func NewMySQLClient(connString string) (*MySQLClient, error) {
+func NewMySQLClient(connString string, opts ...Option) (*MySQLClient, error) {
+	var options clientOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	db, err := sql.Open("mysql", connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -38,7 +68,12 @@ func NewMySQLClient(connString string) (*MySQLClient, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &MySQLClient{db: db}, nil
+	client := &MySQLClient{db: db}
+{{- if .HasObservability}}
+	client.obs = options.obs
+	client.obs.ConnectionOpened(context.Background())
+{{- end}}
+	return client, nil
 }
 
 // Migrate runs database migrations
@@ -125,6 +160,9 @@ func (c *MySQLClient) Ping(ctx context.Context) error {
 
 // Close closes the database connection pool
 func (c *MySQLClient) Close(ctx context.Context) error {
+{{- if .HasObservability}}
+	c.obs.ConnectionClosed(ctx)
+{{- end}}
 	return c.db.Close()
 }
 

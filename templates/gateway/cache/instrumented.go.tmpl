@@ -1,0 +1,92 @@
+package cache
+
+import (
+	"context"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// InstrumentedCache wraps a Cache and emits an OpenTelemetry span for every
+// operation, so cache calls show up in distributed traces alongside the request
+// that triggered them.
+type InstrumentedCache struct {
+	inner  Cache
+	tracer trace.Tracer
+}
+
+// NewInstrumentedCache wraps c so every cache operation produces a span.
+func NewInstrumentedCache(c Cache) *InstrumentedCache {
+	return &InstrumentedCache{
+		inner:  c,
+		tracer: otel.Tracer("cache"),
+	}
+}
+
+func (c *InstrumentedCache) trace(ctx context.Context, op, key string) (context.Context, func(error)) {
+	ctx, span := c.tracer.Start(ctx, "cache."+op,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("cache.operation", op),
+			attribute.String("cache.key", key),
+		),
+	)
+	start := time.Now()
+	return ctx, func(err error) {
+		span.SetAttributes(attribute.Int64("cache.duration_us", time.Since(start).Microseconds()))
+		// A cache miss is an expected outcome, not an error to flag on the span.
+		if err != nil && !IsCacheMiss(err) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}
+}
+
+// Get retrieves a value from the cache.
+func (c *InstrumentedCache) Get(ctx context.Context, key string) ([]byte, error) {
+	ctx, done := c.trace(ctx, "get", key)
+	v, err := c.inner.Get(ctx, key)
+	done(err)
+	return v, err
+}
+
+// Set stores a value in the cache with optional TTL.
+func (c *InstrumentedCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	ctx, done := c.trace(ctx, "set", key)
+	err := c.inner.Set(ctx, key, value, ttl)
+	done(err)
+	return err
+}
+
+// Delete removes a value from the cache.
+func (c *InstrumentedCache) Delete(ctx context.Context, key string) error {
+	ctx, done := c.trace(ctx, "delete", key)
+	err := c.inner.Delete(ctx, key)
+	done(err)
+	return err
+}
+
+// Exists checks if a key exists in the cache.
+func (c *InstrumentedCache) Exists(ctx context.Context, key string) (bool, error) {
+	ctx, done := c.trace(ctx, "exists", key)
+	ok, err := c.inner.Exists(ctx, key)
+	done(err)
+	return ok, err
+}
+
+// Clear removes all entries from the cache.
+func (c *InstrumentedCache) Clear(ctx context.Context) error {
+	ctx, done := c.trace(ctx, "clear", "")
+	err := c.inner.Clear(ctx)
+	done(err)
+	return err
+}
+
+// Close closes the underlying cache connection.
+func (c *InstrumentedCache) Close(ctx context.Context) error {
+	return c.inner.Close(ctx)
+}

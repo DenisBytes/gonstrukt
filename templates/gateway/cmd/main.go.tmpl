@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -97,6 +98,10 @@ func main() {
 {{- else if eq .CacheType "memory"}}
 	cacheClient := cache.NewMemoryCache(cfg.Cache.MaxSize, cfg.Cache.TTL)
 {{- end}}
+{{- if .HasObservability}}
+	// Wrap the cache so every operation emits an OpenTelemetry span.
+	instrumentedCache := cache.NewInstrumentedCache(cacheClient)
+{{- end}}
 {{- end}}
 
 {{- if .HasRateLimiter}}
@@ -129,7 +134,11 @@ func main() {
 	gatewaySvc := services.NewGateway(services.GatewayConfig{
 		UpstreamServices: upstreamServices,
 {{- if .HasCache}}
+{{- if .HasObservability}}
+		Cache:            instrumentedCache,
+{{- else}}
 		Cache:            cacheClient,
+{{- end}}
 {{- end}}
 {{- if .HasRateLimiter}}
 		RateLimiter:      rateLimiter,
@@ -181,6 +190,8 @@ func main() {
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		IdleTimeout:  cfg.Server.IdleTimeout,
+		// Derive request contexts from the root context so shutdown cancellation propagates.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	// Configure TLS if enabled
