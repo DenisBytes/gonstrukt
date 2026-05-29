@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -357,138 +359,201 @@ func ExtractProjectName(moduleName string) string {
 	return path.Base(moduleName)
 }
 
-// Validate validates the project configuration
+// Validate is the single source of truth for configuration validity. It is used
+// by both the interactive wizard and the flag-driven command path. All violations
+// are collected and returned together via errors.Join so the caller can surface
+// every problem at once rather than one at a time.
 func (p *ProjectConfig) Validate() error {
-	if p.ModuleName == "" {
-		return fmt.Errorf("module name is required")
-	}
+	var errs []error
 
-	if !isValidModuleName(p.ModuleName) {
-		return fmt.Errorf("invalid module name format: %s", p.ModuleName)
+	// Required identity fields
+	if p.ModuleName == "" {
+		errs = append(errs, errors.New("module name is required"))
+	} else if !IsValidModuleName(p.ModuleName) {
+		errs = append(errs, fmt.Errorf("invalid module name format: %s", p.ModuleName))
 	}
 
 	if p.ServiceType == "" {
-		return fmt.Errorf("service type is required")
-	}
-
-	// Validate service type is a known value
-	switch p.ServiceType {
-	case ServiceGateway, ServiceAuth, ServiceBoth:
-		// valid
-	default:
-		return fmt.Errorf("invalid service type %q: must be one of %s", p.ServiceType, strings.Join(ValidServiceTypes(), ", "))
-	}
-
-	// Validate gateway requirements
-	if p.ServiceType == ServiceGateway || p.ServiceType == ServiceBoth {
-		if p.Cache == nil {
-			return fmt.Errorf("cache is required for gateway service")
-		}
-		if p.RateLimiter == nil {
-			return fmt.Errorf("rate limiter is required for gateway service")
-		}
-	}
-
-	// Validate auth requirements
-	if p.ServiceType == ServiceAuth || p.ServiceType == ServiceBoth {
-		if p.Database == nil {
-			return fmt.Errorf("database is required for auth service")
-		}
+		errs = append(errs, errors.New("service type is required"))
+	} else if !slices.Contains(ValidServiceTypes(), string(p.ServiceType)) {
+		errs = append(errs, fmt.Errorf("invalid service type %q, valid options: %s", p.ServiceType, strings.Join(ValidServiceTypes(), ", ")))
 	}
 
 	if p.ConfigSource == "" {
-		return fmt.Errorf("config source is required")
+		errs = append(errs, errors.New("config source is required"))
+	} else if !slices.Contains(ValidConfigSources(), string(p.ConfigSource)) {
+		errs = append(errs, fmt.Errorf("invalid config source %q, valid options: %s", p.ConfigSource, strings.Join(ValidConfigSources(), ", ")))
+	}
+
+	isGateway := p.ServiceType == ServiceGateway
+	isAuth := p.ServiceType == ServiceAuth
+	isBoth := p.ServiceType == ServiceBoth
+
+	// Gateway requirements
+	if isGateway || isBoth {
+		if p.Cache == nil {
+			errs = append(errs, errors.New("cache is required for gateway service"))
+		}
+		if p.RateLimiter == nil {
+			errs = append(errs, errors.New("rate limiter is required for gateway service"))
+		}
+	}
+	if p.Cache != nil && !slices.Contains(ValidCacheTypes(), string(*p.Cache)) {
+		errs = append(errs, fmt.Errorf("invalid cache type %q, valid options: %s", *p.Cache, strings.Join(ValidCacheTypes(), ", ")))
+	}
+	if p.RateLimiter != nil && !slices.Contains(ValidRateLimiterTypes(), string(*p.RateLimiter)) {
+		errs = append(errs, fmt.Errorf("invalid rate limiter %q, valid options: %s", *p.RateLimiter, strings.Join(ValidRateLimiterTypes(), ", ")))
+	}
+
+	// Auth requirements
+	if isAuth || isBoth {
+		if p.Database == nil {
+			errs = append(errs, errors.New("database is required for auth service"))
+		}
+	}
+	if p.Database != nil && !slices.Contains(ValidDatabaseTypes(), string(*p.Database)) {
+		errs = append(errs, fmt.Errorf("invalid database type %q, valid options: %s", *p.Database, strings.Join(ValidDatabaseTypes(), ", ")))
 	}
 
 	// AuthCache is only valid for gateway or both
-	if p.AuthCache && p.ServiceType == ServiceAuth {
-		return fmt.Errorf("auth cache is only available for gateway or both service types")
+	if p.AuthCache && isAuth {
+		errs = append(errs, errors.New("auth cache is only available for gateway or both service types"))
 	}
 
 	// Auth-specific features require auth or both service
-	if p.ServiceType == ServiceGateway {
+	if isGateway {
 		if len(p.OAuthProviders) > 0 {
-			return fmt.Errorf("OAuth providers require auth or both service type")
+			errs = append(errs, errors.New("OAuth providers require auth or both service type"))
 		}
 		if p.EnableMFA {
-			return fmt.Errorf("MFA requires auth or both service type")
+			errs = append(errs, errors.New("MFA requires auth or both service type"))
 		}
 		if p.EnableRBAC {
-			return fmt.Errorf("RBAC requires auth or both service type")
+			errs = append(errs, errors.New("RBAC requires auth or both service type"))
 		}
 		if len(p.GDPRFeatures) > 0 {
-			return fmt.Errorf("GDPR features require auth or both service type")
+			errs = append(errs, errors.New("GDPR features require auth or both service type"))
 		}
 	}
 
-	// Validate GDPR email requirement
+	for _, prov := range p.OAuthProviders {
+		if !slices.Contains(ValidOAuthProviders(), string(prov)) {
+			errs = append(errs, fmt.Errorf("invalid OAuth provider %q, valid options: %s", prov, strings.Join(ValidOAuthProviders(), ", ")))
+		}
+	}
+	for _, f := range p.GDPRFeatures {
+		if !slices.Contains(ValidGDPRFeatures(), string(f)) {
+			errs = append(errs, fmt.Errorf("invalid GDPR feature %q, valid options: %s", f, strings.Join(ValidGDPRFeatures(), ", ")))
+		}
+	}
+	if p.EmailService != nil && !slices.Contains(ValidEmailServices(), string(*p.EmailService)) {
+		errs = append(errs, fmt.Errorf("invalid email service %q, valid options: %s", *p.EmailService, strings.Join(ValidEmailServices(), ", ")))
+	}
 	if len(p.GDPRFeatures) > 0 && p.EmailService == nil {
-		return fmt.Errorf("email service is required when GDPR features are enabled")
+		errs = append(errs, errors.New("email service is required when GDPR features are enabled"))
 	}
 
 	// Tenancy requires auth or both service
-	if p.EnableTenancy && p.ServiceType == ServiceGateway {
-		return fmt.Errorf("tenancy requires auth or both service type")
+	if p.EnableTenancy && isGateway {
+		errs = append(errs, errors.New("tenancy requires auth or both service type"))
 	}
 
-	// K8s requires domain
+	// K8s requires a valid domain, and a domain without K8s is an orphan
 	if p.EnableK8s && p.Domain == "" {
-		return fmt.Errorf("domain is required when k8s dev environment is enabled")
+		errs = append(errs, errors.New("domain is required when k8s dev environment is enabled"))
 	}
-
-	// Validate domain format when provided
 	if p.Domain != "" {
 		if !isValidDomain(p.Domain) {
-			return fmt.Errorf("invalid domain format %q: must be a valid domain (e.g., myapp.dev)", p.Domain)
+			errs = append(errs, fmt.Errorf("invalid domain format %q: must be a valid domain (e.g., myapp.dev)", p.Domain))
 		}
-		// Domain without K8s is an orphan — likely a mistake
 		if !p.EnableK8s {
-			return fmt.Errorf("domain %q is set but k8s dev environment is not enabled; use --k8s to enable it", p.Domain)
+			errs = append(errs, fmt.Errorf("domain %q is set but k8s dev environment is not enabled", p.Domain))
 		}
 	}
 
-	// Validate frontend options
-	if len(p.Frontends) > 0 {
-		// Frontend is only allowed with auth or both services
+	errs = append(errs, p.validateFrontend()...)
+
+	return errors.Join(errs...)
+}
+
+// validateFrontend collects all frontend, analytics, and testing-related violations.
+func (p *ProjectConfig) validateFrontend() []error {
+	var errs []error
+	hasFrontend := len(p.Frontends) > 0
+
+	if hasFrontend {
 		if p.ServiceType == ServiceGateway {
-			return fmt.Errorf("frontend is only available for auth or both service types")
+			errs = append(errs, errors.New("frontend is only available for auth or both service types"))
 		}
 
-		// Check if web frontend is selected
 		hasWeb := false
 		for _, f := range p.Frontends {
+			if !slices.Contains(ValidFrontendTypes(), string(f)) {
+				errs = append(errs, fmt.Errorf("invalid frontend type %q, valid options: %s", f, strings.Join(ValidFrontendTypes(), ", ")))
+			}
 			if f == FrontendWeb {
 				hasWeb = true
-				break
 			}
 		}
 
-		// Web frontend requires web framework
-		if hasWeb && p.WebFramework == nil {
-			return fmt.Errorf("web framework is required for web frontend")
+		if hasWeb {
+			switch {
+			case p.WebFramework == nil:
+				errs = append(errs, errors.New("web framework is required for web frontend"))
+			case !slices.Contains(ValidWebFrameworks(), string(*p.WebFramework)):
+				errs = append(errs, fmt.Errorf("invalid web framework %q, valid options: %s", *p.WebFramework, strings.Join(ValidWebFrameworks(), ", ")))
+			case *p.WebFramework != FrameworkReact:
+				errs = append(errs, fmt.Errorf("web framework %q is not yet implemented, only %q is currently available", *p.WebFramework, FrameworkReact))
+			}
 		}
 
-		// Only React+Vite is currently implemented
-		if hasWeb && p.WebFramework != nil && *p.WebFramework != FrameworkReact {
-			return fmt.Errorf("web framework %q is not yet implemented, only %q is currently available", *p.WebFramework, FrameworkReact)
-		}
-
-		// UI library is required when frontend is selected
 		if p.UILibrary == nil {
-			return fmt.Errorf("UI library is required when frontend is selected")
+			errs = append(errs, errors.New("UI library is required when frontend is selected"))
+		} else if !slices.Contains(ValidUILibraries(), string(*p.UILibrary)) {
+			errs = append(errs, fmt.Errorf("invalid UI library %q, valid options: %s", *p.UILibrary, strings.Join(ValidUILibraries(), ", ")))
 		}
 
-		// State management is required when frontend is selected
 		if p.StateManagement == nil {
-			return fmt.Errorf("state management is required when frontend is selected")
+			errs = append(errs, errors.New("state management is required when frontend is selected"))
+		} else if !slices.Contains(ValidStateManagements(), string(*p.StateManagement)) {
+			errs = append(errs, fmt.Errorf("invalid state management %q, valid options: %s", *p.StateManagement, strings.Join(ValidStateManagements(), ", ")))
+		}
+	} else {
+		// Frontend-dependent flags set without any frontend are orphans
+		if p.WebFramework != nil {
+			errs = append(errs, errors.New("web framework requires a frontend to be selected"))
+		}
+		if p.UILibrary != nil {
+			errs = append(errs, errors.New("UI library requires a frontend to be selected"))
+		}
+		if p.StateManagement != nil {
+			errs = append(errs, errors.New("state management requires a frontend to be selected"))
+		}
+		if p.EnablePostHog {
+			errs = append(errs, errors.New("PostHog analytics requires a frontend to be selected"))
+		}
+		if p.EnableSentry {
+			errs = append(errs, errors.New("Sentry error tracking requires a frontend to be selected"))
 		}
 	}
 
-	return nil
+	if p.TestInfra != nil && !slices.Contains(ValidTestInfraTypes(), string(*p.TestInfra)) {
+		errs = append(errs, fmt.Errorf("invalid test infrastructure %q, valid options: %s", *p.TestInfra, strings.Join(ValidTestInfraTypes(), ", ")))
+	}
+	if p.E2EFramework != nil {
+		if !slices.Contains(ValidE2EFrameworkTypes(), string(*p.E2EFramework)) {
+			errs = append(errs, fmt.Errorf("invalid E2E framework %q, valid options: %s", *p.E2EFramework, strings.Join(ValidE2EFrameworkTypes(), ", ")))
+		}
+		if !hasFrontend {
+			errs = append(errs, errors.New("E2E framework requires a frontend to be selected"))
+		}
+	}
+
+	return errs
 }
 
-func isValidModuleName(name string) bool {
-	// Simple validation for Go module names
+// IsValidModuleName reports whether name is a syntactically valid Go module path.
+func IsValidModuleName(name string) bool {
 	pattern := `^[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*$`
 	matched, _ := regexp.MatchString(pattern, name)
 	return matched
@@ -779,37 +844,6 @@ func (t *TemplateData) ForAuth() *TemplateData {
 	copy := *t
 	copy.ServiceName = "auth_service"
 	return &copy
-}
-
-// DatabaseDriver returns the database driver import path
-func (t *TemplateData) DatabaseDriver() string {
-	switch t.Database {
-	case "postgres":
-		return "github.com/jackc/pgx/v5"
-	case "mysql":
-		return "github.com/go-sql-driver/mysql"
-	case "sqlite":
-		return "modernc.org/sqlite"
-	case "mongodb":
-		return "go.mongodb.org/mongo-driver/mongo"
-	case "arangodb":
-		return "github.com/arangodb/go-driver/v2"
-	default:
-		return ""
-	}
-}
-
-// CachePackage returns the cache package based on cache type
-func (t *TemplateData) CachePackage() string {
-	if t.Cache == nil {
-		return ""
-	}
-	switch *t.Cache {
-	case "redis", "valkey":
-		return "github.com/redis/go-redis/v9"
-	default:
-		return ""
-	}
 }
 
 // Title returns a title-cased string (helper for templates)
