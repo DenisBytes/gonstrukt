@@ -36,33 +36,10 @@ type DatabaseType string
 const (
 	DBPostgres DatabaseType = "postgres"
 	DBMySQL    DatabaseType = "mysql"
-	DBSQLite   DatabaseType = "sqlite"
-	DBMongoDB  DatabaseType = "mongodb"
-	DBArangoDB DatabaseType = "arangodb"
 )
 
 func (d DatabaseType) String() string {
 	return string(d)
-}
-
-// IsSQL returns true if the database is a SQL database
-func (d DatabaseType) IsSQL() bool {
-	switch d {
-	case DBPostgres, DBMySQL, DBSQLite:
-		return true
-	default:
-		return false
-	}
-}
-
-// IsNoSQL returns true if the database is a NoSQL database
-func (d DatabaseType) IsNoSQL() bool {
-	switch d {
-	case DBMongoDB, DBArangoDB:
-		return true
-	default:
-		return false
-	}
 }
 
 // ValidDatabaseTypes returns all valid database types
@@ -70,9 +47,6 @@ func ValidDatabaseTypes() []string {
 	return []string{
 		string(DBPostgres),
 		string(DBMySQL),
-		string(DBSQLite),
-		string(DBMongoDB),
-		string(DBArangoDB),
 	}
 }
 
@@ -538,7 +512,7 @@ type TemplateData struct {
 	ServiceName string // e.g., "gateway" or "auth_service"
 
 	// Feature selections
-	Database        string  // "postgres", "mysql", "sqlite", "mongodb", "arangodb"
+	Database        string  // "postgres", "mysql"
 	Cache           *string // nil, "redis", "valkey", "memory" (pointer for nil check)
 	CacheType       string  // "redis", "valkey", "memory" (direct string for templates)
 	Config          string  // "yaml", "env", "vault"
@@ -557,8 +531,6 @@ type TemplateData struct {
 	HasCache         bool
 	HasRateLimiter   bool
 	HasObservability bool
-	IsSQL            bool // postgres, mysql, sqlite
-	IsNoSQL          bool // mongodb, arangodb
 
 	// OAuth helpers
 	HasOAuth          bool
@@ -642,8 +614,6 @@ func NewTemplateData(cfg *ProjectConfig) *TemplateData {
 
 	if cfg.Database != nil {
 		data.Database = string(*cfg.Database)
-		data.IsSQL = cfg.Database.IsSQL()
-		data.IsNoSQL = cfg.Database.IsNoSQL()
 	}
 
 	if cfg.Cache != nil {

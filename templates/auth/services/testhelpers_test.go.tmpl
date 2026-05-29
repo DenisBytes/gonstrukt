@@ -110,17 +110,6 @@ func setupTestDB(ctx context.Context) (db.Database, error) {
 {{- else if eq .Database "mysql"}}
 	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "root:root@tcp(localhost:3306)/test_auth?parseTime=true")
 	return db.NewMySQLClient(dbURL)
-{{- else if eq .Database "sqlite"}}
-	dbPath := getEnvOrDefault("TEST_DATABASE_PATH", ":memory:")
-	return db.NewSQLiteClient(dbPath)
-{{- else if eq .Database "mongodb"}}
-	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "mongodb://localhost:27017")
-	dbName := getEnvOrDefault("TEST_DATABASE_NAME", "test_auth")
-	return db.NewMongoClient(ctx, dbURL, dbName)
-{{- else if eq .Database "arangodb"}}
-	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "http://localhost:8529")
-	dbName := getEnvOrDefault("TEST_DATABASE_NAME", "test_auth")
-	return db.NewArangoClient(ctx, dbURL, dbName)
 {{- end}}
 }
 

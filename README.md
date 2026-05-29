@@ -80,7 +80,6 @@ No Firebase. No Auth0 bills. No vendor lock-in. Just your code, your database, y
 ```bash
 -d postgres   # PostgreSQL (recommended)
 -d mysql      # MySQL
--d sqlite     # SQLite (dev/small projects)
 ```
 
 ### Caching & Rate Limiting

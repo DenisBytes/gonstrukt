@@ -118,8 +118,6 @@ Third-party auth services may seem easier, but they:
 - PostgreSQL 15+
 {{- else if eq .Database "mysql"}}
 - MySQL 8+
-{{- else if eq .Database "mongodb"}}
-- MongoDB 6+
 {{- end}}
 {{- if or (eq .CacheType "redis") (eq .CacheType "valkey")}}
 - Redis/Valkey
@@ -296,8 +294,6 @@ Copy the example below and fill in your values:
 DATABASE_URL=postgres://user:password@localhost:5432/{{.ProjectName}}?sslmode=disable
 {{- else if eq .Database "mysql"}}
 DATABASE_URL=user:password@tcp(localhost:3306)/{{.ProjectName}}?parseTime=true
-{{- else if eq .Database "sqlite"}}
-DATABASE_URL=./{{.ProjectName}}.db
 {{- end}}
 
 # JWT Keys

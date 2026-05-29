@@ -88,12 +88,6 @@ func main() {
 	dbClient, err := db.NewPostgresClient(ctx, cfg.Database.URL)
 {{- else if eq .Database "mysql"}}
 	dbClient, err := db.NewMySQLClient(cfg.Database.URL)
-{{- else if eq .Database "sqlite"}}
-	dbClient, err := db.NewSQLiteClient(cfg.Database.Path)
-{{- else if eq .Database "mongodb"}}
-	dbClient, err := db.NewMongoClient(ctx, cfg.Database.URL, cfg.Database.Name)
-{{- else if eq .Database "arangodb"}}
-	dbClient, err := db.NewArangoClient(ctx, cfg.Database.URL, cfg.Database.Name)
 {{- end}}
 	if err != nil {
 		utils.Fatal("failed to connect to database", zap.Error(err))

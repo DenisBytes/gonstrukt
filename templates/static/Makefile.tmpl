@@ -109,8 +109,8 @@ docker-run:
 	docker run -p 8080:8080 {{.ProjectName}}:latest
 {{- end}}
 
-# Database migrations (if using SQL database)
-{{- if .IsSQL}}
+# Database migrations (auth/both services only)
+{{- if or (eq .ServiceType "auth") (eq .ServiceType "both")}}
 migrate-up:
 {{- if eq .ServiceType "both"}}
 	migrate -path ./services/auth_service/migrations -database "$(DATABASE_URL)" up
@@ -157,7 +157,7 @@ help:
 	@echo "  make deps           - Download and tidy dependencies"
 	@echo "  make docker-build   - Build Docker image"
 	@echo "  make docker-run     - Run Docker container"
-{{- if .IsSQL}}
+{{- if or (eq .ServiceType "auth") (eq .ServiceType "both")}}
 	@echo "  make migrate-up     - Run database migrations"
 	@echo "  make migrate-down   - Rollback database migrations"
 	@echo "  make migrate-create - Create new migration"

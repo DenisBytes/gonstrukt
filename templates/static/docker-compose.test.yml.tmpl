@@ -65,17 +65,3 @@ services:
       timeout: 5s
       retries: 5
 {{- end}}
-
-{{- if eq .Database "mongodb"}}
-  mongodb:
-    image: mongo:7
-    ports:
-      - "27017"
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    tmpfs:
-      - /data/db
-{{- end}}

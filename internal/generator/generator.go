@@ -636,97 +636,79 @@ func (g *Generator) generateDatabase(writer *writers.FileWriter) error {
 		return err
 	}
 
-	// For SQL databases, also copy the specific repository files
-	if g.config.Database.IsSQL() {
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user.go.tmpl", dbType), "internals/db/user.go"); err != nil {
+	// Copy the database-specific repository files (postgres and mysql are both SQL)
+	if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user.go.tmpl", dbType), "internals/db/user.go"); err != nil {
+		return err
+	}
+	if err := writer.WriteTemplate(fmt.Sprintf("database/%s/session.go.tmpl", dbType), "internals/db/session.go"); err != nil {
+		return err
+	}
+	if err := writer.WriteTemplate(fmt.Sprintf("database/%s/consent.go.tmpl", dbType), "internals/db/consent.go"); err != nil {
+		return err
+	}
+	if err := writer.WriteTemplate(fmt.Sprintf("database/%s/mfa.go.tmpl", dbType), "internals/db/mfa.go"); err != nil {
+		return err
+	}
+	if g.data.HasGDPRProcessingLogs {
+		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/data_processing_log.go.tmpl", dbType), "internals/db/data_processing_log.go"); err != nil {
 			return err
 		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/session.go.tmpl", dbType), "internals/db/session.go"); err != nil {
-			return err
-		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/consent.go.tmpl", dbType), "internals/db/consent.go"); err != nil {
-			return err
-		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/mfa.go.tmpl", dbType), "internals/db/mfa.go"); err != nil {
-			return err
-		}
-		if g.data.HasGDPRProcessingLogs {
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/data_processing_log.go.tmpl", dbType), "internals/db/data_processing_log.go"); err != nil {
-				return err
-			}
-		}
+	}
 
-		// Generate tenancy database files if enabled
-		if g.config.EnableTenancy {
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/tenant.go.tmpl", dbType), "internals/db/tenant.go"); err != nil {
-				return err
-			}
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/invitation.go.tmpl", dbType), "internals/db/invitation.go"); err != nil {
-				return err
-			}
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user_tenant.go.tmpl", dbType), "internals/db/user_tenant.go"); err != nil {
-				return err
-			}
-		}
-
-		// Generate OAuth token database file if OAuth enabled
-		if g.data.HasOAuth {
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/oauth_token.go.tmpl", dbType), "internals/db/oauth_token.go"); err != nil {
-				return err
-			}
-		}
-
-		// Copy migrations
-		if err := writer.EnsureDir("internals/db/migrations"); err != nil {
+	// Generate tenancy database files if enabled
+	if g.config.EnableTenancy {
+		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/tenant.go.tmpl", dbType), "internals/db/tenant.go"); err != nil {
 			return err
 		}
+		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/invitation.go.tmpl", dbType), "internals/db/invitation.go"); err != nil {
+			return err
+		}
+		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user_tenant.go.tmpl", dbType), "internals/db/user_tenant.go"); err != nil {
+			return err
+		}
+	}
 
-		// Generate core migration files
-		migrations := []string{"001_users.sql", "002_sessions.sql", "003_consents.sql", "004_mfa.sql"}
-		for _, mig := range migrations {
-			tmplFile := fmt.Sprintf("database/%s/migrations/%s.tmpl", dbType, mig)
-			outFile := fmt.Sprintf("internals/db/migrations/%s", mig)
+	// Generate OAuth token database file if OAuth enabled
+	if g.data.HasOAuth {
+		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/oauth_token.go.tmpl", dbType), "internals/db/oauth_token.go"); err != nil {
+			return err
+		}
+	}
+
+	// Copy migrations
+	if err := writer.EnsureDir("internals/db/migrations"); err != nil {
+		return err
+	}
+
+	// Generate core migration files
+	migrations := []string{"001_users.sql", "002_sessions.sql", "003_consents.sql", "004_mfa.sql"}
+	for _, mig := range migrations {
+		tmplFile := fmt.Sprintf("database/%s/migrations/%s.tmpl", dbType, mig)
+		outFile := fmt.Sprintf("internals/db/migrations/%s", mig)
+		if err := writer.WriteTemplate(tmplFile, outFile); err != nil {
+			return err
+		}
+	}
+
+	// Generate GDPR-related migrations
+	gdprMigrations := []struct {
+		file      string
+		condition bool
+	}{
+		{"005_data_processing_logs.sql", g.data.HasGDPRProcessingLogs},
+		{"006_email_verification.sql", g.data.HasEmail},
+		{"007_password_reset.sql", g.data.HasEmail},
+		{"008_casbin_rules.sql", g.data.EnableRBAC},
+		{"009_oauth.sql", g.data.HasOAuth},
+		{"010_tenants.sql", g.data.HasTenancy},
+	}
+
+	for _, mig := range gdprMigrations {
+		if mig.condition {
+			tmplFile := fmt.Sprintf("database/%s/migrations/%s.tmpl", dbType, mig.file)
+			outFile := fmt.Sprintf("internals/db/migrations/%s", mig.file)
 			if err := writer.WriteTemplate(tmplFile, outFile); err != nil {
 				return err
-			}
-		}
-
-		// Generate GDPR-related migrations
-		gdprMigrations := []struct {
-			file      string
-			condition bool
-		}{
-			{"005_data_processing_logs.sql", g.data.HasGDPRProcessingLogs},
-			{"006_email_verification.sql", g.data.HasEmail},
-			{"007_password_reset.sql", g.data.HasEmail},
-			{"008_casbin_rules.sql", g.data.EnableRBAC},
-			{"009_oauth.sql", g.data.HasOAuth},
-			{"010_tenants.sql", g.data.HasTenancy},
-		}
-
-		for _, mig := range gdprMigrations {
-			if mig.condition {
-				tmplFile := fmt.Sprintf("database/%s/migrations/%s.tmpl", dbType, mig.file)
-				outFile := fmt.Sprintf("internals/db/migrations/%s", mig.file)
-				if err := writer.WriteTemplate(tmplFile, outFile); err != nil {
-					return err
-				}
-			}
-		}
-	} else {
-		// For non-SQL databases (MongoDB, ArangoDB), copy repository files
-		// These may genuinely not exist for all NoSQL implementations
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user.go.tmpl", dbType), "internals/db/user.go"); err != nil {
-			// NoSQL template might not exist
-		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/session.go.tmpl", dbType), "internals/db/session.go"); err != nil {
-		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/consent.go.tmpl", dbType), "internals/db/consent.go"); err != nil {
-		}
-		if err := writer.WriteTemplate(fmt.Sprintf("database/%s/mfa.go.tmpl", dbType), "internals/db/mfa.go"); err != nil {
-		}
-		if g.data.HasGDPRProcessingLogs {
-			if err := writer.WriteTemplate(fmt.Sprintf("database/%s/data_processing_log.go.tmpl", dbType), "internals/db/data_processing_log.go"); err != nil {
 			}
 		}
 	}

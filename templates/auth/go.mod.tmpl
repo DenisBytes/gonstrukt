@@ -33,15 +33,6 @@ require (
 {{- if eq .Database "mysql"}}
 	github.com/go-sql-driver/mysql v1.8.1
 {{- end}}
-{{- if eq .Database "sqlite"}}
-	modernc.org/sqlite v1.29.5
-{{- end}}
-{{- if eq .Database "mongodb"}}
-	go.mongodb.org/mongo-driver v1.14.0
-{{- end}}
-{{- if eq .Database "arangodb"}}
-	github.com/arangodb/go-driver/v2 v2.0.3
-{{- end}}
 {{- if or .HasGoogleOAuth .HasMicrosoftOAuth}}
 	golang.org/x/oauth2 v0.35.0
 {{- end}}

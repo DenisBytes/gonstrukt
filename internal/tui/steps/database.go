@@ -27,21 +27,6 @@ func NewDatabaseStep() *DatabaseStep {
 			Value:       string(config.DBMySQL),
 			Description: "Popular relational database with wide ecosystem support.",
 		},
-		{
-			Label:       "SQLite",
-			Value:       string(config.DBSQLite),
-			Description: "Lightweight, embedded database. Good for development/small apps.",
-		},
-		{
-			Label:       "MongoDB",
-			Value:       string(config.DBMongoDB),
-			Description: "Document database. Flexible schema, good for rapid development.",
-		},
-		{
-			Label:       "ArangoDB",
-			Value:       string(config.DBArangoDB),
-			Description: "Multi-model database. Graph, document, and key-value in one.",
-		},
 	}
 
 	return &DatabaseStep{

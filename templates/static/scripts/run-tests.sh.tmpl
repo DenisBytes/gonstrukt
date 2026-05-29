@@ -31,11 +31,6 @@ export TEST_DATABASE_URL="root:root@tcp(localhost:$MYSQL_PORT)/test_db?parseTime
 echo "  MySQL: localhost:$MYSQL_PORT"
 {{- end}}
 
-{{- if eq .Database "sqlite"}}
-export TEST_DATABASE_URL=":memory:"
-echo "  SQLite: in-memory"
-{{- end}}
-
 {{- if eq .CacheType "redis"}}
 REDIS_PORT=$(docker compose -f docker-compose.test.yml port redis 6379 | cut -d: -f2)
 export TEST_REDIS_ADDR="localhost:$REDIS_PORT"
@@ -48,11 +43,6 @@ export TEST_VALKEY_ADDR="localhost:$VALKEY_PORT"
 echo "  Valkey: localhost:$VALKEY_PORT"
 {{- end}}
 
-{{- if eq .Database "mongodb"}}
-MONGO_PORT=$(docker compose -f docker-compose.test.yml port mongodb 27017 | cut -d: -f2)
-export TEST_MONGODB_URL="mongodb://localhost:$MONGO_PORT"
-echo "  MongoDB: localhost:$MONGO_PORT"
-{{- end}}
 {{- end}}
 
 # Cleanup function

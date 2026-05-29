@@ -186,12 +186,6 @@ func formatDatabase(db config.DatabaseType) string {
 		return "PostgreSQL"
 	case config.DBMySQL:
 		return "MySQL"
-	case config.DBSQLite:
-		return "SQLite"
-	case config.DBMongoDB:
-		return "MongoDB"
-	case config.DBArangoDB:
-		return "ArangoDB"
 	default:
 		return string(db)
 	}

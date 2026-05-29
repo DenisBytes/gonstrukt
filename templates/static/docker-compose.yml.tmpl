@@ -41,9 +41,6 @@ services:
       - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
 {{- else if eq .Database "mysql"}}
       - DATABASE_URL=user:password@tcp(mysql:3306)/auth
-{{- else if eq .Database "mongodb"}}
-      - MONGODB_URL=mongodb://mongo:27017
-      - MONGODB_DATABASE=auth
 {{- end}}
 {{- if eq .Config "vault"}}
       - VAULT_ADDR=http://vault:8200
@@ -53,8 +50,6 @@ services:
       - postgres
 {{- else if eq .Database "mysql"}}
       - mysql
-{{- else if eq .Database "mongodb"}}
-      - mongo
 {{- end}}
     networks:
       - app-network
@@ -96,17 +91,12 @@ services:
       - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
 {{- else if eq .Database "mysql"}}
       - DATABASE_URL=user:password@tcp(mysql:3306)/auth
-{{- else if eq .Database "mongodb"}}
-      - MONGODB_URL=mongodb://mongo:27017
-      - MONGODB_DATABASE=auth
 {{- end}}
     depends_on:
 {{- if eq .Database "postgres"}}
       - postgres
 {{- else if eq .Database "mysql"}}
       - mysql
-{{- else if eq .Database "mongodb"}}
-      - mongo
 {{- end}}
     networks:
       - app-network
@@ -149,22 +139,6 @@ services:
       - app-network
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-{{- end}}
-
-{{- if eq .Database "mongodb"}}
-  mongo:
-    image: mongo:7
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo-data:/data/db
-    networks:
-      - app-network
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
       interval: 10s
       timeout: 5s
       retries: 5
@@ -227,9 +201,6 @@ volumes:
 {{- end}}
 {{- if eq .Database "mysql"}}
   mysql-data:
-{{- end}}
-{{- if eq .Database "mongodb"}}
-  mongo-data:
 {{- end}}
 {{- if eq .CacheType "redis"}}
   redis-data:
