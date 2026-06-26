@@ -30,9 +30,6 @@ require (
 {{- if eq .Database "postgres"}}
 	github.com/jackc/pgx/v5 v5.5.5
 {{- end}}
-{{- if eq .Database "mysql"}}
-	github.com/go-sql-driver/mysql v1.8.1
-{{- end}}
 {{- if or .HasGoogleOAuth .HasMicrosoftOAuth}}
 	golang.org/x/oauth2 v0.35.0
 {{- end}}

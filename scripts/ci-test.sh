@@ -35,16 +35,16 @@ case $CONFIG_NUM in
             -o "$TEST_DIR" -i=false
         ;;
     2)
-        echo "Config: auth + mysql + env + MFA"
+        echo "Config: auth + postgres + env + MFA"
         ./gonstrukt create github.com/test/config2 \
-            -s auth -d mysql -c env \
+            -s auth -d postgres -c env \
             --mfa \
             -o "$TEST_DIR" -i=false
         ;;
     3)
-        echo "Config: auth + sqlite + yaml + OAuth (google,apple)"
+        echo "Config: auth + postgres + yaml + OAuth (google,apple)"
         ./gonstrukt create github.com/test/config3 \
-            -s auth -d sqlite -c yaml \
+            -s auth -d postgres -c yaml \
             --oauth google,apple \
             -o "$TEST_DIR" -i=false
         ;;
@@ -53,7 +53,7 @@ case $CONFIG_NUM in
         ./gonstrukt create github.com/test/config4 \
             -s auth -d postgres -c vault \
             --gdpr consent,data-export,data-deletion,processing-logs \
-            --email-service ses \
+            --email ses \
             --rbac \
             -o "$TEST_DIR" -i=false
         ;;
@@ -91,10 +91,10 @@ case $CONFIG_NUM in
             -o "$TEST_DIR" -i=false
         ;;
     10)
-        echo "Config: both + mysql + valkey + sliding-window + env + MFA + GDPR consent"
+        echo "Config: both + postgres + valkey + sliding-window + env + MFA + GDPR consent"
         ./gonstrukt create github.com/test/config10 \
-            -s both -d mysql --cache valkey -r sliding-window -c env \
-            --mfa --gdpr consent --email-service smtp \
+            -s both -d postgres --cache valkey -r sliding-window -c env \
+            --mfa --gdpr consent --email smtp \
             -o "$TEST_DIR" -i=false
         ;;
     11)
@@ -144,11 +144,7 @@ if [ -f "docker-compose.test.yml" ]; then
         if docker compose -f docker-compose.test.yml port postgres 5432 2>/dev/null; then
             POSTGRES_PORT=$(docker compose -f docker-compose.test.yml port postgres 5432 | cut -d: -f2)
             export TEST_POSTGRES_DSN="postgres://postgres:postgres@localhost:${POSTGRES_PORT}/test_db?sslmode=disable"
-        fi
-
-        if docker compose -f docker-compose.test.yml port mysql 3306 2>/dev/null; then
-            MYSQL_PORT=$(docker compose -f docker-compose.test.yml port mysql 3306 | cut -d: -f2)
-            export TEST_DATABASE_URL="root:password@tcp(localhost:${MYSQL_PORT})/test_db?parseTime=true"
+            export TEST_DATABASE_URL="$TEST_POSTGRES_DSN"
         fi
 
         if docker compose -f docker-compose.test.yml port redis 6379 2>/dev/null; then

@@ -107,9 +107,6 @@ func setupTestDB(ctx context.Context) (db.Database, error) {
 {{- if eq .Database "postgres"}}
 	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/test_auth?sslmode=disable")
 	return db.NewPostgresClient(ctx, dbURL)
-{{- else if eq .Database "mysql"}}
-	dbURL := getEnvOrDefault("TEST_DATABASE_URL", "root:root@tcp(localhost:3306)/test_auth?parseTime=true")
-	return db.NewMySQLClient(dbURL)
 {{- end}}
 }
 

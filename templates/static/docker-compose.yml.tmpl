@@ -39,8 +39,6 @@ services:
       - LOG_LEVEL=info
 {{- if eq .Database "postgres"}}
       - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
-{{- else if eq .Database "mysql"}}
-      - DATABASE_URL=user:password@tcp(mysql:3306)/auth
 {{- end}}
 {{- if eq .Config "vault"}}
       - VAULT_ADDR=http://vault:8200
@@ -48,8 +46,6 @@ services:
     depends_on:
 {{- if eq .Database "postgres"}}
       - postgres
-{{- else if eq .Database "mysql"}}
-      - mysql
 {{- end}}
     networks:
       - app-network
@@ -89,14 +85,10 @@ services:
       - LOG_LEVEL=info
 {{- if eq .Database "postgres"}}
       - DATABASE_URL=postgres://user:password@postgres:5432/auth?sslmode=disable
-{{- else if eq .Database "mysql"}}
-      - DATABASE_URL=user:password@tcp(mysql:3306)/auth
 {{- end}}
     depends_on:
 {{- if eq .Database "postgres"}}
       - postgres
-{{- else if eq .Database "mysql"}}
-      - mysql
 {{- end}}
     networks:
       - app-network
@@ -118,27 +110,6 @@ services:
       - app-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d auth"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-{{- end}}
-
-{{- if eq .Database "mysql"}}
-  mysql:
-    image: mysql:8.0
-    environment:
-      - MYSQL_ROOT_PASSWORD=rootpassword
-      - MYSQL_USER=user
-      - MYSQL_PASSWORD=password
-      - MYSQL_DATABASE=auth
-    ports:
-      - "3306:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-    networks:
-      - app-network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -198,9 +169,6 @@ networks:
 volumes:
 {{- if eq .Database "postgres"}}
   postgres-data:
-{{- end}}
-{{- if eq .Database "mysql"}}
-  mysql-data:
 {{- end}}
 {{- if eq .CacheType "redis"}}
   redis-data:

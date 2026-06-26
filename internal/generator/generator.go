@@ -657,7 +657,7 @@ func (g *Generator) generateDatabase(writer *writers.FileWriter) error {
 		return err
 	}
 
-	// Copy the database-specific repository files (postgres and mysql are both SQL)
+	// Copy the database-specific repository files (postgres is SQL-based)
 	if err := writer.WriteTemplate(fmt.Sprintf("database/%s/user.go.tmpl", dbType), "internals/db/user.go"); err != nil {
 		return err
 	}

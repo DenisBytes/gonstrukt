@@ -78,8 +78,7 @@ No Firebase. No Auth0 bills. No vendor lock-in. Just your code, your database, y
 
 ### Databases
 ```bash
--d postgres   # PostgreSQL (recommended)
--d mysql      # MySQL
+-d postgres   # PostgreSQL
 ```
 
 ### Caching & Rate Limiting

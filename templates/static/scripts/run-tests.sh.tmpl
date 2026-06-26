@@ -25,12 +25,6 @@ export TEST_DATABASE_URL="postgres://postgres:postgres@localhost:$POSTGRES_PORT/
 echo "  PostgreSQL: localhost:$POSTGRES_PORT"
 {{- end}}
 
-{{- if eq .Database "mysql"}}
-MYSQL_PORT=$(docker compose -f docker-compose.test.yml port mysql 3306 | cut -d: -f2)
-export TEST_DATABASE_URL="root:root@tcp(localhost:$MYSQL_PORT)/test_db?parseTime=true"
-echo "  MySQL: localhost:$MYSQL_PORT"
-{{- end}}
-
 {{- if eq .CacheType "redis"}}
 REDIS_PORT=$(docker compose -f docker-compose.test.yml port redis 6379 | cut -d: -f2)
 export TEST_REDIS_ADDR="localhost:$REDIS_PORT"

@@ -94,8 +94,6 @@ func main() {
 	// Initialize database
 {{- if eq .Database "postgres"}}
 	dbClient, err := db.NewPostgresClient(ctx, cfg.Database.URL{{if .HasObservability}}, db.WithObservability(dbObs){{end}})
-{{- else if eq .Database "mysql"}}
-	dbClient, err := db.NewMySQLClient(cfg.Database.URL{{if .HasObservability}}, db.WithObservability(dbObs){{end}})
 {{- end}}
 	if err != nil {
 		utils.Fatal("failed to connect to database", zap.Error(err))

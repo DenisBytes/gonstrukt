@@ -116,8 +116,6 @@ Third-party auth services may seem easier, but they:
 - Docker and Docker Compose (for local development)
 {{- if eq .Database "postgres"}}
 - PostgreSQL 15+
-{{- else if eq .Database "mysql"}}
-- MySQL 8+
 {{- end}}
 {{- if or (eq .CacheType "redis") (eq .CacheType "valkey")}}
 - Redis/Valkey
@@ -292,8 +290,6 @@ Copy the example below and fill in your values:
 # TODO: Replace with your database connection string
 {{- if eq .Database "postgres"}}
 DATABASE_URL=postgres://user:password@localhost:5432/{{.ProjectName}}?sslmode=disable
-{{- else if eq .Database "mysql"}}
-DATABASE_URL=user:password@tcp(localhost:3306)/{{.ProjectName}}?parseTime=true
 {{- end}}
 
 # JWT Keys

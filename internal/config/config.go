@@ -37,7 +37,6 @@ type DatabaseType string
 
 const (
 	DBPostgres DatabaseType = "postgres"
-	DBMySQL    DatabaseType = "mysql"
 )
 
 func (d DatabaseType) String() string {
@@ -48,7 +47,6 @@ func (d DatabaseType) String() string {
 func ValidDatabaseTypes() []string {
 	return []string{
 		string(DBPostgres),
-		string(DBMySQL),
 	}
 }
 
@@ -577,7 +575,7 @@ type TemplateData struct {
 	ServiceName string // e.g., "gateway" or "auth_service"
 
 	// Feature selections
-	Database        string  // "postgres", "mysql"
+	Database        string  // "postgres"
 	Cache           *string // nil, "redis", "valkey", "memory" (pointer for nil check)
 	CacheType       string  // "redis", "valkey", "memory" (direct string for templates)
 	Config          string  // "yaml", "env", "vault"

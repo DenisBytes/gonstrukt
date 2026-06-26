@@ -237,8 +237,6 @@ func formatDatabase(db config.DatabaseType) string {
 	switch db {
 	case config.DBPostgres:
 		return "PostgreSQL"
-	case config.DBMySQL:
-		return "MySQL"
 	default:
 		return string(db)
 	}

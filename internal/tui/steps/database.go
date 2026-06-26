@@ -22,11 +22,6 @@ func NewDatabaseStep() *DatabaseStep {
 			Value:       string(config.DBPostgres),
 			Description: "Recommended for production. Full ACID compliance, JSONB support.",
 		},
-		{
-			Label:       "MySQL",
-			Value:       string(config.DBMySQL),
-			Description: "Popular relational database with wide ecosystem support.",
-		},
 	}
 
 	return &DatabaseStep{

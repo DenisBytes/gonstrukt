@@ -82,7 +82,7 @@ Examples:
 	}
 
 	cmd.Flags().StringVarP(&serviceTypeStr, "service", "s", "", "Service type (gateway, auth, both)")
-	cmd.Flags().StringVarP(&databaseStr, "database", "d", "", "Database type (postgres, mysql)")
+	cmd.Flags().StringVarP(&databaseStr, "database", "d", "", "Database type (postgres)")
 	cmd.Flags().StringVar(&cacheStr, "cache", "", "Cache type (redis, valkey, memory)")
 	cmd.Flags().StringVarP(&configStr, "config", "c", "", "Configuration source (yaml, env, vault)")
 	cmd.Flags().StringVarP(&rateLimiterStr, "rate-limiter", "r", "", "Rate limiting algorithm (token-bucket, sliding-window, leaky-bucket, fixed-window)")
