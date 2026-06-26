@@ -110,7 +110,7 @@ func (s *AuthService) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	tokens, err := s.RefreshTokens(r.Context(), req.RefreshToken)
 	if err != nil {
 		switch err {
-		case ErrSessionNotFound, ErrTokenExpired:
+		case ErrSessionNotFound, ErrTokenExpired, ErrTokenReused:
 			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to refresh tokens")

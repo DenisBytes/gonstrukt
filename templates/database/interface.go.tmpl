@@ -29,6 +29,14 @@ type Database interface {
 	GetSessionByID(ctx context.Context, id string) (*types.Session, error)
 	GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error)
 	GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error)
+	// ConsumeSessionByRefreshToken atomically marks a session spent and returns it,
+	// or an error if the token is unknown or already consumed (refresh rotation).
+	ConsumeSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error)
+	// GetTokenFamilyByConsumedRefreshToken returns the token family of an
+	// already-consumed refresh token (reuse detection).
+	GetTokenFamilyByConsumedRefreshToken(ctx context.Context, token string) (string, error)
+	// DeleteSessionsByTokenFamily revokes every session in a compromised family.
+	DeleteSessionsByTokenFamily(ctx context.Context, tokenFamily string) error
 	DeleteSession(ctx context.Context, id string) error
 	DeleteUserSessions(ctx context.Context, userID string) error
 

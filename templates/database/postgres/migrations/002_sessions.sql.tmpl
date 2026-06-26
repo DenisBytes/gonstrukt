@@ -3,13 +3,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     refresh_token VARCHAR(255) UNIQUE NOT NULL,
+    -- token_family groups all refresh tokens issued from a single login so a
+    -- replayed (already-rotated) token can invalidate the whole chain.
+    token_family UUID NOT NULL,
     user_agent TEXT,
     ip VARCHAR(45),
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    -- consumed_at marks a refresh token as spent (set atomically on rotation);
+    -- consumed rows are kept briefly for reuse detection, then cleaned up.
+    consumed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_refresh_token ON sessions(refresh_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_token_family ON sessions(token_family);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);

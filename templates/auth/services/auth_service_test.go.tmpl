@@ -251,6 +251,39 @@ func TestAuthService_RefreshTokens(t *testing.T) {
 	}
 }
 
+func TestAuthService_RefreshTokens_ReuseDetection(t *testing.T) {
+	t.Cleanup(func() {
+		cleanupUsers(t)
+		cleanupSessions(t)
+	})
+
+	email := "reuse@test.com"
+	password := "password123"
+	createTestUser(t, email, password)
+	tokens := loginTestUser(t, email, password)
+
+	svc := mustGetTestAuthService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First rotation succeeds and yields a fresh token in the same family.
+	rotated, err := svc.RefreshTokens(ctx, tokens.RefreshToken)
+	if err != nil {
+		t.Fatalf("RefreshTokens() first rotation error: %v", err)
+	}
+
+	// Replaying the now-consumed token is reuse: it must be rejected and must
+	// revoke the entire family (including the freshly rotated token).
+	if _, err := svc.RefreshTokens(ctx, tokens.RefreshToken); err != ErrTokenReused {
+		t.Errorf("RefreshTokens() replay error = %v, want %v", err, ErrTokenReused)
+	}
+
+	// The rotated token shares the revoked family, so it is no longer usable.
+	if _, err := svc.RefreshTokens(ctx, rotated.RefreshToken); err != ErrSessionNotFound {
+		t.Errorf("RefreshTokens() post-revocation error = %v, want %v", err, ErrSessionNotFound)
+	}
+}
+
 func TestAuthService_Logout(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupUsers(t)

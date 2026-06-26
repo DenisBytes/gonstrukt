@@ -34,6 +34,7 @@ var (
 	ErrTokenInvalid       = errors.New("token invalid")
 	ErrTokenBlacklisted   = errors.New("token has been revoked")
 	ErrSessionNotFound    = errors.New("session not found")
+	ErrTokenReused        = errors.New("refresh token reuse detected")
 	ErrMFARequired        = errors.New("mfa verification required")
 	ErrInvalidMFACode     = errors.New("invalid mfa code")
 	ErrConsentRequired    = errors.New("consent required")
@@ -272,12 +273,18 @@ func (s *AuthService) Login(ctx context.Context, req *types.LoginRequest) (*type
 		zap.String("email", user.Email))
 
 	// Generate tokens
-	return s.generateTokens(ctx, user)
+	return s.generateTokens(ctx, user, "")
 }
 
 // generateTokens creates access and refresh tokens
-func (s *AuthService) generateTokens(ctx context.Context, user *types.User) (*types.TokenResponse, error) {
+func (s *AuthService) generateTokens(ctx context.Context, user *types.User, tokenFamily string) (*types.TokenResponse, error) {
 	now := time.Now()
+
+	// A login starts a new token family; a refresh keeps the existing one so a
+	// replayed (already-rotated) refresh token can invalidate the whole chain.
+	if tokenFamily == "" {
+		tokenFamily = uuid.New().String()
+	}
 
 	// Generate session ID first so we can include it in the access token
 	sessionID := uuid.New().String()
@@ -299,6 +306,7 @@ func (s *AuthService) generateTokens(ctx context.Context, user *types.User) (*ty
 		ID:           sessionID,
 		UserID:       user.ID,
 		RefreshToken: refreshToken,
+		TokenFamily:  tokenFamily,
 		ExpiresAt:    now.Add(s.refreshTTL),
 		CreatedAt:    now,
 	}
@@ -315,20 +323,34 @@ func (s *AuthService) generateTokens(ctx context.Context, user *types.User) (*ty
 	}, nil
 }
 
-// RefreshTokens refreshes the access token using a refresh token
+// RefreshTokens rotates the refresh token. It atomically consumes the presented
+// token so concurrent refreshes can't both succeed; replaying an already-consumed
+// token is treated as a compromise and revokes the entire token family.
 func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (*types.TokenResponse, error) {
-	// Get session by refresh token
-	session, err := s.db.GetSessionByRefreshToken(ctx, refreshToken)
+	// Atomically mark the session spent. Only one caller can win this race.
+	session, err := s.db.ConsumeSessionByRefreshToken(ctx, refreshToken)
 	if err != nil {
+		// The token is unknown or was already consumed. If it was consumed, this
+		// is a replay of a rotated token: revoke the whole family as a precaution.
+		if family, ferr := s.db.GetTokenFamilyByConsumedRefreshToken(ctx, refreshToken); ferr == nil && family != "" {
+			if derr := s.db.DeleteSessionsByTokenFamily(ctx, family); derr != nil {
+				utils.Warn("failed to revoke token family on reuse",
+					zap.String("token_family", family),
+					zap.Error(derr))
+			}
+			utils.Warn("refresh token reuse detected; token family revoked",
+				zap.String("token_family", family))
+			return nil, ErrTokenReused
+		}
 		return nil, ErrSessionNotFound
 	}
 
-	// Check if session is expired
+	// Reject (and discard) an expired-but-unconsumed session.
 	if time.Now().After(session.ExpiresAt) {
-		if err := s.db.DeleteSession(ctx, session.ID); err != nil {
+		if derr := s.db.DeleteSession(ctx, session.ID); derr != nil {
 			utils.Warn("failed to delete expired session",
 				zap.String("session_id", session.ID),
-				zap.Error(err))
+				zap.Error(derr))
 		}
 		return nil, ErrTokenExpired
 	}
@@ -339,15 +361,8 @@ func (s *AuthService) RefreshTokens(ctx context.Context, refreshToken string) (*
 		return nil, ErrUserNotFound
 	}
 
-	// Delete old session (token rotation)
-	if err := s.db.DeleteSession(ctx, session.ID); err != nil {
-		utils.Warn("failed to delete old session during refresh",
-			zap.String("session_id", session.ID),
-			zap.Error(err))
-	}
-
-	// Generate new tokens
-	return s.generateTokens(ctx, user)
+	// Issue new tokens within the same family (rotation).
+	return s.generateTokens(ctx, user, session.TokenFamily)
 }
 
 // Logout invalidates the session
@@ -474,7 +489,7 @@ func (s *AuthService) VerifyMFALogin(ctx context.Context, mfaToken, code string)
 		zap.String("user_id", user.ID),
 		zap.String("email", user.Email))
 
-	return s.generateTokens(ctx, user)
+	return s.generateTokens(ctx, user, "")
 }
 
 // cleanupMFAPending periodically removes expired MFA pending tokens.

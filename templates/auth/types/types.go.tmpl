@@ -30,6 +30,9 @@ type Session struct {
 	ID           string    `json:"id"`
 	UserID       string    `json:"user_id"`
 	RefreshToken string    `json:"-"`
+	// TokenFamily groups every refresh token derived from one login. On refresh
+	// reuse (a consumed token replayed), the whole family is invalidated.
+	TokenFamily  string    `json:"-"`
 	UserAgent    string    `json:"user_agent,omitempty"`
 	IP           string    `json:"ip,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`

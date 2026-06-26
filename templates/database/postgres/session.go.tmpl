@@ -9,15 +9,35 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// sessionColumns is the canonical column list/order for session scans.
+const sessionColumns = "id, user_id, refresh_token, token_family, user_agent, ip, expires_at, created_at"
+
+// scanSession scans one session row in sessionColumns order.
+func scanSession(scan func(dest ...any) error) (*types.Session, error) {
+	session := &types.Session{}
+	err := scan(
+		&session.ID,
+		&session.UserID,
+		&session.RefreshToken,
+		&session.TokenFamily,
+		&session.UserAgent,
+		&session.IP,
+		&session.ExpiresAt,
+		&session.CreatedAt,
+	)
+	return session, err
+}
+
 // CreateSession creates a new session
 func (c *PostgresClient) CreateSession(ctx context.Context, session *types.Session) error {
 	_, err := c.pool.Exec(ctx, `
-		INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO sessions (id, user_id, refresh_token, token_family, user_agent, ip, expires_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`,
 		session.ID,
 		session.UserID,
 		session.RefreshToken,
+		session.TokenFamily,
 		session.UserAgent,
 		session.IP,
 		session.ExpiresAt,
@@ -26,22 +46,13 @@ func (c *PostgresClient) CreateSession(ctx context.Context, session *types.Sessi
 	return err
 }
 
-// GetSessionByID retrieves a session by ID
+// GetSessionByID retrieves an active (unconsumed) session by ID
 func (c *PostgresClient) GetSessionByID(ctx context.Context, id string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.pool.QueryRow(ctx, `
-		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+	session, err := scanSession(c.pool.QueryRow(ctx, `
+		SELECT `+sessionColumns+`
 		FROM sessions
-		WHERE id = $1
-	`, id).Scan(
-		&session.ID,
-		&session.UserID,
-		&session.RefreshToken,
-		&session.UserAgent,
-		&session.IP,
-		&session.ExpiresAt,
-		&session.CreatedAt,
-	)
+		WHERE id = $1 AND consumed_at IS NULL
+	`, id).Scan)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errors.New("session not found")
@@ -53,22 +64,13 @@ func (c *PostgresClient) GetSessionByID(ctx context.Context, id string) (*types.
 	return session, nil
 }
 
-// GetSessionByRefreshToken retrieves a session by refresh token
+// GetSessionByRefreshToken retrieves an active (unconsumed) session by refresh token
 func (c *PostgresClient) GetSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
-	session := &types.Session{}
-	err := c.pool.QueryRow(ctx, `
-		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+	session, err := scanSession(c.pool.QueryRow(ctx, `
+		SELECT `+sessionColumns+`
 		FROM sessions
-		WHERE refresh_token = $1
-	`, token).Scan(
-		&session.ID,
-		&session.UserID,
-		&session.RefreshToken,
-		&session.UserAgent,
-		&session.IP,
-		&session.ExpiresAt,
-		&session.CreatedAt,
-	)
+		WHERE refresh_token = $1 AND consumed_at IS NULL
+	`, token).Scan)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errors.New("session not found")
@@ -80,12 +82,12 @@ func (c *PostgresClient) GetSessionByRefreshToken(ctx context.Context, token str
 	return session, nil
 }
 
-// GetUserSessions retrieves all sessions for a user
+// GetUserSessions retrieves all active (unconsumed) sessions for a user
 func (c *PostgresClient) GetUserSessions(ctx context.Context, userID string) ([]*types.Session, error) {
 	rows, err := c.pool.Query(ctx, `
-		SELECT id, user_id, refresh_token, user_agent, ip, expires_at, created_at
+		SELECT `+sessionColumns+`
 		FROM sessions
-		WHERE user_id = $1
+		WHERE user_id = $1 AND consumed_at IS NULL
 		ORDER BY created_at DESC
 	`, userID)
 	if err != nil {
@@ -95,22 +97,58 @@ func (c *PostgresClient) GetUserSessions(ctx context.Context, userID string) ([]
 
 	var sessions []*types.Session
 	for rows.Next() {
-		session := &types.Session{}
-		if err := rows.Scan(
-			&session.ID,
-			&session.UserID,
-			&session.RefreshToken,
-			&session.UserAgent,
-			&session.IP,
-			&session.ExpiresAt,
-			&session.CreatedAt,
-		); err != nil {
+		session, err := scanSession(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, session)
 	}
 
 	return sessions, rows.Err()
+}
+
+// ConsumeSessionByRefreshToken atomically marks a session as consumed by its
+// refresh token and returns the consumed session. The single UPDATE ... WHERE
+// consumed_at IS NULL guarantees only one concurrent refresh wins (no TOCTOU);
+// a replay of an already-consumed token returns "session not found".
+func (c *PostgresClient) ConsumeSessionByRefreshToken(ctx context.Context, token string) (*types.Session, error) {
+	session, err := scanSession(c.pool.QueryRow(ctx, `
+		UPDATE sessions
+		SET consumed_at = NOW()
+		WHERE refresh_token = $1 AND consumed_at IS NULL
+		RETURNING `+sessionColumns+`
+	`, token).Scan)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errors.New("session not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return session, nil
+}
+
+// GetTokenFamilyByConsumedRefreshToken returns the token family of an
+// already-consumed refresh token, used to detect refresh-token reuse.
+func (c *PostgresClient) GetTokenFamilyByConsumedRefreshToken(ctx context.Context, token string) (string, error) {
+	var family string
+	err := c.pool.QueryRow(ctx, `
+		SELECT token_family FROM sessions
+		WHERE refresh_token = $1 AND consumed_at IS NOT NULL
+		LIMIT 1
+	`, token).Scan(&family)
+	if err != nil {
+		return "", err
+	}
+	return family, nil
+}
+
+// DeleteSessionsByTokenFamily revokes every session (active and consumed) in a
+// token family — used when a compromised refresh token is replayed.
+func (c *PostgresClient) DeleteSessionsByTokenFamily(ctx context.Context, tokenFamily string) error {
+	_, err := c.pool.Exec(ctx, `DELETE FROM sessions WHERE token_family = $1`, tokenFamily)
+	return err
 }
 
 // DeleteSession deletes a session
@@ -125,9 +163,14 @@ func (c *PostgresClient) DeleteUserSessions(ctx context.Context, userID string) 
 	return err
 }
 
-// DeleteExpiredSessions deletes all expired sessions
+// DeleteExpiredSessions deletes expired sessions plus consumed sessions older
+// than one hour (consumed rows are retained briefly for reuse detection).
 func (c *PostgresClient) DeleteExpiredSessions(ctx context.Context) (int64, error) {
-	result, err := c.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < NOW()`)
+	result, err := c.pool.Exec(ctx, `
+		DELETE FROM sessions
+		WHERE expires_at < NOW()
+		   OR (consumed_at IS NOT NULL AND consumed_at < NOW() - INTERVAL '1 hour')
+	`)
 	if err != nil {
 		return 0, err
 	}
