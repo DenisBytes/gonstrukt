@@ -39,6 +39,7 @@ func CreateCmd() *cobra.Command {
 		enableTenancy     bool
 		enableK8s         bool
 		domainStr         string
+		outputDir         string
 	)
 
 	cmd := &cobra.Command{
@@ -77,7 +78,7 @@ Examples:
 			}
 
 			// Non-interactive mode - validate and run
-			return runNonInteractive(cmd, args, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityBool, oauthProviders, enableMFA, enableRBAC, gdprFeatures, emailServiceStr, authCache, frontends, webFrameworkStr, uiLibraryStr, stateMgmtStr, enablePostHog, enableSentry, testInfraStr, e2eFrameworkStr, enableTenancy, enableK8s, domainStr)
+			return runNonInteractive(cmd, args, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr, observabilityBool, oauthProviders, enableMFA, enableRBAC, gdprFeatures, emailServiceStr, authCache, frontends, webFrameworkStr, uiLibraryStr, stateMgmtStr, enablePostHog, enableSentry, testInfraStr, e2eFrameworkStr, enableTenancy, enableK8s, domainStr, outputDir)
 		},
 	}
 
@@ -105,6 +106,7 @@ Examples:
 	cmd.Flags().BoolVar(&enableTenancy, "tenancy", false, "Enable auth-first multi-tenancy")
 	cmd.Flags().BoolVar(&enableK8s, "k8s", false, "Generate k3s-based local dev environment")
 	cmd.Flags().StringVar(&domainStr, "domain", "", "Local dev domain for k8s (e.g., myapp.dev)")
+	cmd.Flags().StringVarP(&outputDir, "output", "O", "", "Output directory (default: project name)")
 
 	cmd.RegisterFlagCompletionFunc("service", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return config.ValidServiceTypes(), cobra.ShellCompDirectiveNoFileComp
@@ -155,7 +157,7 @@ Examples:
 
 // hasAnyFlag checks if any relevant flags were set
 func hasAnyFlag(cmd *cobra.Command) bool {
-	flags := []string{"service", "database", "cache", "config", "rate-limiter", "frontend", "web-framework", "ui-lib", "state-mgmt", "oauth", "mfa", "rbac", "gdpr", "email", "auth-cache", "observability", "posthog", "sentry", "test-infra", "e2e-framework", "tenancy", "k8s", "domain"}
+	flags := []string{"service", "database", "cache", "config", "rate-limiter", "frontend", "web-framework", "ui-lib", "state-mgmt", "oauth", "mfa", "rbac", "gdpr", "email", "auth-cache", "observability", "posthog", "sentry", "test-infra", "e2e-framework", "tenancy", "k8s", "domain", "output"}
 	for _, name := range flags {
 		if cmd.Flags().Changed(name) {
 			return true
@@ -205,7 +207,7 @@ func runInteractive() error {
 }
 
 // runNonInteractive runs with command-line flags
-func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr string, observability bool, oauthProviders []string, enableMFA, enableRBAC bool, gdprFeatures []string, emailServiceStr string, authCache bool, frontends []string, webFrameworkStr, uiLibraryStr, stateMgmtStr string, enablePostHog, enableSentry bool, testInfraStr, e2eFrameworkStr string, enableTenancy, enableK8s bool, domainStr string) error {
+func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databaseStr, cacheStr, configStr, rateLimiterStr string, observability bool, oauthProviders []string, enableMFA, enableRBAC bool, gdprFeatures []string, emailServiceStr string, authCache bool, frontends []string, webFrameworkStr, uiLibraryStr, stateMgmtStr string, enablePostHog, enableSentry bool, testInfraStr, e2eFrameworkStr string, enableTenancy, enableK8s bool, domainStr, outputDir string) error {
 	var moduleName string
 	if len(args) > 0 {
 		moduleName = args[0]
@@ -217,6 +219,7 @@ func runNonInteractive(cmd *cobra.Command, args []string, serviceTypeStr, databa
 	cfg := &config.ProjectConfig{
 		ModuleName:    moduleName,
 		ProjectName:   config.ExtractProjectName(moduleName),
+		OutputDir:     outputDir,
 		ServiceType:   config.ServiceType(serviceTypeStr),
 		ConfigSource:  config.ConfigSource(configStr),
 		Observability: observability,

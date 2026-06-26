@@ -1,11 +1,13 @@
 package generator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/DenisBytes/gonstrukt/internal/config"
 	"github.com/DenisBytes/gonstrukt/internal/generator/writers"
@@ -95,23 +97,23 @@ func (g *Generator) Generate(ctx context.Context) error {
 		gatewayDir := filepath.Join(g.writer.OutputDir(), "services", "gateway")
 		authDir := filepath.Join(g.writer.OutputDir(), "services", "auth_service")
 
-		if err := g.runGoModTidyIn(gatewayDir); err != nil {
+		if err := g.runGoModTidyIn(ctx, gatewayDir); err != nil {
 			return fmt.Errorf("failed to run go mod tidy for gateway: %w", err)
 		}
-		if err := g.runGoModTidyIn(authDir); err != nil {
+		if err := g.runGoModTidyIn(ctx, authDir); err != nil {
 			return fmt.Errorf("failed to run go mod tidy for auth: %w", err)
 		}
-		if err := g.runGoFmtIn(gatewayDir); err != nil {
+		if err := g.runGoFmtIn(ctx, gatewayDir); err != nil {
 			return fmt.Errorf("failed to format gateway code: %w", err)
 		}
-		if err := g.runGoFmtIn(authDir); err != nil {
+		if err := g.runGoFmtIn(ctx, authDir); err != nil {
 			return fmt.Errorf("failed to format auth code: %w", err)
 		}
 	} else {
-		if err := g.runGoModTidy(); err != nil {
+		if err := g.runGoModTidy(ctx); err != nil {
 			return fmt.Errorf("failed to run go mod tidy: %w", err)
 		}
-		if err := g.runGoFmt(); err != nil {
+		if err := g.runGoFmt(ctx); err != nil {
 			return fmt.Errorf("failed to format code: %w", err)
 		}
 	}
@@ -922,40 +924,47 @@ func (g *Generator) generateK8s() error {
 	return nil
 }
 
-// runGoModTidy runs go mod tidy in the output directory
-func (g *Generator) runGoModTidy() error {
-	cmd := exec.Command("go", "mod", "tidy")
-	cmd.Dir = g.writer.OutputDir()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// runGoFmt runs gofmt on the output directory
-func (g *Generator) runGoFmt() error {
-	cmd := exec.Command("gofmt", "-w", ".")
-	cmd.Dir = g.writer.OutputDir()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// runGoModTidyIn runs go mod tidy in a specific directory
-func (g *Generator) runGoModTidyIn(dir string) error {
-	cmd := exec.Command("go", "mod", "tidy")
+// runCmd runs an external command in dir, threading ctx for cancellation and
+// capturing combined output. It stays silent on success and returns an error
+// that includes the captured output on failure. This keeps generation quiet and
+// isolated when many projects are produced back-to-back (e.g. the audit harness).
+func (g *Generator) runCmd(ctx context.Context, dir, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		if out := strings.TrimSpace(buf.String()); out != "" {
+			return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out)
+		}
+		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return nil
 }
 
-// runGoFmtIn runs gofmt in a specific directory
-func (g *Generator) runGoFmtIn(dir string) error {
-	cmd := exec.Command("gofmt", "-w", ".")
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+// runGoModTidy runs go mod tidy in the output directory.
+func (g *Generator) runGoModTidy(ctx context.Context) error {
+	return g.runGoModTidyIn(ctx, g.writer.OutputDir())
+}
+
+// runGoFmt runs gofmt on the output directory.
+func (g *Generator) runGoFmt(ctx context.Context) error {
+	return g.runGoFmtIn(ctx, g.writer.OutputDir())
+}
+
+// runGoModTidyIn runs go mod tidy in a specific directory. It is skipped when
+// SkipTidy is set (faster audit iterations that resolve modules at build time).
+func (g *Generator) runGoModTidyIn(ctx context.Context, dir string) error {
+	if g.config.SkipTidy {
+		return nil
+	}
+	return g.runCmd(ctx, dir, "go", "mod", "tidy")
+}
+
+// runGoFmtIn runs gofmt in a specific directory.
+func (g *Generator) runGoFmtIn(ctx context.Context, dir string) error {
+	return g.runCmd(ctx, dir, "gofmt", "-w", ".")
 }
 
 // generateGatewayTests generates test files for gateway service

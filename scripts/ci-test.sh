@@ -32,21 +32,21 @@ case $CONFIG_NUM in
         echo "Config: auth + postgres + yaml (basic)"
         ./gonstrukt create github.com/test/config1 \
             -s auth -d postgres -c yaml \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     2)
         echo "Config: auth + postgres + env + MFA"
         ./gonstrukt create github.com/test/config2 \
             -s auth -d postgres -c env \
             --mfa \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     3)
         echo "Config: auth + postgres + yaml + OAuth (google,apple)"
         ./gonstrukt create github.com/test/config3 \
             -s auth -d postgres -c yaml \
             --oauth google,apple \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     4)
         echo "Config: auth + postgres + vault + GDPR (all) + RBAC"
@@ -55,7 +55,7 @@ case $CONFIG_NUM in
             --gdpr consent,data-export,data-deletion,processing-logs \
             --email ses \
             --rbac \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     5)
         echo "Config: auth + postgres + redis + token-bucket + MFA + OAuth (microsoft)"
@@ -63,46 +63,46 @@ case $CONFIG_NUM in
             -s auth -d postgres -c yaml \
             --cache redis -r token-bucket \
             --mfa --oauth microsoft \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     6)
         echo "Config: gateway + redis + sliding-window + yaml"
         ./gonstrukt create github.com/test/config6 \
             -s gateway --cache redis -r sliding-window -c yaml \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     7)
         echo "Config: gateway + valkey + leaky-bucket + env"
         ./gonstrukt create github.com/test/config7 \
             -s gateway --cache valkey -r leaky-bucket -c env \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     8)
         echo "Config: gateway + memory + fixed-window + yaml + auth-cache"
         ./gonstrukt create github.com/test/config8 \
             -s gateway --cache memory -r fixed-window -c yaml \
             --auth-cache \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     9)
         echo "Config: both + postgres + redis + token-bucket + yaml"
         ./gonstrukt create github.com/test/config9 \
             -s both -d postgres --cache redis -r token-bucket -c yaml \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     10)
         echo "Config: both + postgres + valkey + sliding-window + env + MFA + GDPR consent"
         ./gonstrukt create github.com/test/config10 \
             -s both -d postgres --cache valkey -r sliding-window -c env \
             --mfa --gdpr consent --email smtp \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     11)
         echo "Config: auth + postgres + yaml + frontend (react, shadcn, tanstack)"
         ./gonstrukt create github.com/test/config11 \
             -s auth -d postgres -c yaml \
             --frontend web --web-framework react --ui-lib shadcn --state-mgmt tanstack \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     12)
         echo "Config: auth + postgres + yaml + frontend (next, baseui, redux) + posthog + sentry"
@@ -110,7 +110,7 @@ case $CONFIG_NUM in
             -s auth -d postgres -c yaml \
             --frontend web --web-framework next --ui-lib baseui --state-mgmt redux \
             --posthog --sentry \
-            -o "$TEST_DIR" -i=false
+            --output "$TEST_DIR" -i=false
         ;;
     *)
         echo "Invalid config number: $CONFIG_NUM"

@@ -311,6 +311,7 @@ type ProjectConfig struct {
 	ModuleName  string // e.g., github.com/user/project
 	ProjectName string // e.g., project (extracted from module)
 	OutputDir   string // Where to generate
+	SkipTidy    bool   // Skip `go mod tidy` after generation (faster audit iterations)
 	ServiceType ServiceType
 
 	// Gateway features (required for gateway, optional for auth)
