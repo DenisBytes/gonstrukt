@@ -37,7 +37,7 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 	xssPatterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)<script[^>]*>`),
 		regexp.MustCompile(`(?i)javascript\s*:`),
-		regexp.MustCompile(`(?i)on\w+\s*=`),
+		regexp.MustCompile(`(?i)<[^>]+\bon\w+\s*=`),
 		regexp.MustCompile(`(?i)<iframe[^>]*>`),
 		regexp.MustCompile(`(?i)<object[^>]*>`),
 		regexp.MustCompile(`(?i)<embed[^>]*>`),
@@ -48,7 +48,7 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 	sqliPatterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(union|select|insert|update|delete|drop|exec|execute|xp_|sp_)\s`),
 		regexp.MustCompile(`(?i)('\s*(or|and)\s*'[^']*')`),
-		regexp.MustCompile(`(?i)(--|\|\|)`),
+		regexp.MustCompile(`(?i)([;']\s*--|\|\|)`),
 		regexp.MustCompile(`(?i)(;|')\s*(select|insert|update|delete|drop)`),
 		regexp.MustCompile(`(?i)sleep\s*\(\s*\d+\s*\)`),
 		regexp.MustCompile(`(?i)benchmark\s*\(`),
@@ -120,9 +120,12 @@ func MaliciousPayloadDetection(cfg MaliciousPayloadConfig) func(http.Handler) ht
 
 			// Check body for POST/PUT/PATCH requests
 			if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-				if r.ContentLength > 0 && r.ContentLength <= cfg.MaxBodySize {
+				// Scan bodies up to MaxBodySize. RequestSizeLimit upstream already wraps
+				// the body with MaxBytesReader, so LimitReader here is safe even for chunked
+				// transfers (ContentLength == -1).
+				if r.ContentLength != 0 && (r.ContentLength <= cfg.MaxBodySize || r.ContentLength == -1) {
 					body, err := io.ReadAll(io.LimitReader(r.Body, cfg.MaxBodySize))
-					if err == nil {
+					if err == nil && len(body) > 0 {
 {{- if .HasObservability}}
 						if blocked, pattern := checkMaliciousContent(string(body), cfg, xssPatterns, sqliPatterns, cmdPatterns); blocked {
 							span.SetStatus(codes.Error, "Malicious payload detected in body")

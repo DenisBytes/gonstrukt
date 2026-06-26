@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"log"
 	"os"
 	"time"
 
@@ -50,25 +51,32 @@ func NewKeyManager(cfg JWTConfig) (*KeyManager, error) {
 		}
 	}
 
-	// Generate new keys if not loaded
+	// Require keys to be configured (no silent auto-generation in production).
+	// Auto-generation only happens when AUTH_DEV_MODE=true is explicitly set.
 	if privateKey == nil {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			return nil, err
-		}
-		privateKey = key
-		publicKey = &key.PublicKey
+		if os.Getenv("AUTH_DEV_MODE") == "true" {
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				return nil, err
+			}
+			privateKey = key
+			publicKey = &key.PublicKey
 
-		// Save keys if paths are provided
-		if cfg.PrivateKeyPath != "" {
-			if err := savePrivateKey(cfg.PrivateKeyPath, privateKey); err != nil {
-				return nil, err
+			// Persist the ephemeral keys if paths are provided so they survive restarts.
+			if cfg.PrivateKeyPath != "" {
+				if err := savePrivateKey(cfg.PrivateKeyPath, privateKey); err != nil {
+					return nil, err
+				}
 			}
-		}
-		if cfg.PublicKeyPath != "" {
-			if err := savePublicKey(cfg.PublicKeyPath, publicKey); err != nil {
-				return nil, err
+			if cfg.PublicKeyPath != "" {
+				if err := savePublicKey(cfg.PublicKeyPath, publicKey); err != nil {
+					return nil, err
+				}
 			}
+
+			log.Println("WARNING: Using auto-generated JWT keys (AUTH_DEV_MODE=true). DO NOT USE IN PRODUCTION.")
+		} else {
+			return nil, errors.New("JWT signing keys not configured: set jwt.private_key_path and jwt.public_key_path in config, or set AUTH_DEV_MODE=true for development")
 		}
 	}
 

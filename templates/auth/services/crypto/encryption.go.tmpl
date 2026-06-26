@@ -9,6 +9,20 @@ import (
 	"io"
 )
 
+// ValidateKey checks that the given hex-encoded string decodes to a 32-byte
+// AES-256 key. Use it at startup to fail fast on a misconfigured key instead of
+// only catching the error on the first encrypt/decrypt call.
+func ValidateKey(hexKey string) error {
+	key, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf("invalid encryption key: %w", err)
+	}
+	if len(key) != 32 {
+		return fmt.Errorf("encryption key must be 32 bytes (got %d)", len(key))
+	}
+	return nil
+}
+
 // Encrypt encrypts plaintext using AES-256-GCM with the given hex-encoded key.
 // Returns hex-encoded ciphertext (nonce + sealed data).
 func Encrypt(plaintext string, hexKey string) (string, error) {
@@ -16,13 +30,10 @@ func Encrypt(plaintext string, hexKey string) (string, error) {
 		return "", nil
 	}
 
-	key, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return "", fmt.Errorf("invalid encryption key: %w", err)
+	if err := ValidateKey(hexKey); err != nil {
+		return "", err
 	}
-	if len(key) != 32 {
-		return "", fmt.Errorf("encryption key must be 32 bytes (got %d)", len(key))
-	}
+	key, _ := hex.DecodeString(hexKey)
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -49,13 +60,10 @@ func Decrypt(hexCiphertext string, hexKey string) (string, error) {
 		return "", nil
 	}
 
-	key, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return "", fmt.Errorf("invalid encryption key: %w", err)
+	if err := ValidateKey(hexKey); err != nil {
+		return "", err
 	}
-	if len(key) != 32 {
-		return "", fmt.Errorf("encryption key must be 32 bytes (got %d)", len(key))
-	}
+	key, _ := hex.DecodeString(hexKey)
 
 	ciphertext, err := hex.DecodeString(hexCiphertext)
 	if err != nil {

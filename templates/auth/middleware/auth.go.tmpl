@@ -39,9 +39,10 @@ type AuthConfig struct {
 func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if path is excluded
+			// Check if path is excluded (exact match to prevent bypasses
+			// like /logout-admin slipping through the /logout entry)
 			for _, path := range cfg.ExcludedPaths {
-				if strings.HasPrefix(r.URL.Path, path) {
+				if r.URL.Path == path {
 					next.ServeHTTP(w, r)
 					return
 				}

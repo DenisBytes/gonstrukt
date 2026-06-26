@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -43,26 +44,39 @@ type CSRFConfig struct {
 	// MaxAge is the max age of the CSRF cookie in seconds
 	MaxAge int
 
-	// ExcludedPaths are paths that should not require CSRF validation
+	// ExcludedPaths are paths that should not require CSRF validation (exact match)
 	ExcludedPaths []string
+
+	// ExcludedPrefixes are path prefixes that should not require CSRF validation.
+	// Use for routes with dynamic segments (e.g. /api/v1/resource/token/).
+	ExcludedPrefixes []string
 
 	// SafeMethods are HTTP methods that don't require CSRF validation
 	SafeMethods []string
+
+	// SkipBearerToken skips CSRF validation when the request includes an
+	// Authorization: Bearer header. Bearer tokens are not automatically
+	// attached by browsers, so they are inherently CSRF-safe. This allows
+	// native mobile clients (which use Bearer auth but cannot manage
+	// browser cookies) to bypass CSRF without weakening protection for
+	// cookie-based browser sessions.
+	SkipBearerToken bool
 }
 
 // DefaultCSRFConfig returns the default CSRF configuration
 func DefaultCSRFConfig() CSRFConfig {
 	return CSRFConfig{
-		TokenLength:    csrfTokenLength,
-		CookieName:     csrfTokenCookie,
-		HeaderName:     csrfTokenHeader,
-		CookiePath:     "/",
-		CookieSecure:   true,
-		CookieHTTPOnly: true,
-		CookieSameSite: http.SameSiteStrictMode,
-		MaxAge:         86400,
-		SafeMethods:    []string{"GET", "HEAD", "OPTIONS", "TRACE"},
-		ExcludedPaths:  []string{"/health", "/readiness"},
+		TokenLength:     csrfTokenLength,
+		CookieName:      csrfTokenCookie,
+		HeaderName:      csrfTokenHeader,
+		CookiePath:      "/",
+		CookieSecure:    true,
+		CookieHTTPOnly:  true,
+		CookieSameSite:  http.SameSiteStrictMode,
+		MaxAge:          86400,
+		SafeMethods:     []string{"GET", "HEAD", "OPTIONS", "TRACE"},
+		ExcludedPaths:   []string{"/health", "/readiness"},
+		SkipBearerToken: true,
 	}
 }
 
@@ -70,9 +84,17 @@ func DefaultCSRFConfig() CSRFConfig {
 func CSRF(cfg CSRFConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if path is excluded
+			// Check if path is excluded (exact match)
 			for _, path := range cfg.ExcludedPaths {
 				if r.URL.Path == path {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
+			// Check if path is excluded by prefix (for tokened routes with dynamic segments)
+			for _, prefix := range cfg.ExcludedPrefixes {
+				if strings.HasPrefix(r.URL.Path, prefix) {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -103,6 +125,15 @@ func CSRF(cfg CSRFConfig) func(http.Handler) http.Handler {
 
 			// For unsafe methods, validate the token
 			if !isSafe {
+				// Skip CSRF for requests using Bearer token authentication.
+				// Bearer tokens are not auto-attached by browsers, making them
+				// inherently immune to CSRF attacks.
+				if cfg.SkipBearerToken && hasBearerToken(r) {
+					w.Header().Set(cfg.HeaderName, token)
+					next.ServeHTTP(w, r)
+					return
+				}
+
 				headerToken := r.Header.Get(cfg.HeaderName)
 				if headerToken == "" {
 					http.Error(w, "CSRF token missing", http.StatusForbidden)
@@ -121,6 +152,12 @@ func CSRF(cfg CSRFConfig) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// hasBearerToken checks if the request has an Authorization: Bearer header.
+func hasBearerToken(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	return len(auth) > 7 && auth[:7] == "Bearer "
 }
 
 // generateToken generates a cryptographically secure random token

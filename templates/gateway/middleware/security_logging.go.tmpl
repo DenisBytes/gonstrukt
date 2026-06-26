@@ -1,8 +1,11 @@
 package middleware
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -64,7 +67,7 @@ func SecurityLogging(cfg SecurityLoggingConfig) func(http.Handler) http.Handler 
 					EventType:    determineEventType(r, wrapped.statusCode),
 					IPHash:       hashIP(extractIP(r), cfg.HashSalt),
 					Method:       r.Method,
-					Path:         r.URL.Path,
+					Path:         RedactSensitivePath(r.URL.Path),
 					StatusCode:   wrapped.statusCode,
 					UserAgent:    sanitizeUserAgent(r.UserAgent()),
 					Blocked:      wrapped.statusCode >= 400,
@@ -104,12 +107,94 @@ func SecurityLogging(cfg SecurityLoggingConfig) func(http.Handler) http.Handler 
 // securityResponseWriter wraps http.ResponseWriter to capture status code
 type securityResponseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
 func (rw *securityResponseWriter) WriteHeader(code int) {
+	if rw.wroteHeader {
+		return
+	}
+	rw.wroteHeader = true
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *securityResponseWriter) Write(b []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+func (rw *securityResponseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (rw *securityResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("upstream ResponseWriter does not implement http.Hijacker")
+}
+
+// RedactSensitivePath returns the request path with any secret token segment
+// replaced by "<redacted>" so a credential carried in the URL never lands in a
+// log line, trace attribute, or metric label. A segment is treated as a secret
+// when it either (a) immediately follows a known sensitive keyword segment
+// (e.g. /reset-password/<token>, /calendar-feed/<token>,
+// /contract-signing/<token>), or (b) is a long opaque value (>= 20 chars with
+// no '.', which would otherwise suggest a filename). The route shape is
+// preserved for observability. If the path carries no sensitive token it is
+// returned unchanged.
+func RedactSensitivePath(path string) string {
+	if path == "" {
+		return path
+	}
+
+	segments := strings.Split(path, "/")
+	changed := false
+	for i, seg := range segments {
+		if seg == "" {
+			continue
+		}
+
+		redact := false
+		if i > 0 {
+			if _, ok := sensitivePathKeywords[strings.ToLower(segments[i-1])]; ok {
+				redact = true
+			}
+		}
+		if !redact && len(seg) >= 20 && !strings.Contains(seg, ".") {
+			redact = true
+		}
+
+		if redact {
+			segments[i] = "<redacted>"
+			changed = true
+		}
+	}
+
+	if !changed {
+		return path
+	}
+	return strings.Join(segments, "/")
+}
+
+// sensitivePathKeywords lists URL path segments whose IMMEDIATELY FOLLOWING
+// segment is a secret credential (a token-in-URL) that must never be logged.
+var sensitivePathKeywords = map[string]struct{}{
+	"reset-password":   {},
+	"verify-email":     {},
+	"verify":           {},
+	"confirm":          {},
+	"invite":           {},
+	"invitation":       {},
+	"calendar-feed":    {},
+	"contract-signing": {},
+	"token":            {},
 }
 
 // isSecurityRelevant determines if a request/response is security relevant
