@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	"net/http"
+	"strings"
 )
 
 // RateLimiter defines the interface for rate limiting implementations
@@ -19,6 +20,9 @@ type RateLimiter interface {
 
 	// GetStats returns current rate limit statistics for a key
 	GetStats(ctx context.Context, key string) (*Stats, error)
+
+	// Close releases resources (stops cleanup goroutines, closes connections)
+	Close()
 }
 
 // Stats holds rate limit statistics
@@ -32,19 +36,15 @@ type Stats struct {
 // KeyFunc extracts the rate limiting key from a request
 type KeyFunc func(*http.Request) string
 
-// DefaultKeyFunc uses the client IP as the rate limiting key
+// DefaultKeyFunc keys on the client IP. It is only a fallback for callers that
+// do not configure user-level keying (see NewUserKeyFunc) — generated services
+// key on the authenticated user, leaving IP-based limiting to the reverse proxy.
+// It prefers X-Real-IP (set by a trusted proxy) over the spoofable
+// X-Forwarded-For, then falls back to RemoteAddr.
 func DefaultKeyFunc(r *http.Request) string {
-	// Check X-Forwarded-For header first
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
-	}
-
-	// Check X-Real-IP header
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+		return strings.TrimSpace(xri)
 	}
-
-	// Fall back to RemoteAddr
 	return r.RemoteAddr
 }
 

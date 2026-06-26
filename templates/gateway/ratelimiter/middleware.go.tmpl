@@ -4,11 +4,47 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
 )
+
+// sensitiveRateLimitPrefixes are auth-style routes that need special handling:
+//   - when unauthenticated, they are limited by a per-endpoint GLOBAL bucket
+//     (never by IP) so anonymous floods (credential stuffing, signup abuse) are
+//     still bounded;
+//   - when the limiter backend errors, they fail CLOSED rather than open, because
+//     a brute-force window on login/MFA/reset is worse than briefly rejecting
+//     some requests.
+//
+// Adjust these to match your gateway's upstream auth route prefixes.
+var sensitiveRateLimitPrefixes = []string{
+	"/api/v1/auth/login",
+	"/api/v1/auth/register",
+	"/api/v1/auth/forgot-password",
+	"/api/v1/auth/reset-password",
+	"/api/v1/auth/mfa",
+	"/auth/login",
+	"/auth/register",
+	"/login",
+	"/register",
+}
+
+// isSensitivePath reports whether path is a sensitive auth route.
+func isSensitivePath(path string) bool {
+	for _, p := range sensitiveRateLimitPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // MiddlewareConfig holds configuration for the rate limiter middleware
 type MiddlewareConfig struct {
-	// KeyFunc extracts the rate limiting key from the request
+	// KeyFunc extracts the rate limiting key from the request. An empty return
+	// value means "no authenticated identity" (see NewUserKeyFunc).
 	KeyFunc KeyFunc
 
 	// OnLimited is called when a request is rate limited
@@ -19,9 +55,14 @@ type MiddlewareConfig struct {
 
 	// IncludeHeaders determines whether to include rate limit headers
 	IncludeHeaders bool
+
+	// Logger logs rate limiter backend errors (e.g. Redis failures). Optional.
+	Logger *zap.Logger
 }
 
-// DefaultMiddlewareConfig returns the default middleware configuration
+// DefaultMiddlewareConfig returns the default middleware configuration. It keys
+// on IP via DefaultKeyFunc as a fallback; generated services override KeyFunc
+// with NewUserKeyFunc for user-level limiting.
 func DefaultMiddlewareConfig() MiddlewareConfig {
 	return MiddlewareConfig{
 		KeyFunc:        DefaultKeyFunc,
@@ -36,6 +77,21 @@ func Middleware(limiter RateLimiter) func(http.Handler) http.Handler {
 	return MiddlewareWithConfig(limiter, DefaultMiddlewareConfig())
 }
 
+// resolveKey returns the rate limiting key for a request, plus whether the
+// request should be limited at all. An empty KeyFunc result means the request is
+// unauthenticated: sensitive routes get a per-endpoint global bucket, everything
+// else is left to the reverse proxy (not limited here).
+func resolveKey(cfg MiddlewareConfig, r *http.Request) (key string, limit bool) {
+	key = cfg.KeyFunc(r)
+	if key != "" {
+		return key, true
+	}
+	if isSensitivePath(r.URL.Path) {
+		return anonEndpointKey(r), true
+	}
+	return "", false
+}
+
 // MiddlewareWithConfig creates a rate limiting middleware with custom config
 func MiddlewareWithConfig(limiter RateLimiter, cfg MiddlewareConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -48,13 +104,24 @@ func MiddlewareWithConfig(limiter RateLimiter, cfg MiddlewareConfig) func(http.H
 				}
 			}
 
-			// Get the rate limiting key
-			key := cfg.KeyFunc(r)
+			key, limit := resolveKey(cfg, r)
+			if !limit {
+				next.ServeHTTP(w, r)
+				return
+			}
 
-			// Check rate limit
 			allowed, err := limiter.Allow(r.Context(), key)
 			if err != nil {
-				// On error, allow the request but log it
+				if cfg.Logger != nil {
+					cfg.Logger.Warn("rate limiter backend error",
+						zap.String("path", r.URL.Path), zap.Error(err))
+				}
+				// Fail CLOSED on sensitive auth routes; fail open elsewhere to
+				// preserve availability during a limiter-backend outage.
+				if isSensitivePath(r.URL.Path) {
+					cfg.OnLimited(w, r, nil)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -83,27 +150,53 @@ func MiddlewareWithConfig(limiter RateLimiter, cfg MiddlewareConfig) func(http.H
 
 // defaultOnLimited is the default handler for rate limited requests
 func defaultOnLimited(w http.ResponseWriter, r *http.Request, stats *Stats) {
+	// Retry-After is expressed in seconds-from-now (RFC 7231), not a Unix
+	// timestamp. Compute the delta and clamp to at least 1 second.
+	retryAfter := int64(1)
+	if stats != nil && stats.ResetAt > 0 {
+		if delta := stats.ResetAt - time.Now().Unix(); delta > 1 {
+			retryAfter = delta
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", strconv.FormatInt(stats.ResetAt, 10))
+	w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 	w.WriteHeader(http.StatusTooManyRequests)
 
 	response := map[string]interface{}{
 		"error":       "rate limit exceeded",
-		"retry_after": stats.ResetAt,
+		"retry_after": retryAfter,
 	}
 
 	json.NewEncoder(w).Encode(response)
 }
 
-// PerEndpointMiddleware creates a middleware that rate limits per endpoint
+// PerEndpointMiddleware creates a middleware that rate limits per endpoint, on
+// top of the per-identity key. Unauthenticated, non-sensitive requests are not
+// limited here (left to the reverse proxy).
 func PerEndpointMiddleware(limiter RateLimiter, cfg MiddlewareConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Create a key that includes the path
-			baseKey := cfg.KeyFunc(r)
+			baseKey, limit := resolveKey(cfg, r)
+			if !limit {
+				next.ServeHTTP(w, r)
+				return
+			}
 			key := baseKey + ":" + r.URL.Path
 
-			allowed, _ := limiter.Allow(r.Context(), key)
+			allowed, err := limiter.Allow(r.Context(), key)
+			if err != nil {
+				if cfg.Logger != nil {
+					cfg.Logger.Warn("rate limiter backend error",
+						zap.String("path", r.URL.Path), zap.Error(err))
+				}
+				if isSensitivePath(r.URL.Path) {
+					cfg.OnLimited(w, r, nil)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
 			stats, _ := limiter.GetStats(r.Context(), key)
 
 			if cfg.IncludeHeaders && stats != nil {

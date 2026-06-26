@@ -20,6 +20,7 @@ type Config struct {
 {{- end}}
 {{- if .HasRateLimiter}}
 	RateLimiter      RateLimiterConfig       `yaml:"rate_limiter" json:"rate_limiter" env:"RATE_LIMITER"`
+	Auth             AuthConfig              `yaml:"auth" json:"auth" env:"AUTH"`
 {{- end}}
 }
 
@@ -80,6 +81,14 @@ type MemoryCacheConfig struct {
 {{- end}}
 
 {{- if .HasRateLimiter}}
+
+// AuthConfig holds the settings the gateway uses to verify access tokens for
+// user-level rate limiting. JWTPublicKeyPath points at the auth service's ECDSA
+// public key (PEM); leave it empty to disable user keying, in which case
+// sensitive routes fall back to anonymous per-endpoint limits.
+type AuthConfig struct {
+	JWTPublicKeyPath string `yaml:"jwt_public_key_path" json:"jwt_public_key_path" env:"JWT_PUBLIC_KEY_PATH"`
+}
 
 // RateLimiterConfig holds rate limiter configuration
 type RateLimiterConfig struct {

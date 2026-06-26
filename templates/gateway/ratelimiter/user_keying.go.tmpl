@@ -1,0 +1,96 @@
+package ratelimiter
+
+import (
+	"crypto/ecdsa"
+	"crypto/x509"
+	"encoding/pem"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// LoadPublicKey loads the ECDSA public key (PEM/PKIX) used to verify access
+// tokens for user-level rate limiting. It returns nil when the path is empty or
+// the key cannot be read/parsed; in that case user keying degrades to anonymous
+// per-endpoint limiting on sensitive routes (see middleware.go).
+func LoadPublicKey(path string) *ecdsa.PublicKey {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	pub, _ := key.(*ecdsa.PublicKey)
+	return pub
+}
+
+// bearerToken returns the raw token from an "Authorization: Bearer <token>"
+// header, or "" if absent.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+	}
+	return ""
+}
+
+// NewUserKeyFunc returns a KeyFunc that buckets requests by the AUTHENTICATED
+// user identity (the JWT "sub" claim){{if .HasTenancy}}, namespaced by tenant (the "tenant_id" claim){{end}}.
+//
+// IP-based limiting is intentionally NOT used here — bounding clients by IP is
+// the reverse proxy's job. The token signature is verified with pub, so the key
+// cannot be spoofed by forging claims. A missing or unverifiable token yields an
+// empty key; the middleware then applies anonymous per-endpoint limits on
+// sensitive routes (login/register/...) instead of trusting an attacker-supplied
+// identity. If pub is nil (no key configured) every request is treated as
+// unauthenticated.
+func NewUserKeyFunc(pub *ecdsa.PublicKey) KeyFunc {
+	return func(r *http.Request) string {
+		if pub == nil {
+			return ""
+		}
+		tok := bearerToken(r)
+		if tok == "" {
+			return ""
+		}
+		claims := jwt.MapClaims{}
+		parsed, err := jwt.ParseWithClaims(tok, claims, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodECDSA); !ok {
+				return nil, jwt.ErrTokenSignatureInvalid
+			}
+			return pub, nil
+		})
+		if err != nil || !parsed.Valid {
+			return ""
+		}
+		sub, _ := claims["sub"].(string)
+		if sub == "" {
+			return ""
+		}
+		{{- if .HasTenancy}}
+		if tid, ok := claims["tenant_id"].(string); ok && tid != "" {
+			return "tenant:" + tid + ":user:" + sub
+		}
+		{{- end}}
+		return "user:" + sub
+	}
+}
+
+// anonEndpointKey returns a per-endpoint GLOBAL key for unauthenticated requests
+// to sensitive routes (e.g. login). It bounds anonymous floods without keying on
+// IP — a single shared bucket per method+path rather than per client.
+func anonEndpointKey(r *http.Request) string {
+	return "anon:" + r.Method + ":" + r.URL.Path
+}

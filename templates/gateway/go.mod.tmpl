@@ -22,4 +22,7 @@ require (
 {{- if or (eq .CacheType "redis") (eq .CacheType "valkey")}}
 	github.com/redis/go-redis/v9 v9.5.1
 {{- end}}
+{{- if .HasRateLimiter}}
+	github.com/golang-jwt/jwt/v5 v5.2.0
+{{- end}}
 )

@@ -203,6 +203,16 @@ func main() {
 		},
 	})
 
+{{- if .HasRateLimiter}}
+	// Rate limiting keys on the authenticated user (the JWT "sub" claim), never
+	// on IP — that is the reverse proxy's job. Tokens are verified with this
+	// service's own public key; unauthenticated requests to sensitive routes
+	// (login/register/...) fall back to anonymous per-endpoint limits.
+	rlConfig := ratelimiter.DefaultMiddlewareConfig()
+	rlConfig.KeyFunc = ratelimiter.NewUserKeyFunc(ratelimiter.LoadPublicKey(cfg.JWT.PublicKeyPath))
+	rlConfig.Logger = utils.Logger
+{{- end}}
+
 	// Apply middleware chain
 	// Order matters: tracing -> recovery -> metrics -> logging -> security -> auth -> rate limiting
 	// Recovery sits just inside tracing so it catches panics from all downstream middleware.
@@ -220,7 +230,7 @@ func main() {
 		middleware.RequestValidation(),
 		authMiddleware,
 {{- if .HasRateLimiter}}
-		ratelimiter.Middleware(rateLimiter),
+		ratelimiter.MiddlewareWithConfig(rateLimiter, rlConfig),
 {{- end}}
 	)
 

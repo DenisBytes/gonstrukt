@@ -188,6 +188,9 @@ func (g *Generator) generateGateway() error {
 		if err := writer.WriteTemplate("gateway/ratelimiter/middleware.go.tmpl", "internals/ratelimiter/middleware.go"); err != nil {
 			return err
 		}
+		if err := writer.WriteTemplate("gateway/ratelimiter/user_keying.go.tmpl", "internals/ratelimiter/user_keying.go"); err != nil {
+			return err
+		}
 
 		var rlFile, rlOut string
 		switch *g.config.RateLimiter {
@@ -470,6 +473,9 @@ func (g *Generator) generateAuth() error {
 			return err
 		}
 		if err := writer.WriteTemplate("gateway/ratelimiter/middleware.go.tmpl", "internals/ratelimiter/middleware.go"); err != nil {
+			return err
+		}
+		if err := writer.WriteTemplate("gateway/ratelimiter/user_keying.go.tmpl", "internals/ratelimiter/user_keying.go"); err != nil {
 			return err
 		}
 
