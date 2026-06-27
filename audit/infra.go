@@ -63,23 +63,27 @@ func StartInfra(ctx context.Context) (*Infra, error) {
 		name string
 		args []string
 	}
+	// Ports are bound to 127.0.0.1 only. These are throwaway containers with
+	// default/no credentials (test fixtures); publishing them on 0.0.0.0 would
+	// expose an unauthenticated Postgres/Redis/Valkey to the whole network. The
+	// harness always connects over loopback, so this costs nothing.
 	specs := []spec{
 		{in.pgName, []string{
 			"run", "-d", "--name", in.pgName,
 			"-e", "POSTGRES_PASSWORD=" + in.pgPass,
 			"-e", "POSTGRES_USER=" + in.pgUser,
 			"-e", "POSTGRES_DB=postgres",
-			"-p", fmt.Sprintf("%d:5432", in.pgPort),
+			"-p", fmt.Sprintf("127.0.0.1:%d:5432", in.pgPort),
 			"postgres:16-alpine",
 		}},
 		{in.redisName, []string{
 			"run", "-d", "--name", in.redisName,
-			"-p", fmt.Sprintf("%d:6379", in.redisPort),
+			"-p", fmt.Sprintf("127.0.0.1:%d:6379", in.redisPort),
 			"redis:7-alpine",
 		}},
 		{in.valkeyName, []string{
 			"run", "-d", "--name", in.valkeyName,
-			"-p", fmt.Sprintf("%d:6379", in.valkeyPort),
+			"-p", fmt.Sprintf("127.0.0.1:%d:6379", in.valkeyPort),
 			"valkey/valkey:8-alpine",
 		}},
 	}
