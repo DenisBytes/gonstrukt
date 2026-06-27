@@ -8,7 +8,9 @@ import (
 
 	"{{.ModuleName}}/internals/middleware"
 	"{{.ModuleName}}/internals/types"
+	"{{.ModuleName}}/internals/utils"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -104,6 +106,11 @@ func (s *AuthService) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	var req types.RefreshRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.RefreshToken == "" {
+		writeError(w, http.StatusBadRequest, "refresh token is required")
 		return
 	}
 
@@ -252,6 +259,14 @@ func (s *AuthService) handleChangePassword(w http.ResponseWriter, r *http.Reques
 	if err := s.db.UpdateUser(r.Context(), user); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update password")
 		return
+	}
+
+	// Revoke every existing session so a stolen refresh token can't outlive a
+	// password change (session-fixation prevention). The user re-authenticates.
+	if err := s.db.DeleteUserSessions(r.Context(), userID); err != nil {
+		utils.Warn("failed to revoke sessions after password change",
+			zap.String("user_id", userID),
+			zap.Error(err))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password changed"})
