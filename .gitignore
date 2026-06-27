@@ -42,6 +42,8 @@ Thumbs.db
 dist/
 build/
 bin/
+# Compiled CLI binary (`go build -o gonstrukt`)
+/gonstrukt
 
 # Logs
 *.log
@@ -66,4 +68,5 @@ scripts/create-commits.sh
 # AI/Claude Code artifacts
 CLAUDE.md
 docs/plans/
+docs/superpowers/
 .claude/
