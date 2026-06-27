@@ -124,7 +124,7 @@ export function SessionList({ sessions, isLoading, onRevoke }: SessionListProps)
       {sessions.map((session) => (
         <SessionItem key={session.id}>
           <SessionInfo>
-            <div style={{ display: 'flex', alignItems: 'center' }}>
+            <div style={{"{{" }} display: 'flex', alignItems: 'center' {{ "}}" }}>
               <LabelSmall>{session.user_agent.split(' ')[0] || 'Unknown Device'}</LabelSmall>
               {session.is_current && <CurrentBadge>Current</CurrentBadge>}
             </div>
